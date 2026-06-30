@@ -1,0 +1,230 @@
+
+import { getCoreSupabaseClient, getTenantSupabaseClient } from '../_shared/supabaseClients.ts';
+import { corsHeaders } from '../_shared/cors.ts';
+
+// NOTE: Encryption helpers are kept for future actions that might need them, like saving integrations.
+const ENCRYPTION_KEY = Deno.env.get('GLAMTICA_ENCRYPTION_KEY');
+
+async function getKey() {
+  if (!ENCRYPTION_KEY) {
+    throw new Error("GLAMTICA_ENCRYPTION_KEY is not set in environment variables.");
+  }
+  const keyData = new TextEncoder().encode(ENCRYPTION_KEY.slice(0, 32));
+  return await crypto.subtle.importKey("raw", keyData, { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+}
+
+async function encrypt(data: string): Promise<{ encrypted: string; nonce: string }> {
+  const key = await getKey();
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const encodedData = new TextEncoder().encode(data);
+  const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, encodedData);
+  const encrypted = btoa(String.fromCharCode.apply(null, new Uint8Array(encryptedBuffer)));
+  const nonceB64 = btoa(String.fromCharCode.apply(null, nonce));
+  return { encrypted, nonce: nonceB64 };
+}
+
+console.log("Initializing superadmin-actions function (distributed architecture)");
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+
+  try {
+    const { action, payload } = await req.json();
+    console.log(`superadmin-actions: Received action '${action}'`);
+
+    const coreSupabase = getCoreSupabaseClient();
+    const tenantSupabase = getTenantSupabaseClient();
+
+    let responseData: any;
+    let statusCode = 200;
+    const startTime = performance.now();
+    let metricsPath = `edge/superadmin-actions/${action}`;
+
+    try {
+      switch (action) {
+        // --- Platform Actions (Refactored for Core DB) ---
+        case 'get_platforms': {
+          const { searchTerm } = payload || {};
+          let query = coreSupabase.from('platforms').select('*');
+          if (searchTerm) {
+            query = query.ilike('name', `%${searchTerm}%`);
+          }
+          const { data, error } = await query.order('name');
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'get_platform_by_id': {
+          const { platformId } = payload;
+          if (!platformId) throw new Error('platformId is required.');
+          const { data, error } = await coreSupabase.from('platforms').select('*').eq('id', platformId).single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'create_platform': {
+          const { data, error } = await coreSupabase.from('platforms').insert(payload).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'update_platform': {
+          const { id, data: platformData } = payload;
+          if (!id || !platformData) throw new Error('id and data are required for update.');
+          const { data, error } = await coreSupabase.from('platforms').update(platformData).eq('id', id).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'delete_platform': {
+          const { id } = payload;
+          if (!id) throw new Error('id is required for delete.');
+          const { error } = await coreSupabase.from('platforms').delete().eq('id', id);
+          if (error) throw error;
+          responseData = { success: true };
+          break;
+        }
+        case 'update_platform_settings': {
+          const { platformId, settings } = payload;
+          if (!platformId || !settings) throw new Error('platformId and settings are required.');
+          const { data, error } = await coreSupabase.from('platforms').update(settings).eq('id', platformId).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+
+        // --- System Catalogs (Refactored for Core DB) ---
+        case 'get_currencies': {
+          let query = coreSupabase.from('currencies').select('*');
+          if (payload?.searchTerm) query = query.ilike('name', `%${payload.searchTerm}%`);
+          const { data, error } = await query.order('name');
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'create_currency': {
+          const { data, error } = await coreSupabase.from('currencies').insert(payload).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'update_currency': {
+          const { id, ...updateData } = payload;
+          if (!id) throw new Error('Currency ID is required.');
+          const { data, error } = await coreSupabase.from('currencies').update(updateData).eq('id', id).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'delete_currency': {
+          const { id } = payload;
+          if (!id) throw new Error('Currency ID is required.');
+          const { error } = await coreSupabase.from('currencies').delete().eq('id', id);
+          if (error) throw error;
+          responseData = { success: true };
+          break;
+        }
+        case 'get_countries': {
+          let query = coreSupabase.from('countries').select('*, currency:currencies(id, code, symbol)');
+          if (payload?.searchTerm) query = query.ilike('name', `%${payload.searchTerm}%`);
+          const { data, error } = await query.order('name');
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'create_country': {
+          const { data, error } = await coreSupabase.from('countries').insert(payload).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'update_country': {
+          const { id, ...updateData } = payload;
+          if (!id) throw new Error('Country ID is required.');
+          const { data, error } = await coreSupabase.from('countries').update(updateData).eq('id', id).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'delete_country': {
+          const { id } = payload;
+          if (!id) throw new Error('Country ID is required.');
+          const { error } = await coreSupabase.from('countries').delete().eq('id', id);
+          if (error) throw error;
+          responseData = { success: true };
+          break;
+        }
+        case 'get_languages': {
+          let query = coreSupabase.from('languages').select('*');
+          if (payload?.searchTerm) query = query.ilike('name', `%${payload.searchTerm}%`);
+          const { data, error } = await query.order('name');
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'create_language': {
+          const { data, error } = await coreSupabase.from('languages').insert(payload).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'update_language': {
+          const { id, ...updateData } = payload;
+          if (!id) throw new Error('Language ID is required.');
+          const { data, error } = await coreSupabase.from('languages').update(updateData).eq('id', id).select().single();
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+        case 'delete_language': {
+          const { id } = payload;
+          if (!id) throw new Error('Language ID is required.');
+          const { error } = await coreSupabase.from('languages').delete().eq('id', id);
+          if (error) throw error;
+          responseData = { success: true };
+          break;
+        }
+        
+        // --- All other original actions from the file, pointing to tenantSupabase as a fallback. ---
+        // --- These will be refactored in subsequent steps. ---
+        default: {
+            console.warn(`Action '${action}' has not been fully refactored for the new architecture. Using Tenant DB as a fallback.`);
+            // A simple example of a fallback action. The real implementation would have all original cases here.
+            // For now, throwing an error is safer to identify what needs refactoring.
+            throw new Error(`Action '${action}' is not yet refactored for the new architecture.`);
+        }
+      }
+    } catch (error) {
+      statusCode = error.code?.startsWith('PGRST') ? 400 : 500;
+      console.error(`Error in action '${action}':`, error.message);
+      responseData = { success: false, message: error.message };
+    } finally {
+      const endTime = performance.now();
+      const responseTimeMs = endTime - startTime;
+      console.log(`superadmin-actions: Action '${action}' took ${responseTimeMs.toFixed(2)}ms, status: ${statusCode}`);
+      // Temporarily log metrics to tenant DB. This could be moved to Core DB later.
+      await tenantSupabase.from('api_request_metrics').insert({
+        path: metricsPath,
+        method: 'POST',
+        status_code: statusCode,
+        response_time_ms: responseTimeMs
+      });
+    }
+
+    return new Response(JSON.stringify(responseData), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      status: statusCode,
+    });
+
+  } catch (error) {
+    return new Response(JSON.stringify({
+      success: false,
+      message: error.message,
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      status: 400,
+    });
+  }
+});

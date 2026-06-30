@@ -1,0 +1,1 @@
+ALTER TABLE public.branches DROP CONSTRAINT branches_tenant_id_fkey;

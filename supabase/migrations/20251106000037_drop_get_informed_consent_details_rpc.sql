@@ -1,0 +1,1 @@
+DROP FUNCTION IF EXISTS public.get_informed_consent_details(uuid);

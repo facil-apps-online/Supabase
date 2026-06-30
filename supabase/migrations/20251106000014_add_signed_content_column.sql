@@ -1,0 +1,1 @@
+ALTER TABLE public.signed_consents ADD COLUMN IF NOT EXISTS signed_content text NULL;

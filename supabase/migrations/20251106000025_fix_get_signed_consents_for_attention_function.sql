@@ -1,0 +1,51 @@
+-- Fixes the get_signed_consents_for_attention function to use the correct table name.
+-- The table name was consent_templates and it should be informed_consent_templates.
+
+DROP FUNCTION IF EXISTS get_signed_consents_for_attention(uuid, uuid, uuid);
+
+CREATE OR REPLACE FUNCTION get_signed_consents_for_attention(
+    p_tenant_id uuid,
+    p_attention_id uuid,
+    p_attention_service_id uuid DEFAULT NULL
+)
+RETURNS TABLE(
+    id uuid,
+    attention_id uuid,
+    client_id uuid,
+    professional_id uuid,
+    template_id uuid,
+    template_name text,
+    template_content text,
+    professional_observations text,
+    signed_content text,
+    signed_at timestamptz,
+    created_at timestamptz,
+    updated_at timestamptz,
+    attention_service_id uuid
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        sc.id,
+        sc.attention_id,
+        sc.client_id,
+        sc.professional_id,
+        sc.template_id,
+        ct.name AS template_name,
+        ct.content AS template_content,
+        sc.professional_observations,
+        sc.signed_content,
+        sc.signed_at,
+        sc.created_at,
+        sc.updated_at,
+        sc.attention_service_id
+    FROM
+        public.signed_consents sc
+    JOIN
+        public.informed_consent_templates ct ON sc.template_id = ct.id
+    WHERE
+        sc.tenant_id = p_tenant_id
+        AND sc.attention_id = p_attention_id
+        AND (p_attention_service_id IS NULL OR sc.attention_service_id = p_attention_service_id);
+END;
+$$ LANGUAGE plpgsql;

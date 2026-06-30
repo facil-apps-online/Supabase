@@ -1,0 +1,1 @@
+ALTER TABLE public.payslips DROP COLUMN signature_url;

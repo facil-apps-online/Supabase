@@ -1,0 +1,1 @@
+DROP FUNCTION IF EXISTS public.assign_treatment_to_client(uuid, uuid, uuid, text, numeric, timestamp with time zone, jsonb);

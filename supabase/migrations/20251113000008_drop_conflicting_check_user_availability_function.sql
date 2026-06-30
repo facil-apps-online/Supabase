@@ -1,0 +1,1 @@
+DROP FUNCTION public.check_user_availability(uuid, text, uuid, uuid, date, time without time zone, integer, uuid);

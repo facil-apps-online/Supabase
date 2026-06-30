@@ -1,0 +1,1 @@
+ALTER TABLE public.subscription_plans DROP CONSTRAINT subscription_plans_name_key;

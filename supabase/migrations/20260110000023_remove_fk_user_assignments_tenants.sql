@@ -1,0 +1,1 @@
+ALTER TABLE public.user_assignments DROP CONSTRAINT user_assignments_tenant_id_fkey;
