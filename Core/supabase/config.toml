@@ -335,4 +335,13 @@ s3_secret_key = "env(S3_SECRET_KEY)"
   verify_jwt = false
 
 [functions.core-orphan-cleanup]
-verify_jwt = false
+  verify_jwt = false
+
+[functions.core-actions]
+  verify_jwt = false
+
+[functions.wompi-generate-checkout]
+  verify_jwt = false
+
+[functions.proxy-google-drive-image]
+  verify_jwt = false

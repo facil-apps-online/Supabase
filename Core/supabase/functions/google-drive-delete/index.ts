@@ -14,9 +14,9 @@ serve(async (req) => {
 
   try {
     // 1. Extract parameters from the request body
-    const { fileId, integration_owner_tenant_id } = await req.json();
-    if (!fileId || !integration_owner_tenant_id) {
-      return new Response(JSON.stringify({ error: 'Missing required body parameters: fileId and integration_owner_tenant_id are required.' }), {
+    const { fileId, integration_owner_tenant_id, platform_id } = await req.json();
+    if (!fileId) {
+      return new Response(JSON.stringify({ error: 'Missing required body parameters: fileId is required.' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
@@ -28,15 +28,40 @@ serve(async (req) => {
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     );
 
+    // Determine which tenant owns the integration credentials
+    let integrationTenantId = integration_owner_tenant_id;
+    
+    // If not provided, fetch the system owner for the platform
+    if (!integrationTenantId && platform_id) {
+      const { data: ownerTenant, error: ownerError } = await supabaseAdmin
+        .from('tenants')
+        .select('id')
+        .eq('platform_id', platform_id)
+        .eq('is_system_owner', true)
+        .single();
+        
+      if (ownerError || !ownerTenant) {
+        throw new Error(`Failed to find system owner tenant for platform ${platform_id}: ${ownerError?.message}`);
+      }
+      integrationTenantId = ownerTenant.id;
+    }
+    
+    if (!integrationTenantId) {
+      return new Response(JSON.stringify({ error: 'Missing required body parameters: integration_owner_tenant_id or platform_id is required.' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
     // 3. Fetch the Google Drive integration from the DB
     const { data: googleDriveIntegration, error: fetchIntegrationError } = await supabaseAdmin
       .from('tenant_integrations')
       .select('*')
-      .eq('tenant_id', integration_owner_tenant_id)
+      .eq('tenant_id', integrationTenantId)
       .eq('provider', 'google_drive')
       .single();
 
-    if (fetchIntegrationError) throw new Error(`Failed to fetch Google Drive integration for tenant ${integration_owner_tenant_id}: ${fetchIntegrationError.message}`);
+    if (fetchIntegrationError) throw new Error(`Failed to fetch Google Drive integration for tenant ${integrationTenantId}: ${fetchIntegrationError.message}`);
     if (!googleDriveIntegration.encrypted_credentials || !googleDriveIntegration.nonce) {
       throw new Error('La integración de Google Drive no tiene las credenciales encriptadas.');
     }

@@ -72,8 +72,8 @@ serve(async (req) => {
     const payload = await req.json();
     console.log('[gdrive-upload] Received payload:', payload);
     const { platform_id, fileBase64, mimeType, fileName, path_components, integration_owner_tenant_id, tenantId } = payload;
-    if (!platform_id || !fileBase64 || !mimeType || !fileName || !path_components || !Array.isArray(path_components) || !integration_owner_tenant_id) {
-      return new Response(JSON.stringify({ error: 'Missing required body parameters: platform_id, fileBase64, mimeType, fileName, path_components (array), and integration_owner_tenant_id are required.' }), {
+    if (!platform_id || !fileBase64 || !mimeType || !fileName || !path_components || !Array.isArray(path_components)) {
+      return new Response(JSON.stringify({ error: 'Missing required body parameters: platform_id, fileBase64, mimeType, fileName, and path_components (array) are required.' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
@@ -102,7 +102,24 @@ serve(async (req) => {
     console.log(`[gdrive-upload] Found platformName: ${platformName}`);
 
     // 4. Determine which tenant owns the integration credentials
-    const integrationTenantId = integration_owner_tenant_id;
+    let integrationTenantId = integration_owner_tenant_id;
+    
+    // If not provided, fetch the system owner for the platform
+    if (!integrationTenantId) {
+      console.log(`[gdrive-upload] No integration_owner_tenant_id provided, fetching system owner for platform ${platform_id}`);
+      const { data: ownerTenant, error: ownerError } = await supabaseAdmin
+        .from('tenants')
+        .select('id')
+        .eq('platform_id', platform_id)
+        .eq('is_system_owner', true)
+        .single();
+        
+      if (ownerError || !ownerTenant) {
+        throw new Error(`Failed to find system owner tenant for platform ${platform_id}: ${ownerError?.message}`);
+      }
+      integrationTenantId = ownerTenant.id;
+    }
+    
     console.log(`[gdrive-upload] Using integrationTenantId: ${integrationTenantId}`);
 
     // 5. Fetch the Google Drive integration from the DB
@@ -169,7 +186,13 @@ serve(async (req) => {
 
     // 8. Create dynamic folder structure from path_components (refactored)
     console.log('[gdrive-upload] Creating folder structure...');
-    let parentFolderId = await findOrCreateFolder(platformName, null, accessToken);
+    let parentFolderId = null;
+    
+    // Inject the tenantId as the first subfolder to isolate tenant files
+    if (tenantId) {
+      parentFolderId = await findOrCreateFolder(tenantId, parentFolderId, accessToken);
+    }
+    
     for (const folderName of path_components) {
         if (folderName) { // Avoid creating folders for empty/null path components
             parentFolderId = await findOrCreateFolder(folderName, parentFolderId, accessToken);

@@ -104,41 +104,62 @@ Deno.serve(async (req) => {
           throw new Error('El userId y el platformId son obligatorios.');
         }
 
-        // 1. Consultar asignaciones activas del usuario para esta plataforma
-        const { data: assignments, error: queryError } = await supabaseAdmin
-          .from('user_assignments')
-          .select(`
-            assignment_id:id,
-            tenant_id,
-            role_id,
-            branch_id,
-            status,
-            tenants!inner ( name, platform_id ),
-            roles ( name, display_name ),
-            branches ( name )
-          `)
-          .eq('user_id', userId)
-          .eq('status', 'active')
-          .eq('tenants.platform_id', platformId);
+        // 1. Consultar asignaciones en user_roles
+        const { data: userRoles, error: urError } = await supabaseAdmin
+          .from('user_roles')
+          .select('id, role_id')
+          .eq('user_id', userId);
 
-        if (queryError) {
-          console.error('Error al obtener asignaciones:', queryError.message);
-          throw new Error(`Error al consultar asignaciones: ${queryError.message}`);
+        if (urError) throw new Error(`Error en user_roles: ${urError.message}`);
+        
+        if (!userRoles || userRoles.length === 0) {
+          // No roles = clear assignments
+          await supabaseAdmin.auth.admin.updateUserById(userId, { app_metadata: { assignments: [] } });
+          responseData = { success: true, message: 'Metadatos limpiados, sin roles.' };
+          break;
         }
 
-        // 2. Mapear al formato esperado en app_metadata
-        const mappedAssignments = assignments.map((a: any) => ({
-          assignment_id: a.assignment_id,
-          tenant_id: a.tenant_id,
-          tenant_name: a.tenants?.name || 'N/A',
-          platform_id: a.tenants?.platform_id,
-          role_id: a.role_id,
-          role_name: a.roles?.name || 'N/A',
-          role_display_name: a.roles?.display_name || 'N/A',
-          branch_id: a.branch_id || null,
-          branch_name: a.branches?.name || null,
-          status: a.status,
-        }));
+        const roleIds = userRoles.map(ur => ur.role_id);
+
+        // 2. Consultar roles
+        const { data: roles, error: rError } = await supabaseAdmin
+          .from('roles')
+          .select('id, name, description, tenant_id')
+          .in('id', roleIds);
+
+        if (rError) throw new Error(`Error en roles: ${rError.message}`);
+
+        const tenantIds = roles?.map(r => r.tenant_id) || [];
+
+        // 3. Consultar tenants
+        const { data: tenants, error: tError } = await supabaseAdmin
+          .from('tenants')
+          .select('id, name, platform_id')
+          .in('id', tenantIds)
+          .eq('platform_id', platformId);
+
+        if (tError) throw new Error(`Error en tenants: ${tError.message}`);
+
+        // 4. Mapear
+        const mappedAssignments = userRoles.map(ur => {
+          const role = roles?.find(r => r.id === ur.role_id);
+          const tenant = tenants?.find(t => t.id === role?.tenant_id);
+          
+          if (!tenant) return null; // Filtramos si el tenant no coincide con la plataforma
+
+          return {
+            assignment_id: ur.id,
+            tenant_id: tenant.id,
+            tenant_name: tenant.name,
+            platform_id: tenant.platform_id,
+            role_id: role?.id,
+            role_name: role?.name || 'N/A',
+            role_display_name: role?.description || 'N/A',
+            branch_id: null,
+            branch_name: null,
+            status: 'active',
+          };
+        }).filter(Boolean);
 
         // 3. Actualizar app_metadata del usuario
         const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(
@@ -166,7 +187,7 @@ Deno.serve(async (req) => {
         }
 
         const { data, error } = await supabaseAdmin
-          .from('user_assignments')
+          .from('user_roles')
           .select('id')
           .eq('id', newAssignmentId)
           .eq('user_id', userId)

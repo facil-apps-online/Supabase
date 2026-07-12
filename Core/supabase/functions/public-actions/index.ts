@@ -36,6 +36,39 @@ serve(async (req) => {
         result = prefixesData;
         break;
 
+      case 'get_public_platforms':
+        const { data: platformsData, error: platformsError } = await supabaseClient
+          .from('platforms')
+          .select(`
+            id,
+            name,
+            slug,
+            status,
+            description,
+            description_en,
+            base_url,
+            logo_url,
+            social_facebook,
+            social_instagram,
+            display_order,
+            category_id,
+            platform_categories:category_id (
+              id,
+              slug,
+              platform_category_translations (
+                locale,
+                name
+              )
+            )
+          `)
+          .eq('is_public', true)
+          .order('display_order', { ascending: true })
+          .order('name', { ascending: true });
+
+        if (platformsError) throw platformsError;
+        result = platformsData;
+        break;
+
       default:
         throw new Error(`Action '${action}' not found`);
     }

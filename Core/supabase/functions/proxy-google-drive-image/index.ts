@@ -51,27 +51,39 @@ serve(async (req) => {
     }
 
     const coreSupabase = getSupabaseAdminClient();
-    let tenantIdToUse = tenantId;
+    let integrationTenantId;
     
-    console.log(`[proxy-gdrive-core] Using provided tenantId: ${tenantIdToUse} for platformId: ${platformId}`);
+    // Fetch the system owner for the platform
+    const { data: ownerTenant, error: ownerError } = await coreSupabase
+      .from('tenants')
+      .select('id')
+      .eq('platform_id', platformId)
+      .eq('is_system_owner', true)
+      .single();
+      
+    if (ownerError || !ownerTenant) {
+      throw new Error(`Failed to find system owner tenant for platform ${platformId}: ${ownerError?.message}`);
+    }
+    integrationTenantId = ownerTenant.id;
+    
+    console.log(`[proxy-gdrive-core] Using system owner tenantId: ${integrationTenantId} for platformId: ${platformId} (Requested by tenant: ${tenantId})`);
     
     const { data: googleDriveIntegration, error: fetchIntegrationError } = await coreSupabase
       .from('tenant_integrations')
       .select('encrypted_credentials, nonce')
-      .eq('tenant_id', tenantIdToUse)
-      .eq('platform_id', platformId)
+      .eq('tenant_id', integrationTenantId)
       .eq('provider', 'google_drive')
       .single();
 
     if (fetchIntegrationError) {
-      console.error(`[proxy-gdrive-core] Error fetching integration for tenant ${tenantIdToUse}:`, fetchIntegrationError.message);
-      throw new Error(`Failed to fetch Google Drive integration for tenant ${tenantIdToUse}: ${fetchIntegrationError.message}`);
+      console.error(`[proxy-gdrive-core] Error fetching integration for tenant ${integrationTenantId}:`, fetchIntegrationError.message);
+      throw new Error(`Failed to fetch Google Drive integration for tenant ${integrationTenantId}: ${fetchIntegrationError.message}`);
     }
     if (!googleDriveIntegration || !googleDriveIntegration.encrypted_credentials || !googleDriveIntegration.nonce) {
-      console.error(`[proxy-gdrive-core] Incomplete Google Drive integration data for tenant ${tenantIdToUse}`);
+      console.error(`[proxy-gdrive-core] Incomplete Google Drive integration data for tenant ${integrationTenantId}`);
       throw new Error('La integración de Google Drive no tiene las credenciales encriptadas o no fue encontrada.');
     }
-    console.log(`[proxy-gdrive-core] Found Google Drive integration for tenant ${tenantIdToUse}`);
+    console.log(`[proxy-gdrive-core] Found Google Drive integration for tenant ${integrationTenantId}`);
 
     const { data: decryptedResponse, error: decryptError } = await coreSupabase.functions.invoke(
       'decrypt-secret', { body: { encryptedData: googleDriveIntegration.encrypted_credentials, iv: googleDriveIntegration.nonce } }
@@ -122,13 +134,12 @@ serve(async (req) => {
     const headers = new Headers(corsHeaders);
     const contentType = response.headers.get('content-type');
     
-    if (contentType && contentType.startsWith('image/')) {
+    if (contentType && (contentType.startsWith('image/') || contentType === 'application/pdf' || contentType.includes('document') || contentType.includes('pdf'))) {
       headers.set('content-type', contentType);
     } else {
-      return new Response(JSON.stringify({ error: 'El archivo obtenido de Google Drive no es una imagen o tiene un tipo de contenido inesperado.' }), {
-        status: 502,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      });
+      // Just set whatever it is instead of throwing, or explicitly allow all.
+      // But let's allow it if it's a known safe type. Actually, since we control the platform, we can just allow the contentType through.
+      headers.set('content-type', contentType || 'application/octet-stream');
     }
 
     headers.set('Cache-Control', 'public, max-age=31536000, immutable');

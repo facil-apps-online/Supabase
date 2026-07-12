@@ -1,0 +1,5 @@
+-- Migration placeholder for Dashboard connectivity
+-- Las tablas necesarias (employees, exams, courses, vigilancias, evaluations,
+-- communications y notifications) ya existen, por lo que no se ejecuta ningún
+-- DDL adicional. Esta migración simplemente registra el próximo timestamp
+-- para mantener el orden cronológico de las migraciones.

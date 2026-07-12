@@ -97,6 +97,7 @@ Deno.serve(async (req) => {
     
       // System Health & Alerts
       'get_api_health_stats': ['super_admin', 'app_super_admin'],
+      'get_infrastructure_metrics': ['super_admin', 'app_super_admin'],
       'insert_system_alert': ['super_admin', 'app_super_admin'],
       'get_system_alerts': ['super_admin', 'app_super_admin'],
       'update_system_alert_status': ['super_admin', 'app_super_admin'],
@@ -136,10 +137,20 @@ Deno.serve(async (req) => {
       'get_integration_body_formats': ['super_admin', 'app_super_admin'],
       'get_integration_auth_methods': ['super_admin', 'app_super_admin'],
       'get_integration_categories': ['super_admin', 'app_super_admin'],
+      'get_platform_categories': ['super_admin', 'app_super_admin'],
     
+      // Tenant-facing Subscription Actions (public - validated via tenantId in payload)
+      'get_subscription_status': ['public'],
+      'get_tenant_subscription_plans': ['public'],
+      'get_subscription_usage': ['public'],
+      'activate_subscription': ['public'],
+      'generate_wompi_checkout': ['public'],
+      
       // Public Actions - No authentication required
       'check_superadmin_exists': ['public'],
       'get-google-auth-url': ['public'],
+      'get_tenant_integration': ['public'],
+      'delete_tenant_integration': ['public'],
       'create_first_superadmin': ['public'],
       
       // Internal Service Actions - Requires internal secret
@@ -1090,6 +1101,24 @@ Deno.serve(async (req) => {
             responseData = data;
             break;
           }
+
+          case 'get_platform_categories': {
+            const { data, error } = await coreSupabase
+              .from('platform_categories')
+              .select(`
+                id,
+                slug,
+                display_order,
+                platform_category_translations (
+                  locale,
+                  name
+                )
+              `)
+              .order('display_order', { ascending: true });
+            if (error) throw error;
+            responseData = data;
+            break;
+          }
   
           case 'delete_integration_category': {
             const { id } = payload;
@@ -1147,6 +1176,37 @@ Deno.serve(async (req) => {
           });
 
           responseData = enrichedIntegrations;
+          break;
+        }
+
+        case 'get_tenant_integration': {
+          const { tenantId, provider } = payload;
+          if (!tenantId || !provider) throw new Error('tenantId and provider are required.');
+
+          const { data, error } = await coreSupabase
+            .from('tenant_integrations')
+            .select('*')
+            .eq('tenant_id', tenantId)
+            .eq('provider', provider)
+            .maybeSingle();
+
+          if (error) throw error;
+          responseData = data || null;
+          break;
+        }
+
+        case 'delete_tenant_integration': {
+          const { tenantId, provider } = payload;
+          if (!tenantId || !provider) throw new Error('tenantId and provider are required.');
+
+          const { error } = await coreSupabase
+            .from('tenant_integrations')
+            .delete()
+            .eq('tenant_id', tenantId)
+            .eq('provider', provider);
+
+          if (error) throw error;
+          responseData = { success: true };
           break;
         }
 
@@ -1423,9 +1483,67 @@ Deno.serve(async (req) => {
         }
 
         case 'get_api_health_stats': {
-          const { data, error } = await coreSupabase.rpc('get_api_health_stats'); // Changed to coreSupabase
+          const { data, error } = await coreSupabase.rpc('get_api_health_stats'); // Consultar tabla Core nativa
           if (error) throw error;
           responseData = data;
+          break;
+        }
+
+        case 'get_infrastructure_metrics': {
+          const { data: nodes, error: nodesError } = await coreSupabase.from('infrastructure_nodes').select('*').eq('is_active', true);
+          if (nodesError) throw nodesError;
+
+          const { createClient } = await import('https://esm.sh/@supabase/supabase-js@2');
+          const results = [];
+
+          for (const node of nodes) {
+            try {
+              const cleanKey = node.service_role_key.replace(/\s+/g, '');
+              const nodeClient = createClient(node.project_url, cleanKey, {
+                auth: { autoRefreshToken: false, persistSession: false }
+              });
+              
+              const start = Date.now();
+              const { error: pingError } = await nodeClient.rpc('non_existent_ping_function');
+              const latency = Date.now() - start;
+
+              let status = 'online';
+              let details = 'OK';
+
+              if (pingError) {
+                // Si el error es PGRST202, significa que la base de datos respondió correctamente
+                // indicando que la función no existe. Por lo tanto, el servidor está VIVO.
+                if (pingError.code === 'PGRST202') {
+                  status = 'online';
+                  details = 'OK';
+                } else if (pingError.message && pingError.message.includes('Unexpected token')) {
+                  status = 'error';
+                  details = 'Proyecto pausado o API Key corrupta (Revisar infrastructure_nodes)';
+                } else {
+                  status = 'warning';
+                  details = pingError.message;
+                }
+              }
+
+              results.push({
+                node_id: node.id,
+                node_name: node.node_name,
+                project_url: node.project_url,
+                status: status,
+                latency_ms: latency,
+                details: details
+              });
+            } catch (err) {
+              results.push({
+                node_id: node.id,
+                node_name: node.node_name,
+                status: 'error',
+                details: err.message
+              });
+            }
+          }
+
+          responseData = results;
           break;
         }
 
@@ -1545,6 +1663,141 @@ Deno.serve(async (req) => {
           
           if (error) throw error;
           responseData = data;
+          break;
+        }
+
+        // --- Tenant-facing Subscription Actions ---
+        case 'get_subscription_status': {
+          const { tenantId, platformId } = payload;
+          if (!tenantId) throw new Error('tenantId is required.');
+          if (!platformId) throw new Error('platformId is required.');
+          const { data, error } = await coreSupabase.rpc('get_tenant_plan_limits', { p_tenant_id: tenantId, p_platform_id: platformId });
+          if (error) throw error;
+          responseData = Array.isArray(data) ? data[0] || null : data;
+          break;
+        }
+
+        case 'get_tenant_subscription_plans': {
+          const { tenantId: tId, platformId: pId } = payload;
+          if (!tId) throw new Error('tenantId is required.');
+          if (!pId) throw new Error('platformId is required.');
+          const { data: plansData, error: plansError } = await coreSupabase.rpc('get_subscription_plans_for_tenant', { p_tenant_id: tId, p_platform_id: pId });
+          if (plansError) throw plansError;
+          responseData = plansData || [];
+          break;
+        }
+
+        case 'get_subscription_usage': {
+          const { tenantId: usageTenantId, platformId: usagePlatformId } = payload;
+          if (!usageTenantId) throw new Error('tenantId is required.');
+          if (!usagePlatformId) throw new Error('platformId is required.');
+          
+          const { data: limitsData, error: limitsError } = await coreSupabase.rpc('get_tenant_plan_limits', { p_tenant_id: usageTenantId, p_platform_id: usagePlatformId });
+          if (limitsError) throw limitsError;
+          const limits = Array.isArray(limitsData) ? limitsData[0] : limitsData;
+          
+          if (!limits || limits.status === 'cancelado') {
+            responseData = null;
+            break;
+          }
+
+          const { data: activeSub } = await coreSupabase
+            .from('tenant_subscriptions')
+            .select('plan_country_configuration_id')
+            .eq('tenant_id', usageTenantId)
+            .eq('is_active', true)
+            .order('start_date', { ascending: false })
+            .limit(1)
+            .single();
+
+          const pccId = activeSub?.plan_country_configuration_id;
+
+          const { data: planAssets } = await coreSupabase
+            .from('plan_assets')
+            .select('*, asset_purposes(purpose_key)')
+            .eq('platform_id', usagePlatformId);
+
+          const usage = [];
+          for (const asset of planAssets || []) {
+            let limitValue = -1;
+            if (pccId) {
+              const { data: limitData } = await coreSupabase
+                .from('plan_asset_limits')
+                .select('value')
+                .eq('plan_country_config_id', pccId)
+                .eq('asset_id', asset.id)
+                .maybeSingle();
+              if (limitData?.value != null) limitValue = Number(limitData.value);
+            }
+
+            let totalUsed = 0;
+            if (limits.starts_at && limits.ends_at) {
+              const { data: usageData } = await coreSupabase
+                .from('asset_usage_tracking')
+                .select('quantity_used')
+                .eq('tenant_id', usageTenantId)
+                .eq('asset_id', asset.id)
+                .gte('usage_period_start', limits.starts_at)
+                .lte('usage_period_end', limits.ends_at);
+              totalUsed = (usageData || []).reduce((sum, u) => sum + (Number(u.quantity_used) || 0), 0);
+            }
+
+            usage.push({
+              asset_name: asset.name,
+              asset_key: asset.asset_key,
+              asset_description: asset.description || '',
+              asset_purpose_key: asset.asset_purposes?.purpose_key,
+              used: totalUsed,
+              limit: limitValue,
+            });
+          }
+
+          responseData = {
+            plan_name: limits.plan_name,
+            billing_period_start: limits.starts_at,
+            billing_period_end: limits.ends_at,
+            usage,
+          };
+          break;
+        }
+
+        case 'activate_subscription': {
+          const { tenantId: actTenantId, planId } = payload;
+          if (!actTenantId || !planId) throw new Error('tenantId and planId are required.');
+          const { data: actResult, error: actError } = await coreSupabase.rpc('activate_subscription', {
+            p_tenant_id: actTenantId,
+            p_plan_id: planId,
+          });
+          if (actError) throw actError;
+          responseData = actResult;
+          break;
+        }
+
+        case 'generate_wompi_checkout': {
+          const { tenantId: checkoutTenantId, redirectUrl, userId, planId, currency, extraItems } = payload;
+          if (!checkoutTenantId || !redirectUrl || !userId || !planId) {
+            throw new Error('tenantId, redirectUrl, userId, and planId are required.');
+          }
+
+          const wompiUrl = `${Deno.env.get('SUPABASE_URL')}/functions/v1/wompi-generate-checkout`;
+          const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_ANON_KEY');
+          const wompiResponse = await fetch(wompiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${serviceKey}` },
+            body: JSON.stringify({
+              tenantId: checkoutTenantId, redirectUrl, userId, planId,
+              currency: currency || 'COP', extraItems: extraItems || [],
+            }),
+          });
+
+          if (!wompiResponse.ok) {
+            const errorBody = await wompiResponse.text();
+            console.error(`[core-actions] wompi-generate-checkout returned ${wompiResponse.status}:`, errorBody);
+            throw new Error(`wompi-generate-checkout failed (${wompiResponse.status}): ${errorBody}`);
+          }
+
+          const checkoutResult = await wompiResponse.json();
+          responseData = checkoutResult;
           break;
         }
 

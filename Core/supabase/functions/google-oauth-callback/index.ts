@@ -136,7 +136,7 @@ serve(async (req) => {
     }
 
     // 5. Redirect user back to the Superadmin UI
-    return Response.redirect(`${redirectUrl}?success=true&provider=${provider}&tenantId=${tenantId}`, 303);
+    return Response.redirect(`${redirectUrl}?success=true&provider=${provider}&tenantId=${tenantId}&accountEmail=${encodeURIComponent(userEmail)}`, 303);
 
   } catch (error) {
     console.error('Error in Google OAuth callback:', error);

@@ -21,7 +21,7 @@ const corsHeaders = {
 };
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { getNexuAdminClient } from '../_shared/supabaseClients.ts';
+import { getNexuAdminClient, getCoreSupabaseClient } from '../_shared/supabaseClients.ts';
 import { jwtDecode } from 'https://esm.sh/jwt-decode@4.0.0';
 
 interface RequestBody {
@@ -154,13 +154,32 @@ Deno.serve(async (req) => {
       }
 
       // -----------------------------------------------------------------------
+      // GET STORAGE USAGE — Almacenamiento consumido por el tenant
+      // -----------------------------------------------------------------------
+      case 'get_storage_usage': {
+        console.log('Iniciando acción: get_storage_usage');
+        const targetTenantId = payload?.tenantId || tenantId;
+        if (!targetTenantId) throw new Error('Se requiere un tenantId.');
+
+        const { data, error } = await supabaseAdmin
+          .rpc('get_nexuhr_storage_usage', { p_tenant_id: targetTenantId });
+
+        if (error) throw new Error(`Error al obtener uso de almacenamiento: ${error.message}`);
+
+        const breakdown = (data || []) as { category: string; size: number }[];
+        const totalSize = breakdown.reduce((sum, row) => sum + row.size, 0);
+
+        responseData = { totalSize, breakdown };
+        break;
+      }
+
+      // -----------------------------------------------------------------------
       // === MÓDULOS DE NEXUHR ===
       // Las siguientes acciones se irán agregando conforme se desarrollen
       // los módulos de RR.HH.: empleados, nómina, vigilancias, cursos, etc.
       // -----------------------------------------------------------------------
 
       // TODO: get_employees
-      // TODO: create_employee
       // TODO: update_employee
       // TODO: get_employee_detail
       // TODO: get_nomina_periods
@@ -169,6 +188,70 @@ Deno.serve(async (req) => {
       // TODO: get_cursos
       // TODO: get_dotacion
       // ... (se agregan en este switch a medida que se desarrollan los módulos)
+
+      case 'create_employee': {
+        const { employee_data } = payload;
+        if (!employee_data) throw new Error('employee_data is required');
+        
+        const coreSupabase = getCoreSupabaseClient();
+        const { data: limitsData, error: limitsError } = await coreSupabase.rpc('get_tenant_plan_limits', { 
+          p_tenant_id: tenantId, 
+          p_platform_id: platformId 
+        });
+        if (limitsError) throw limitsError;
+        
+        const maxUsers = limitsData?.[0]?.max_users;
+        if (maxUsers !== null && maxUsers !== undefined && maxUsers > 0) {
+          const { data: currentCount, error: countError } = await nexuAdmin.rpc('count_active_employees_for_billing', {
+            p_tenant_id: tenantId
+          });
+          if (countError) throw countError;
+          
+          if (currentCount >= maxUsers) {
+            throw new Error(`Has alcanzado el límite máximo de empleados activos permitidos por tu plan (${maxUsers}). Por favor mejora tu plan o inactiva empleados.`);
+          }
+        }
+
+        const { data, error } = await nexuAdmin.from('employees').insert([{
+          ...employee_data,
+          tenant_id: tenantId
+        }]).select().single();
+        if (error) throw error;
+        
+        responseData = data;
+        break;
+      }
+
+      case 'create_employees_bulk': {
+        const { employees_data } = payload;
+        if (!employees_data || !Array.isArray(employees_data)) throw new Error('employees_data array is required');
+        
+        const coreSupabase = getCoreSupabaseClient();
+        const { data: limitsData, error: limitsError } = await coreSupabase.rpc('get_tenant_plan_limits', { 
+          p_tenant_id: tenantId, 
+          p_platform_id: platformId 
+        });
+        if (limitsError) throw limitsError;
+        
+        const maxUsers = limitsData?.[0]?.max_users;
+        if (maxUsers !== null && maxUsers !== undefined && maxUsers > 0) {
+          const { data: currentCount, error: countError } = await nexuAdmin.rpc('count_active_employees_for_billing', {
+            p_tenant_id: tenantId
+          });
+          if (countError) throw countError;
+          
+          if (currentCount + employees_data.length > maxUsers) {
+            throw new Error(`Esta importación excede tu límite de empleados activos permitidos (${maxUsers}). Actualmente tienes ${currentCount}. Por favor mejora tu plan o inactiva empleados.`);
+          }
+        }
+
+        const employeesToInsert = employees_data.map(emp => ({ ...emp, tenant_id: tenantId }));
+        const { data, error } = await nexuAdmin.from('employees').insert(employeesToInsert).select();
+        if (error) throw error;
+        
+        responseData = data;
+        break;
+      }
 
       // -----------------------------------------------------------------------
       default:

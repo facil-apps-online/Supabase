@@ -333,3 +333,6 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 [functions.services-orphan-cleanup]
 verify_jwt = false
+
+[functions.dynamic-og-tags]
+verify_jwt = false
