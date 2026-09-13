@@ -183,6 +183,8 @@ Deno.serve(async (req) => {
       'get_vendor_invitation_funnel': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'invite_superadmin_team_member': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'resend_superadmin_team_invitation': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'revoke_superadmin_team_member': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'reactivate_superadmin_team_member': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'create_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'update_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'get_vendor_conversion_report': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
@@ -1811,6 +1813,35 @@ Deno.serve(async (req) => {
 
           const fullNameForResend = `${targetUser.user_metadata?.first_name || ''} ${targetUser.user_metadata?.last_name || ''}`.trim() || targetUser.email;
           await generateAndQueueTeamInvitation(coreSupabase, targetUser.id, targetUser.email, fullNameForResend);
+
+          responseData = { success: true };
+          break;
+        }
+
+        case 'revoke_superadmin_team_member': {
+          const { userId: revokeUserId } = payload;
+          if (!revokeUserId) throw new Error('userId es requerido.');
+          if (revokeUserId === callerUserId) throw new Error('No puedes revocarte a ti mismo.');
+
+          // ban_duration largo en vez de borrar nada: bloquea el login sin perder
+          // vendor_platform_commissions ni el historial, para poder reactivar tal cual quedó.
+          const { error: revokeError } = await coreSupabase.auth.admin.updateUserById(revokeUserId, {
+            ban_duration: '876000h',
+          });
+          if (revokeError) throw revokeError;
+
+          responseData = { success: true };
+          break;
+        }
+
+        case 'reactivate_superadmin_team_member': {
+          const { userId: reactivateUserId } = payload;
+          if (!reactivateUserId) throw new Error('userId es requerido.');
+
+          const { error: reactivateError } = await coreSupabase.auth.admin.updateUserById(reactivateUserId, {
+            ban_duration: 'none',
+          });
+          if (reactivateError) throw reactivateError;
 
           responseData = { success: true };
           break;
