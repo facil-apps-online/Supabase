@@ -1690,9 +1690,9 @@ Deno.serve(async (req) => {
         }
 
         case 'invite_superadmin_team_member': {
-          const { email, fullName, platformId, firstPaymentCommissionRate, recurringPaymentCommissionRate } = payload;
-          if (!email || !fullName || !platformId) {
-            throw new Error('email, fullName y platformId son requeridos.');
+          const { email, fullName, platforms } = payload;
+          if (!email || !fullName || !platforms?.length) {
+            throw new Error('email, fullName y al menos una plataforma son requeridos.');
           }
 
           const nameParts = fullName.trim().split(' ');
@@ -1709,12 +1709,13 @@ Deno.serve(async (req) => {
           });
           if (createError) throw createError;
 
-          const { error: commissionError } = await coreSupabase.from('vendor_platform_commissions').insert({
+          const commissionRows = platforms.map((p: any) => ({
             user_id: newUser.user.id,
-            platform_id: platformId,
-            first_payment_commission_rate: (firstPaymentCommissionRate ?? 50) / 100,
-            recurring_payment_commission_rate: (recurringPaymentCommissionRate ?? 10) / 100,
-          });
+            platform_id: p.platformId,
+            first_payment_commission_rate: (p.firstPaymentCommissionRate ?? 50) / 100,
+            recurring_payment_commission_rate: (p.recurringPaymentCommissionRate ?? 10) / 100,
+          }));
+          const { error: commissionError } = await coreSupabase.from('vendor_platform_commissions').insert(commissionRows);
           if (commissionError) throw commissionError;
 
           const { data: linkData, error: linkError } = await coreSupabase.auth.admin.generateLink({
