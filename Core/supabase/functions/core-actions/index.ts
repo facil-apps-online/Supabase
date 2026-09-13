@@ -23,6 +23,8 @@ function extractBusinessFields(prospect: any) {
     physical_state: prospect?.physicalState || null,
     physical_postal_code: prospect?.physicalPostalCode || null,
     website: prospect?.website || null,
+    latitude: prospect?.latitude ?? null,
+    longitude: prospect?.longitude ?? null,
   };
 }
 
@@ -1892,6 +1894,8 @@ Deno.serve(async (req) => {
               physical_state: prospectRow.physical_state,
               physical_postal_code: prospectRow.physical_postal_code,
               website: prospectRow.website,
+              latitude: prospectRow.latitude,
+              longitude: prospectRow.longitude,
               invite_token: inviteToken,
               invite_url: inviteUrl,
               trial_days_override: trialDaysOverride ?? null,
