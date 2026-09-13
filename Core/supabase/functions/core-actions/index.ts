@@ -139,6 +139,7 @@ Deno.serve(async (req) => {
       'update_vendor_invitation_status': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'delete_vendor_invitation': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'get_vendor_invitation_funnel': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'invite_superadmin_team_member': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'create_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'update_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'get_vendor_conversion_report': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
@@ -1685,6 +1686,58 @@ Deno.serve(async (req) => {
           }
 
           responseData = Object.values(stats);
+          break;
+        }
+
+        case 'invite_superadmin_team_member': {
+          const { email, fullName, platformId, firstPaymentCommissionRate, recurringPaymentCommissionRate } = payload;
+          if (!email || !fullName || !platformId) {
+            throw new Error('email, fullName y platformId son requeridos.');
+          }
+
+          const nameParts = fullName.trim().split(' ');
+          const firstName = nameParts.shift() || '';
+          const lastName = nameParts.join(' ');
+
+          // Sin contraseña: el invitado la crea él mismo desde el link (igual patrón que
+          // Fel.Api.Tenant/TenantDevelopersController en Facil Factura).
+          const { data: newUser, error: createError } = await coreSupabase.auth.admin.createUser({
+            email,
+            email_confirm: false,
+            user_metadata: { full_name: fullName, first_name: firstName, last_name: lastName },
+            app_metadata: { assignments: [{ role: 'vendor' }] },
+          });
+          if (createError) throw createError;
+
+          const { error: commissionError } = await coreSupabase.from('vendor_platform_commissions').insert({
+            user_id: newUser.user.id,
+            platform_id: platformId,
+            first_payment_commission_rate: (firstPaymentCommissionRate ?? 50) / 100,
+            recurring_payment_commission_rate: (recurringPaymentCommissionRate ?? 10) / 100,
+          });
+          if (commissionError) throw commissionError;
+
+          const { data: linkData, error: linkError } = await coreSupabase.auth.admin.generateLink({
+            type: 'invite',
+            email,
+            options: { redirectTo: 'https://admin.facil-apps.online/invitacion' },
+          });
+          if (linkError) throw linkError;
+          const actionLink = linkData?.properties?.action_link;
+          if (!actionLink) throw new Error('No se pudo generar el link de invitación.');
+
+          // Invitación genérica de Facil Apps Online: platform_id NULL a propósito, no
+          // referencia ningún producto/plataforma.
+          const { error: queueError } = await coreSupabase.rpc('queue_platform_email', {
+            p_platform_id: null,
+            p_recipient_email: email,
+            p_template_type: 'team_invitation',
+            p_template_data: { reset_link: actionLink, user_name: fullName },
+            p_tenant_id: null,
+          });
+          if (queueError) throw queueError;
+
+          responseData = { success: true, userId: newUser.user.id };
           break;
         }
 

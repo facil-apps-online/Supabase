@@ -49,15 +49,20 @@ async function processJob(supabaseAdmin: any, job: any) {
 
     // 2. Obtener la plantilla de correo. De alcance plataforma (tenant_id IS NULL) por ahora —
     // el filtro por platform_id evita traer la plantilla de otra plataforma con el mismo
-    // template_type.
-    const { data: template, error: templateError } = await supabaseAdmin
+    // template_type. job.platform_id puede ser NULL (ej. invitaciones internas de Facil Apps
+    // Online que no son de ningún producto) — .eq(col, null) NO matchea filas NULL en SQL, hay
+    // que usar .is() para ese caso.
+    let templateQuery = supabaseAdmin
       .from('email_templates')
       .select('subject, body_html')
       .eq('template_type', job.template_type)
       .eq('language_id', languageId)
-      .eq('platform_id', job.platform_id)
-      .is('tenant_id', null)
-      .single();
+      .is('tenant_id', null);
+    templateQuery = job.platform_id
+      ? templateQuery.eq('platform_id', job.platform_id)
+      : templateQuery.is('platform_id', null);
+
+    const { data: template, error: templateError } = await templateQuery.single();
 
     if (templateError) throw new Error(`Template not found for type ${job.template_type}, platform ${job.platform_id}, language ${languageId}: ${templateError.message}`);
 
