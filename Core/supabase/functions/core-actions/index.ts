@@ -28,23 +28,37 @@ function extractBusinessFields(prospect: any) {
   };
 }
 
-// Genera un link de invitación de Supabase Auth (vence en 1 hora, otp_expiry) y lo encola con
-// Brevo — usado tanto al invitar por primera vez como al reenviar. Invitación genérica de
-// Facil Apps Online: platform_id NULL a propósito, no referencia ningún producto/plataforma.
-async function generateAndQueueTeamInvitation(coreSupabase: any, email: string, fullName: string) {
-  // type: 'recovery', no 'invite' — generateLink nunca manda correo por sí solo en ningún caso,
-  // pero 'invite' solo aplica a un usuario aún no confirmado, y este ya se crea con
-  // email_confirm:true (para que Supabase mismo no dispare su propio correo de confirmación,
-  // sin formato y con un link que no es el nuestro). 'recovery' es el tipo correcto para "dale
-  // una sesión a un usuario confirmado sin contraseña utilizable todavía".
-  const { data: linkData, error: linkError } = await coreSupabase.auth.admin.generateLink({
-    type: 'recovery',
-    email,
-    options: { redirectTo: 'https://admin.facil-apps.online/invitacion' },
+// Token de invitación propio (independiente del invite/recovery nativo de Supabase Auth, que
+// exige tocar Site URL / Redirect URLs a nivel de proyecto y activa una sesión con solo abrir
+// el link). El link generado aquí solo permite asignar la contraseña — nunca inicia sesión.
+// Mismo patrón que PasswordResetService en Facil Factura, adaptado a Postgres/Deno.
+async function hashToken(raw: string): Promise<string> {
+  const data = new TextEncoder().encode(raw);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return encode(new Uint8Array(digest));
+}
+
+function generateRawToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return encode(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// Genera el token, lo guarda (vence en 1 hora) y encola el correo por Brevo — usado tanto al
+// invitar por primera vez como al reenviar. Invitación genérica de Facil Apps Online:
+// platform_id NULL a propósito, no referencia ningún producto/plataforma.
+async function generateAndQueueTeamInvitation(coreSupabase: any, userId: string, email: string, fullName: string) {
+  const rawToken = generateRawToken();
+  const tokenHash = await hashToken(rawToken);
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+  const { error: tokenError } = await coreSupabase.from('superadmin_invitation_tokens').insert({
+    user_id: userId,
+    token_hash: tokenHash,
+    expires_at: expiresAt,
   });
-  if (linkError) throw linkError;
-  const actionLink = linkData?.properties?.action_link;
-  if (!actionLink) throw new Error('No se pudo generar el link de invitación.');
+  if (tokenError) throw tokenError;
+
+  const actionLink = `https://admin.facil-apps.online/invitacion?token=${rawToken}`;
 
   const { error: queueError } = await coreSupabase.rpc('queue_platform_email', {
     p_platform_id: null,
@@ -218,6 +232,7 @@ Deno.serve(async (req) => {
       'get_tenant_integration': ['public'],
       'delete_tenant_integration': ['public'],
       'create_first_superadmin': ['public'],
+      'accept_superadmin_invitation': ['public'],
       
       // Internal Service Actions - Requires internal secret
       'get_google_drive_service_token': ['service_worker'],
@@ -1776,7 +1791,7 @@ Deno.serve(async (req) => {
             .upsert(commissionRows, { onConflict: 'user_id, platform_id' });
           if (commissionError) throw commissionError;
 
-          await generateAndQueueTeamInvitation(coreSupabase, email, fullName);
+          await generateAndQueueTeamInvitation(coreSupabase, userId, email, fullName);
 
           responseData = { success: true, userId };
           break;
@@ -1795,7 +1810,42 @@ Deno.serve(async (req) => {
           }
 
           const fullNameForResend = `${targetUser.user_metadata?.first_name || ''} ${targetUser.user_metadata?.last_name || ''}`.trim() || targetUser.email;
-          await generateAndQueueTeamInvitation(coreSupabase, targetUser.email, fullNameForResend);
+          await generateAndQueueTeamInvitation(coreSupabase, targetUser.id, targetUser.email, fullNameForResend);
+
+          responseData = { success: true };
+          break;
+        }
+
+        case 'accept_superadmin_invitation': {
+          const { token, password } = payload;
+          if (!token || !password) throw new Error('token y password son requeridos.');
+
+          const tokenHash = await hashToken(token);
+          const { data: tokenRow, error: tokenLookupError } = await coreSupabase
+            .from('superadmin_invitation_tokens')
+            .select('id, user_id, expires_at, used_at')
+            .eq('token_hash', tokenHash)
+            .maybeSingle();
+          if (tokenLookupError) throw tokenLookupError;
+          if (!tokenRow || tokenRow.used_at || new Date(tokenRow.expires_at) < new Date()) {
+            throw new Error('El enlace no es válido o ya expiró. Pide que te reenvíen la invitación.');
+          }
+
+          const { data: userData, error: getUserError } = await coreSupabase.auth.admin.getUserById(tokenRow.user_id);
+          if (getUserError) throw getUserError;
+          const existingMetadata = userData.user?.user_metadata || {};
+
+          const { error: updateError } = await coreSupabase.auth.admin.updateUserById(tokenRow.user_id, {
+            password,
+            user_metadata: { ...existingMetadata, invitation_pending: false },
+          });
+          if (updateError) throw updateError;
+
+          const { error: markUsedError } = await coreSupabase
+            .from('superadmin_invitation_tokens')
+            .update({ used_at: new Date().toISOString() })
+            .eq('id', tokenRow.id);
+          if (markUsedError) throw markUsedError;
 
           responseData = { success: true };
           break;
