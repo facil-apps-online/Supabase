@@ -26,6 +26,7 @@ interface FormData {
   latitude: number;
   longitude: number;
   recaptcha_token: string;
+  invite_ref?: string;
 }
 
 const RECAPTCHA_SECRET_KEY = Deno.env.get('RECAPTCHA_SECRET_KEY');
@@ -47,7 +48,7 @@ serve(async (req) => {
 
   try {
     const payload: FormData = await req.json();
-    const { recaptcha_token, platform_id, ...tenant_data } = payload;
+    const { recaptcha_token, platform_id, invite_ref, ...tenant_data } = payload;
 
     // 1. Validación de reCAPTCHA
     console.log('Paso 1: Validando reCAPTCHA...');
@@ -79,6 +80,93 @@ serve(async (req) => {
     if (coreTenantError) throw new Error(`Error al crear el tenant en la BD Core: ${coreTenantError.message}`);
     createdTenantId = newTenant.id; // Guardamos el ID para el rollback
     console.log(`Tenant creado en BD Core con ID: ${createdTenantId}`);
+
+    // 2.1 Redención de invitación de vendedor (best-effort, no bloquea el registro).
+    if (invite_ref) {
+      try {
+        console.log(`Paso 2.1: Intentando redimir invite_ref '${invite_ref}'...`);
+        const { data: invitation, error: inviteLookupError } = await coreSupabase
+          .from('vendor_invitations')
+          .select('id, vendor_user_id, platform_id, status, trial_days_override')
+          .eq('invite_token', invite_ref)
+          .not('status', 'in', '(cuenta_creada,activo,activo_con_plan,perdido,duplicado)')
+          .maybeSingle();
+
+        if (inviteLookupError) {
+          console.error('Error al buscar la invitación:', inviteLookupError.message);
+        } else if (invitation) {
+          const { error: vendorTenantError } = await coreSupabase.from('vendor_tenants').insert({
+            user_id: invitation.vendor_user_id,
+            tenant_id: createdTenantId,
+            platform_id: invitation.platform_id,
+          });
+          if (vendorTenantError) console.error('Error al vincular vendor_tenants:', vendorTenantError.message);
+
+          const { error: inviteUpdateError } = await coreSupabase
+            .from('vendor_invitations')
+            .update({ status: 'cuenta_creada', tenant_id: createdTenantId })
+            .eq('id', invitation.id);
+          if (inviteUpdateError) console.error('Error al actualizar la invitación:', inviteUpdateError.message);
+
+          // Activa el trial del plan de la plataforma (si tiene uno configurado). El tope de
+          // días SIEMPRE es el duration_days del plan — trial_days_override solo puede reducirlo,
+          // la función lo aplica con LEAST(...) sin importar lo que traiga la invitación.
+          const { data: trialResult, error: trialRpcError } = await coreSupabase.rpc('activate_vendor_trial_subscription', {
+            p_tenant_id: createdTenantId,
+            p_platform_id: invitation.platform_id,
+            p_requested_days: invitation.trial_days_override,
+          });
+          if (trialRpcError) {
+            console.error('Error al invocar activate_vendor_trial_subscription:', trialRpcError.message);
+          } else if (!trialResult?.success) {
+            console.log(`No se activó trial para tenant ${createdTenantId}: ${trialResult?.error}`);
+          } else {
+            console.log(`Trial activado para tenant ${createdTenantId}: ${trialResult.days_granted} días.`);
+          }
+
+          console.log(`Invitación '${invite_ref}' redimida para tenant ${createdTenantId}.`);
+        } else {
+          console.log(`No se encontró una invitación válida para invite_ref '${invite_ref}'.`);
+        }
+      } catch (inviteError) {
+        console.error('Error inesperado redimiendo la invitación (no bloquea el registro):', inviteError.message);
+      }
+    } else {
+      // 2.1 Registro directo (sin vendedor): solo se activa el trial si la plataforma tiene un
+      // plan is_default_trial y además is_active = true. A diferencia del canal de vendedor, aquí
+      // sí se respeta ese flag — es como el admin de la plataforma prende/apaga el trial
+      // automático para altas orgánicas.
+      try {
+        console.log('Paso 2.1: Registro directo, verificando si hay trial activo para la plataforma...');
+        const { data: trialPlan, error: trialPlanError } = await coreSupabase
+          .from('subscription_plans')
+          .select('id')
+          .eq('platform_id', platform_id)
+          .eq('is_default_trial', true)
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if (trialPlanError) {
+          console.error('Error al buscar el plan de prueba de la plataforma:', trialPlanError.message);
+        } else if (trialPlan) {
+          const { data: trialResult, error: trialRpcError } = await coreSupabase.rpc('activate_vendor_trial_subscription', {
+            p_tenant_id: createdTenantId,
+            p_platform_id: platform_id,
+          });
+          if (trialRpcError) {
+            console.error('Error al invocar activate_vendor_trial_subscription:', trialRpcError.message);
+          } else if (!trialResult?.success) {
+            console.log(`No se activó trial para tenant ${createdTenantId}: ${trialResult?.error}`);
+          } else {
+            console.log(`Trial activado (registro directo) para tenant ${createdTenantId}: ${trialResult.days_granted} días.`);
+          }
+        } else {
+          console.log(`La plataforma ${platform_id} no tiene un plan de prueba activo (is_active=true); no se activa trial automático.`);
+        }
+      } catch (trialError) {
+        console.error('Error inesperado activando el trial de registro directo (no bloquea el registro):', trialError.message);
+      }
+    }
 
     console.log('--- Proceso de registro de tenant en Core finalizado exitosamente ---');
     return new Response(JSON.stringify({ 

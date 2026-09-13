@@ -8,6 +8,24 @@ import { Sha256 } from 'https://deno.land/std@0.160.0/hash/sha256.ts';
 
 console.log("Initializing core-actions function (refactored for distributed architecture)");
 
+// Datos de negocio compartidos entre vendor_prospects y vendor_invitations (mismo set de
+// campos que pide "Crear Tenant", menos las credenciales del admin) — capturados desde el
+// primer contacto para no volver a digitarlos al invitar o dar de alta al cliente.
+function extractBusinessFields(prospect: any) {
+  return {
+    legal_name: prospect?.legalName || null,
+    whatsapp_phone: prospect?.whatsappPhone || null,
+    billing_address: prospect?.billingAddress || null,
+    einvoicing_email: prospect?.einvoicingEmail || null,
+    physical_address_line1: prospect?.physicalAddressLine1 || null,
+    physical_address_line2: prospect?.physicalAddressLine2 || null,
+    physical_city: prospect?.physicalCity || null,
+    physical_state: prospect?.physicalState || null,
+    physical_postal_code: prospect?.physicalPostalCode || null,
+    website: prospect?.website || null,
+  };
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -59,8 +77,8 @@ Deno.serve(async (req) => {
       
       // Platform/App Admins (app_super_admin)
       'create_user': ['super_admin', 'app_super_admin'],
-      'get_tenants': ['super_admin', 'app_super_admin'],
-      'get_tenant_by_id': ['super_admin', 'app_super_admin'],
+      'get_tenants': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'get_tenant_by_id': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'get_subscriptions_by_tenant': ['super_admin', 'app_super_admin'],
       'get_tenant_integrations': ['super_admin', 'app_super_admin'],
       'save_whatsapp_integration': ['super_admin', 'app_super_admin'],
@@ -109,15 +127,31 @@ Deno.serve(async (req) => {
       'remove_platform_assignment': ['super_admin', 'app_super_admin'],
       'update_investor_stake': ['super_admin'],
       'assign_super_admin_role': ['super_admin'],
-      'assign_vendor_role': ['super_admin', 'app_super_admin'],
-      'assign_vendor_platform_commissions': ['super_admin', 'app_super_admin'],
+      'assign_vendor_role': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'remove_vendor_tenant_assignment': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'get_tenant_vendor_assignment': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'assign_vendor_platform_commissions': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'create_vendor_invitation': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'get_platform_trial_plan': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'list_vendor_invitations': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'update_vendor_invitation_status': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'delete_vendor_invitation': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'get_vendor_invitation_funnel': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'create_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'update_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'get_vendor_conversion_report': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'list_vendor_prospects': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'delete_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'log_vendor_prospect_visit': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'list_vendor_prospect_visits': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
+      'convert_vendor_prospect_to_invitation': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'delete_user': ['super_admin'],
                 'update_user_name': ['super_admin', 'app_super_admin'],
                 'get_vendor_platform_commissions': ['super_admin', 'app_super_admin', 'vendor'],
                 'update_vendor_platform_commission': ['super_admin', 'app_super_admin'],
                 'remove_vendor_platform_commission': ['super_admin', 'app_super_admin'],
-                'get_platforms_stats': ['super_admin', 'app_super_admin', 'investor', 'vendor'],
-                'get_superadmin_payment_stats': ['super_admin', 'app_super_admin', 'investor', 'vendor'],
+                'get_platforms_stats': ['super_admin', 'app_super_admin', 'investor', 'vendor', 'comercial_admin'],
+                'get_superadmin_payment_stats': ['super_admin', 'app_super_admin', 'investor', 'vendor', 'comercial_admin'],
                 'get_countries_for_platform': ['super_admin', 'app_super_admin'],
                 'assign_country_to_platform': ['super_admin', 'app_super_admin'],
                 'remove_country_from_platform': ['super_admin', 'app_super_admin'],
@@ -126,11 +160,11 @@ Deno.serve(async (req) => {
       'upsert_billing_entity': ['super_admin'],
       
       // General Read Actions for any authenticated user of the superadmin portal
-      'get_platforms': ['super_admin', 'app_super_admin', 'investor', 'vendor'],
-      'get_platform_by_id': ['super_admin', 'app_super_admin', 'investor', 'vendor'],
-      'get_currencies': ['super_admin', 'app_super_admin', 'investor', 'vendor'],
-      'get_countries': ['super_admin', 'app_super_admin', 'investor', 'vendor'],
-      'get_languages': ['super_admin', 'app_super_admin', 'investor', 'vendor'],
+      'get_platforms': ['super_admin', 'app_super_admin', 'investor', 'vendor', 'comercial_admin'],
+      'get_platform_by_id': ['super_admin', 'app_super_admin', 'investor', 'vendor', 'comercial_admin'],
+      'get_currencies': ['super_admin', 'app_super_admin', 'investor', 'vendor', 'comercial_admin'],
+      'get_countries': ['super_admin', 'app_super_admin', 'investor', 'vendor', 'comercial_admin'],
+      'get_languages': ['super_admin', 'app_super_admin', 'investor', 'vendor', 'comercial_admin'],
       'get_global_integrations': ['super_admin', 'app_super_admin'],
       'get_integration_provider': ['super_admin', 'app_super_admin'],
       'get_integration_http_methods': ['super_admin', 'app_super_admin'],
@@ -169,6 +203,9 @@ Deno.serve(async (req) => {
       .map(([action]) => action);
 
     // --- Authorization & Role-Based Access Control ---
+    let callerUserId: string | null = null;
+    let callerRoles: string[] = [];
+
     if (internalServiceActions.includes(action)) {
       const internalSecret = req.headers.get('X-Internal-Service-Secret');
       const expectedSecret = Deno.env.get('INTERNAL_SERVICE_SECRET');
@@ -208,6 +245,8 @@ Deno.serve(async (req) => {
 
         const userRoles = (decodedToken?.app_metadata?.assignments || []).map((a: any) => a.role);
         const userId = decodedToken?.sub;
+        callerUserId = userId ?? null;
+        callerRoles = userRoles;
 
         // super_admin can do anything
         if (userRoles.includes('super_admin')) {
@@ -290,14 +329,18 @@ Deno.serve(async (req) => {
 
         case 'create_user': {
           console.log("[core-actions] Matched action: 'create_user'");
-          const { email, password, fullName, role, firstName: payloadFirstName, lastName: payloadLastName } = payload;
+          // NOTA: este era el primero de dos 'case create_user' duplicados en este switch —
+          // JS solo ejecuta el primero, así que el segundo (más abajo) estaba muerto y con él
+          // la lógica que de verdad escribía platform_assignments/investor_platform_shares/
+          // vendor_platform_commissions. Se fusionó aquí; el bloque muerto se eliminó.
+          const { email, password, fullName, role, assignments, firstName: payloadFirstName, lastName: payloadLastName } = payload;
           if (!email || !password || !fullName || !role) {
             throw new Error('email, password, fullName, and role are required.');
           }
 
           const firstName = payloadFirstName || (fullName.split(' ')[0] || '');
           const lastName = payloadLastName || (fullName.split(' ').slice(1).join(' ') || '');
-          
+
           const { data: newUser, error: createError } = await coreSupabase.auth.admin.createUser({
             email,
             password,
@@ -311,7 +354,31 @@ Deno.serve(async (req) => {
           if (createError) {
             throw createError;
           }
-          
+
+          const userId = newUser.user.id;
+
+          if (assignments && assignments.length > 0) {
+            if (role === 'app_super_admin' || role === 'comercial_admin') {
+              const { data: roleData, error: roleError } = await coreSupabase.from('roles').select('id').eq('name', role).single();
+              if (roleError) throw new Error(`Could not find role ${role}.`);
+              const platformAssignments = assignments.map((platformId: string) => ({ user_id: userId, platform_id: platformId, role_id: roleData.id }));
+              const { error } = await coreSupabase.from('platform_assignments').insert(platformAssignments);
+              if (error) throw error;
+            } else if (role === 'investor') {
+              const investorData = assignments.map((a: any) => ({
+                user_id: userId, platform_id: a.platformId, investment_share: a.stake / 100,
+              }));
+              const { error } = await coreSupabase.from('investor_platform_shares').insert(investorData);
+              if (error) throw error;
+            } else if (role === 'vendor') {
+              const vendorData = assignments.map((platformId: string) => ({
+                user_id: userId, platform_id: platformId,
+              }));
+              const { error } = await coreSupabase.from('vendor_platform_commissions').insert(vendorData);
+              if (error) throw error;
+            }
+          }
+
           responseData = { success: true, user: newUser.user };
           break;
         }
@@ -1270,9 +1337,9 @@ Deno.serve(async (req) => {
             }));
             existingAssignments = existingAssignments.filter((ea: any) => !(ea.role === 'investor' && newAssignment.some((na: any) => na.platform_id === ea.platform_id)));
             existingAssignments.push(...newAssignment);
-          } else if (role === 'app_super_admin') {
-            const { data: roleData, error: roleError } = await coreSupabase.from('roles').select('id').eq('name', 'app_super_admin').single();
-            if (roleError) throw new Error('Could not find app_super_admin role.');
+          } else if (role === 'app_super_admin' || role === 'comercial_admin') {
+            const { data: roleData, error: roleError } = await coreSupabase.from('roles').select('id').eq('name', role).single();
+            if (roleError) throw new Error(`Could not find ${role} role.`);
             const roleId = roleData.id;
             const platformAssignments = assignments.map((a: any) => ({
               user_id: userId, platform_id: a.platformId, role_id: roleId,
@@ -1280,9 +1347,9 @@ Deno.serve(async (req) => {
             const { error } = await coreSupabase.from('platform_assignments').upsert(platformAssignments);
             if (error) throw error;
             const newAssignment = assignments.map((a: any) => ({
-              assignment_id: crypto.randomUUID(), tenant_id: null, tenant_name: null, role_id: roleId, role: 'app_super_admin', platform_id: a.platformId, platform_name: a.platform_name, branch_id: null, branch_name: null, status: 'active',
+              assignment_id: crypto.randomUUID(), tenant_id: null, tenant_name: null, role_id: roleId, role: role, platform_id: a.platformId, platform_name: a.platform_name, branch_id: null, branch_name: null, status: 'active',
             }));
-            existingAssignments = existingAssignments.filter((ea: any) => !(ea.role === 'app_super_admin' && newAssignment.some((na: any) => na.platform_id === ea.platform_id)));
+            existingAssignments = existingAssignments.filter((ea: any) => !(ea.role === role && newAssignment.some((na: any) => na.platform_id === ea.platform_id)));
             existingAssignments.push(...newAssignment);
           } else {
             throw new Error(`Role ${role} is not a platform-level role.`);
@@ -1301,7 +1368,7 @@ Deno.serve(async (req) => {
             if (role === 'investor') {
                 const { error } = await coreSupabase.from('investor_platform_shares').delete().match({ user_id: userId, platform_id: platformId });
                 if (error) throw error;
-            } else if (role === 'app_super_admin') {
+            } else if (role === 'app_super_admin' || role === 'comercial_admin') {
                 const { error } = await coreSupabase.from('platform_assignments').delete().match({ user_id: userId, platform_id: platformId });
                 if (error) throw error;
             }
@@ -1342,9 +1409,60 @@ Deno.serve(async (req) => {
         case 'assign_vendor_role': {
           const { userId, tenantId } = payload;
           if (!userId || !tenantId) throw new Error('userId and tenantId are required.');
-          const { error } = await coreSupabase.from('vendor_tenants').insert({ user_id: userId, tenant_id: tenantId });
+          // vendor_tenants.platform_id es NOT NULL: se deriva del tenant en vez de exigirlo
+          // al llamador, para poder usar esta misma acción como asignación manual desde
+          // TenantDetails (donde solo se conoce el tenantId).
+          const { data: assignTenant, error: assignTenantError } = await coreSupabase
+            .from('tenants')
+            .select('platform_id')
+            .eq('id', tenantId)
+            .single();
+          if (assignTenantError) throw assignTenantError;
+          const { error } = await coreSupabase.from('vendor_tenants').insert({
+            user_id: userId,
+            tenant_id: tenantId,
+            platform_id: assignTenant.platform_id,
+          });
           if (error) throw error;
           responseData = { success: true };
+          break;
+        }
+
+        case 'remove_vendor_tenant_assignment': {
+          const { userId, tenantId } = payload;
+          if (!userId || !tenantId) throw new Error('userId and tenantId are required.');
+          const { error } = await coreSupabase
+            .from('vendor_tenants')
+            .delete()
+            .eq('user_id', userId)
+            .eq('tenant_id', tenantId);
+          if (error) throw error;
+          responseData = { success: true };
+          break;
+        }
+
+        case 'get_tenant_vendor_assignment': {
+          const { tenantId } = payload || {};
+          if (!tenantId) throw new Error('tenantId is required.');
+          const { data: vtRows, error: vtError } = await coreSupabase
+            .from('vendor_tenants')
+            .select('user_id')
+            .eq('tenant_id', tenantId)
+            .order('created_at', { ascending: false })
+            .limit(1);
+          if (vtError) throw vtError;
+          const vtRow = vtRows?.[0];
+          if (!vtRow) {
+            responseData = null;
+            break;
+          }
+          const { data: vendorUser, error: vendorUserError } = await coreSupabase.auth.admin.getUserById(vtRow.user_id);
+          if (vendorUserError) throw vendorUserError;
+          responseData = {
+            userId: vtRow.user_id,
+            email: vendorUser.user.email,
+            fullName: `${vendorUser.user.user_metadata?.first_name || ''} ${vendorUser.user.user_metadata?.last_name || ''}`.trim(),
+          };
           break;
         }
 
@@ -1360,54 +1478,444 @@ Deno.serve(async (req) => {
           break;
         }
 
+        case 'get_platform_trial_plan': {
+          const { platformId } = payload || {};
+          if (!platformId) throw new Error('platformId is required.');
+          const { data: trialPlan, error: trialPlanError } = await coreSupabase
+            .from('subscription_plans')
+            .select('id, duration_days')
+            .eq('platform_id', platformId)
+            .eq('is_default_trial', true)
+            .maybeSingle();
+          if (trialPlanError) throw trialPlanError;
+          responseData = trialPlan
+            ? { planId: trialPlan.id, durationDays: trialPlan.duration_days }
+            : { planId: null, durationDays: null };
+          break;
+        }
+
+        case 'create_vendor_invitation': {
+          const { platformId, vendorUserId, prospect, trialDaysOverride, notes } = payload;
+          if (!platformId || !prospect?.firstName) throw new Error('platformId y el nombre del prospecto son requeridos.');
+
+          const isVendorOnly = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+          const targetVendorUserId = isVendorOnly ? callerUserId : (vendorUserId || callerUserId);
+          if (!targetVendorUserId) throw new Error('No se pudo determinar el vendedor de la invitación.');
+
+          if (trialDaysOverride !== undefined && trialDaysOverride !== null) {
+            const { data: trialPlan } = await coreSupabase
+              .from('subscription_plans')
+              .select('duration_days')
+              .eq('platform_id', platformId)
+              .eq('is_default_trial', true)
+              .maybeSingle();
+            if (!trialPlan) {
+              throw new Error('Esta plataforma no tiene un plan de prueba configurado; no se pueden asignar días de prueba.');
+            }
+            // El vendedor solo puede pedir MENOS días que el plan de la plataforma, nunca más.
+            if (trialDaysOverride > trialPlan.duration_days) {
+              throw new Error(`Los días de prueba no pueden superar los del plan de prueba de la plataforma (${trialPlan.duration_days}).`);
+            }
+            if (trialDaysOverride < 1) throw new Error('Los días de prueba deben ser al menos 1.');
+          }
+
+          const { data: platform, error: platformError } = await coreSupabase
+            .from('platforms')
+            .select('base_url')
+            .eq('id', platformId)
+            .single();
+          if (platformError) throw platformError;
+
+          const inviteToken = crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+          const base = platform.base_url?.replace(/\/$/, '') || '';
+          const inviteUrl = `${base}/registro?ref=${inviteToken}`;
+
+          const { data, error } = await coreSupabase
+            .from('vendor_invitations')
+            .insert({
+              vendor_user_id: targetVendorUserId,
+              platform_id: platformId,
+              prospect_first_name: prospect.firstName,
+              prospect_last_name: prospect.lastName || null,
+              prospect_email: prospect.email || null,
+              prospect_phone: prospect.phone || null,
+              company_name: prospect.companyName || null,
+              tax_id: prospect.taxId || null,
+              ...extractBusinessFields(prospect),
+              invite_token: inviteToken,
+              invite_url: inviteUrl,
+              trial_days_override: trialDaysOverride ?? null,
+              notes: notes || null,
+            })
+            .select(`*, platform:platforms (name)`)
+            .single();
+          if (error) throw error;
+          responseData = { ...data, platform_name: data.platform.name, platform: undefined };
+          break;
+        }
+
+        case 'list_vendor_invitations': {
+          const { vendorUserId, platformId, status, q } = payload || {};
+          const isVendorOnly = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let query = coreSupabase
+            .from('vendor_invitations')
+            .select(`*, platform:platforms (name)`);
+
+          if (isVendorOnly) {
+            query = query.eq('vendor_user_id', callerUserId);
+          } else if (vendorUserId) {
+            query = query.eq('vendor_user_id', vendorUserId);
+          }
+          if (platformId) query = query.eq('platform_id', platformId);
+          if (status) query = query.eq('status', status);
+          if (q) {
+            query = query.or(`prospect_first_name.ilike.%${q}%,prospect_last_name.ilike.%${q}%,prospect_email.ilike.%${q}%,company_name.ilike.%${q}%`);
+          }
+
+          const { data, error } = await query.order('created_at', { ascending: false });
+          if (error) throw error;
+          responseData = (data || []).map((d: any) => ({ ...d, platform_name: d.platform?.name, platform: undefined }));
+          break;
+        }
+
+        case 'update_vendor_invitation_status': {
+          const { invitationId, status, notes } = payload;
+          if (!invitationId || !status) throw new Error('invitationId y status son requeridos.');
+          const isVendorOnly = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let query = coreSupabase.from('vendor_invitations').update({
+            status,
+            ...(notes !== undefined ? { notes } : {}),
+          }).eq('id', invitationId);
+          if (isVendorOnly) query = query.eq('vendor_user_id', callerUserId);
+
+          const { data, error } = await query.select().single();
+          if (error) throw error;
+          if (!data) throw new Error('Invitación no encontrada o sin permiso para editarla.');
+          responseData = data;
+          break;
+        }
+
+        case 'delete_vendor_invitation': {
+          const { invitationId } = payload;
+          if (!invitationId) throw new Error('invitationId es requerido.');
+          const isVendorOnly = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let query = coreSupabase.from('vendor_invitations').delete().eq('id', invitationId);
+          if (isVendorOnly) query = query.eq('vendor_user_id', callerUserId);
+
+          const { error } = await query;
+          if (error) throw error;
+          responseData = { success: true };
+          break;
+        }
+
+        case 'get_vendor_invitation_funnel': {
+          const { vendorUserId, platformId } = payload || {};
+          const isVendorOnly = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let query = coreSupabase.from('vendor_invitations').select('status');
+          if (isVendorOnly) {
+            query = query.eq('vendor_user_id', callerUserId);
+          } else if (vendorUserId) {
+            query = query.eq('vendor_user_id', vendorUserId);
+          }
+          if (platformId) query = query.eq('platform_id', platformId);
+
+          const { data, error } = await query;
+          if (error) throw error;
+          const counts: Record<string, number> = {};
+          for (const row of data || []) {
+            counts[row.status] = (counts[row.status] || 0) + 1;
+          }
+          responseData = counts;
+          break;
+        }
+
+        case 'get_vendor_conversion_report': {
+          const { vendorUserId, platformId } = payload || {};
+          const isVendorOnlyCr = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let prospectsQuery = coreSupabase.from('vendor_prospects').select('vendor_user_id, status');
+          let invitationsQuery = coreSupabase.from('vendor_invitations').select('vendor_user_id, status');
+
+          if (isVendorOnlyCr) {
+            prospectsQuery = prospectsQuery.eq('vendor_user_id', callerUserId);
+            invitationsQuery = invitationsQuery.eq('vendor_user_id', callerUserId);
+          } else if (vendorUserId) {
+            prospectsQuery = prospectsQuery.eq('vendor_user_id', vendorUserId);
+            invitationsQuery = invitationsQuery.eq('vendor_user_id', vendorUserId);
+          }
+          if (platformId) {
+            prospectsQuery = prospectsQuery.eq('platform_id', platformId);
+            invitationsQuery = invitationsQuery.eq('platform_id', platformId);
+          }
+
+          const [{ data: prospectRows, error: prospectsErr }, { data: invitationRows, error: invitationsErr }] = await Promise.all([prospectsQuery, invitationsQuery]);
+          if (prospectsErr) throw prospectsErr;
+          if (invitationsErr) throw invitationsErr;
+
+          const stats: Record<string, any> = {};
+          const ensureStat = (vid: string) => (stats[vid] ||= {
+            vendorUserId: vid,
+            prospectsTotal: 0,
+            prospectsConverted: 0,
+            invitationsTotal: 0,
+            invitationsAccountCreated: 0,
+            invitationsActive: 0,
+            invitationsPaying: 0,
+            invitationsLostOrDuplicate: 0,
+          });
+
+          for (const p of prospectRows || []) {
+            const s = ensureStat(p.vendor_user_id);
+            s.prospectsTotal++;
+            if (p.status === 'convertido') s.prospectsConverted++;
+          }
+          for (const inv of invitationRows || []) {
+            const s = ensureStat(inv.vendor_user_id);
+            s.invitationsTotal++;
+            if (['cuenta_creada', 'activo', 'activo_con_plan'].includes(inv.status)) s.invitationsAccountCreated++;
+            if (inv.status === 'activo' || inv.status === 'activo_con_plan') s.invitationsActive++;
+            if (inv.status === 'activo_con_plan') s.invitationsPaying++;
+            if (inv.status === 'perdido' || inv.status === 'duplicado') s.invitationsLostOrDuplicate++;
+          }
+
+          responseData = Object.values(stats);
+          break;
+        }
+
+        case 'create_vendor_prospect': {
+          const { platformId, vendorUserId, prospect } = payload;
+          if (!platformId || !prospect?.firstName) throw new Error('platformId y el nombre del prospecto son requeridos.');
+
+          const isVendorOnlyCp = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+          const targetVendorUserId = isVendorOnlyCp ? callerUserId : (vendorUserId || callerUserId);
+          if (!targetVendorUserId) throw new Error('No se pudo determinar el vendedor del prospecto.');
+
+          const { data, error } = await coreSupabase
+            .from('vendor_prospects')
+            .insert({
+              vendor_user_id: targetVendorUserId,
+              platform_id: platformId,
+              first_name: prospect.firstName,
+              last_name: prospect.lastName || null,
+              phone: prospect.phone || null,
+              email: prospect.email || null,
+              company_name: prospect.companyName || null,
+              tax_id: prospect.taxId || null,
+              ...extractBusinessFields(prospect),
+            })
+            .select(`*, platform:platforms (name)`)
+            .single();
+          if (error) throw error;
+          responseData = { ...data, platform_name: data.platform.name, platform: undefined };
+          break;
+        }
+
+        case 'list_vendor_prospects': {
+          const { vendorUserId, platformId, status, q, dueOnly } = payload || {};
+          const isVendorOnlyLp = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let query = coreSupabase
+            .from('vendor_prospects')
+            .select(`*, platform:platforms (name)`);
+
+          if (isVendorOnlyLp) {
+            query = query.eq('vendor_user_id', callerUserId);
+          } else if (vendorUserId) {
+            query = query.eq('vendor_user_id', vendorUserId);
+          }
+          if (platformId) query = query.eq('platform_id', platformId);
+          if (status) query = query.eq('status', status);
+          if (q) {
+            query = query.or(`first_name.ilike.%${q}%,last_name.ilike.%${q}%,email.ilike.%${q}%,company_name.ilike.%${q}%`);
+          }
+          if (dueOnly) {
+            query = query.not('next_visit_at', 'is', null).lte('next_visit_at', new Date().toISOString());
+          }
+
+          const { data, error } = await query.order(dueOnly ? 'next_visit_at' : 'created_at', { ascending: !!dueOnly });
+          if (error) throw error;
+          responseData = (data || []).map((d: any) => ({ ...d, platform_name: d.platform?.name, platform: undefined }));
+          break;
+        }
+
+        case 'update_vendor_prospect': {
+          const { prospectId, prospect } = payload;
+          if (!prospectId || !prospect) throw new Error('prospectId y prospect son requeridos.');
+          const isVendorOnlyUp = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          const updates: Record<string, unknown> = { ...extractBusinessFields(prospect) };
+          if (prospect.firstName !== undefined) updates.first_name = prospect.firstName;
+          if (prospect.lastName !== undefined) updates.last_name = prospect.lastName || null;
+          if (prospect.phone !== undefined) updates.phone = prospect.phone || null;
+          if (prospect.email !== undefined) updates.email = prospect.email || null;
+          if (prospect.companyName !== undefined) updates.company_name = prospect.companyName || null;
+          if (prospect.taxId !== undefined) updates.tax_id = prospect.taxId || null;
+
+          let query = coreSupabase.from('vendor_prospects').update(updates).eq('id', prospectId);
+          if (isVendorOnlyUp) query = query.eq('vendor_user_id', callerUserId);
+
+          const { data, error } = await query.select(`*, platform:platforms (name)`).single();
+          if (error) throw error;
+          if (!data) throw new Error('Prospecto no encontrado o sin permiso para editarlo.');
+          responseData = { ...data, platform_name: data.platform.name, platform: undefined };
+          break;
+        }
+
+        case 'delete_vendor_prospect': {
+          const { prospectId } = payload;
+          if (!prospectId) throw new Error('prospectId es requerido.');
+          const isVendorOnlyDp = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let query = coreSupabase.from('vendor_prospects').delete().eq('id', prospectId);
+          if (isVendorOnlyDp) query = query.eq('vendor_user_id', callerUserId);
+
+          const { error } = await query;
+          if (error) throw error;
+          responseData = { success: true };
+          break;
+        }
+
+        case 'log_vendor_prospect_visit': {
+          const { prospectId, status, notes, visitDate, nextVisitDate } = payload;
+          if (!prospectId || !status) throw new Error('prospectId y status son requeridos.');
+          const isVendorOnlyLv = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let prospectQuery = coreSupabase.from('vendor_prospects').select('id, vendor_user_id').eq('id', prospectId);
+          if (isVendorOnlyLv) prospectQuery = prospectQuery.eq('vendor_user_id', callerUserId);
+          const { data: prospectRow, error: prospectError } = await prospectQuery.maybeSingle();
+          if (prospectError) throw prospectError;
+          if (!prospectRow) throw new Error('Prospecto no encontrado o sin permiso para editarlo.');
+
+          const { data: visit, error: visitError } = await coreSupabase
+            .from('vendor_prospect_visits')
+            .insert({
+              prospect_id: prospectId,
+              vendor_user_id: callerUserId || prospectRow.vendor_user_id,
+              status,
+              notes: notes || null,
+              ...(visitDate ? { visit_date: visitDate } : {}),
+            })
+            .select()
+            .single();
+          if (visitError) throw visitError;
+
+          const { error: updateProspectError } = await coreSupabase
+            .from('vendor_prospects')
+            .update({
+              status,
+              last_visit_at: visit.visit_date,
+              // Solo se toca si esta visita trae una fecha nueva; si no, se deja la que ya
+              // hubiera (o null si nunca se agendó ninguna).
+              ...(nextVisitDate !== undefined ? { next_visit_at: nextVisitDate || null } : {}),
+            })
+            .eq('id', prospectId);
+          if (updateProspectError) throw updateProspectError;
+
+          responseData = visit;
+          break;
+        }
+
+        case 'list_vendor_prospect_visits': {
+          const { prospectId } = payload || {};
+          if (!prospectId) throw new Error('prospectId es requerido.');
+          const { data, error } = await coreSupabase
+            .from('vendor_prospect_visits')
+            .select('*')
+            .eq('prospect_id', prospectId)
+            .order('visit_date', { ascending: false });
+          if (error) throw error;
+          responseData = data || [];
+          break;
+        }
+
+        case 'convert_vendor_prospect_to_invitation': {
+          const { prospectId, trialDaysOverride } = payload;
+          if (!prospectId) throw new Error('prospectId es requerido.');
+          const isVendorOnlyCv = !callerRoles.includes('super_admin') && !callerRoles.includes('app_super_admin') && !callerRoles.includes('comercial_admin');
+
+          let prospectQuery = coreSupabase.from('vendor_prospects').select('*').eq('id', prospectId);
+          if (isVendorOnlyCv) prospectQuery = prospectQuery.eq('vendor_user_id', callerUserId);
+          const { data: prospectRow, error: prospectError } = await prospectQuery.maybeSingle();
+          if (prospectError) throw prospectError;
+          if (!prospectRow) throw new Error('Prospecto no encontrado o sin permiso para convertirlo.');
+          if (prospectRow.status === 'convertido') throw new Error('Este prospecto ya fue convertido a invitación.');
+
+          if (trialDaysOverride !== undefined && trialDaysOverride !== null) {
+            const { data: trialPlan } = await coreSupabase
+              .from('subscription_plans')
+              .select('duration_days')
+              .eq('platform_id', prospectRow.platform_id)
+              .eq('is_default_trial', true)
+              .maybeSingle();
+            if (!trialPlan) {
+              throw new Error('Esta plataforma no tiene un plan de prueba configurado; no se pueden asignar días de prueba.');
+            }
+            if (trialDaysOverride > trialPlan.duration_days) {
+              throw new Error(`Los días de prueba no pueden superar los del plan de prueba de la plataforma (${trialPlan.duration_days}).`);
+            }
+            if (trialDaysOverride < 1) throw new Error('Los días de prueba deben ser al menos 1.');
+          }
+
+          const { data: platform, error: platformError } = await coreSupabase
+            .from('platforms')
+            .select('base_url')
+            .eq('id', prospectRow.platform_id)
+            .single();
+          if (platformError) throw platformError;
+
+          const inviteToken = crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+          const base = platform.base_url?.replace(/\/$/, '') || '';
+          const inviteUrl = `${base}/registro?ref=${inviteToken}`;
+
+          const { data: invitation, error: invitationError } = await coreSupabase
+            .from('vendor_invitations')
+            .insert({
+              vendor_user_id: prospectRow.vendor_user_id,
+              platform_id: prospectRow.platform_id,
+              prospect_first_name: prospectRow.first_name,
+              prospect_last_name: prospectRow.last_name,
+              prospect_email: prospectRow.email,
+              prospect_phone: prospectRow.phone,
+              company_name: prospectRow.company_name,
+              tax_id: prospectRow.tax_id,
+              legal_name: prospectRow.legal_name,
+              whatsapp_phone: prospectRow.whatsapp_phone,
+              billing_address: prospectRow.billing_address,
+              einvoicing_email: prospectRow.einvoicing_email,
+              physical_address_line1: prospectRow.physical_address_line1,
+              physical_address_line2: prospectRow.physical_address_line2,
+              physical_city: prospectRow.physical_city,
+              physical_state: prospectRow.physical_state,
+              physical_postal_code: prospectRow.physical_postal_code,
+              website: prospectRow.website,
+              invite_token: inviteToken,
+              invite_url: inviteUrl,
+              trial_days_override: trialDaysOverride ?? null,
+            })
+            .select(`*, platform:platforms (name)`)
+            .single();
+          if (invitationError) throw invitationError;
+
+          const { error: updateProspectError2 } = await coreSupabase
+            .from('vendor_prospects')
+            .update({ status: 'convertido', invitation_id: invitation.id })
+            .eq('id', prospectId);
+          if (updateProspectError2) throw updateProspectError2;
+
+          responseData = { ...invitation, platform_name: invitation.platform.name, platform: undefined };
+          break;
+        }
+
         case 'delete_user': {
           const { userId } = payload;
           if (!userId) throw new Error('userId is required for deletion.');
           const { error } = await coreSupabase.auth.admin.deleteUser(userId);
           if (error) throw error;
           responseData = { success: true };
-          break;
-        }
-
-        case 'create_user': {
-          console.log("[core-actions] Matched action: 'create_user'");
-          const { email, password, fullName, role, assignments } = payload;
-          if (!email || !password || !fullName || !role) throw new Error('email, password, fullName, and role are required.');
-          const nameParts = fullName.split(' ');
-          const firstName = nameParts.shift() || '';
-          const lastName = nameParts.join(' ');
-          const { data: newUser, error: createError } = await coreSupabase.auth.admin.createUser({
-            email,
-            password,
-            email_confirm: true,
-            user_metadata: { full_name: fullName, first_name: firstName, last_name: lastName },
-            app_metadata: {
-              assignments: [{ role: role }]
-            }
-          });
-          if (createError) throw createError;
-          const userId = newUser.user.id;
-          const { data: roleData, error: roleError } = await coreSupabase.from('roles').select('id').eq('name', role).single();
-          if (roleError) throw new Error('Could not find role.'); // Changed
-          const roleId = roleData.id;
-          if (role === 'app_super_admin' && assignments) {
-            const platformAssignments = assignments.map((platformId: string) => ({ user_id: userId, platform_id: platformId, role_id: roleId }));
-            const { error } = await coreSupabase.from('platform_assignments').insert(platformAssignments);
-            if (error) throw error;
-          } else if (role === 'investor' && assignments) {
-            const investorData = assignments.map((a: any) => ({
-              user_id: userId, platform_id: a.platformId, investment_share: a.stake / 100,
-            }));
-            const { error } = await coreSupabase.from('investor_platform_shares').insert(investorData);
-            if (error) throw error;
-          } else if (role === 'vendor' && assignments) {
-            const vendorData = assignments.map((platformId: string) => ({
-              user_id: userId, platform_id: platformId,
-            }));
-            const { error } = await coreSupabase.from('vendor_platform_commissions').insert(vendorData);
-            if (error) throw error;
-          }
-          responseData = { success: true, user: newUser.user };
           break;
         }
 
