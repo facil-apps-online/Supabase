@@ -1701,21 +1701,47 @@ Deno.serve(async (req) => {
 
           // Sin contraseña: el invitado la crea él mismo desde el link (igual patrón que
           // Fel.Api.Tenant/TenantDevelopersController en Facil Factura).
+          let userId: string;
           const { data: newUser, error: createError } = await coreSupabase.auth.admin.createUser({
             email,
             email_confirm: false,
             user_metadata: { full_name: fullName, first_name: firstName, last_name: lastName },
             app_metadata: { assignments: [{ role: 'vendor' }] },
           });
-          if (createError) throw createError;
+
+          if (createError) {
+            // El link vence en 1 hora (otp_expiry); si nadie lo usó a tiempo, reinvitar al mismo
+            // correo debe reenviar un link nuevo en vez de fallar con "ya está registrado".
+            const alreadyExists = /already.*registered|already exists/i.test(createError.message || '');
+            if (!alreadyExists) throw createError;
+
+            const { data: existingList, error: listError } = await coreSupabase.auth.admin.listUsers({ perPage: 1000 });
+            if (listError) throw listError;
+            const existing = existingList.users.find((u: any) => u.email === email);
+            if (!existing) throw createError;
+            if (existing.email_confirmed_at) {
+              throw new Error('Ya existe una cuenta activa con este correo.');
+            }
+
+            userId = existing.id;
+            const { error: updateError } = await coreSupabase.auth.admin.updateUserById(userId, {
+              user_metadata: { full_name: fullName, first_name: firstName, last_name: lastName },
+              app_metadata: { assignments: [{ role: 'vendor' }] },
+            });
+            if (updateError) throw updateError;
+          } else {
+            userId = newUser.user.id;
+          }
 
           const commissionRows = platforms.map((p: any) => ({
-            user_id: newUser.user.id,
+            user_id: userId,
             platform_id: p.platformId,
             first_payment_commission_rate: (p.firstPaymentCommissionRate ?? 50) / 100,
             recurring_payment_commission_rate: (p.recurringPaymentCommissionRate ?? 10) / 100,
           }));
-          const { error: commissionError } = await coreSupabase.from('vendor_platform_commissions').insert(commissionRows);
+          const { error: commissionError } = await coreSupabase
+            .from('vendor_platform_commissions')
+            .upsert(commissionRows, { onConflict: 'user_id, platform_id' });
           if (commissionError) throw commissionError;
 
           const { data: linkData, error: linkError } = await coreSupabase.auth.admin.generateLink({
@@ -1738,7 +1764,7 @@ Deno.serve(async (req) => {
           });
           if (queueError) throw queueError;
 
-          responseData = { success: true, userId: newUser.user.id };
+          responseData = { success: true, userId };
           break;
         }
 
