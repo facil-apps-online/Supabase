@@ -28,6 +28,34 @@ function extractBusinessFields(prospect: any) {
   };
 }
 
+// Genera un link de invitación de Supabase Auth (vence en 1 hora, otp_expiry) y lo encola con
+// Brevo — usado tanto al invitar por primera vez como al reenviar. Invitación genérica de
+// Facil Apps Online: platform_id NULL a propósito, no referencia ningún producto/plataforma.
+async function generateAndQueueTeamInvitation(coreSupabase: any, email: string, fullName: string) {
+  // type: 'recovery', no 'invite' — generateLink nunca manda correo por sí solo en ningún caso,
+  // pero 'invite' solo aplica a un usuario aún no confirmado, y este ya se crea con
+  // email_confirm:true (para que Supabase mismo no dispare su propio correo de confirmación,
+  // sin formato y con un link que no es el nuestro). 'recovery' es el tipo correcto para "dale
+  // una sesión a un usuario confirmado sin contraseña utilizable todavía".
+  const { data: linkData, error: linkError } = await coreSupabase.auth.admin.generateLink({
+    type: 'recovery',
+    email,
+    options: { redirectTo: 'https://admin.facil-apps.online/invitacion' },
+  });
+  if (linkError) throw linkError;
+  const actionLink = linkData?.properties?.action_link;
+  if (!actionLink) throw new Error('No se pudo generar el link de invitación.');
+
+  const { error: queueError } = await coreSupabase.rpc('queue_platform_email', {
+    p_platform_id: null,
+    p_recipient_email: email,
+    p_template_type: 'team_invitation',
+    p_template_data: { reset_link: actionLink, user_name: fullName },
+    p_tenant_id: null,
+  });
+  if (queueError) throw queueError;
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -140,6 +168,7 @@ Deno.serve(async (req) => {
       'delete_vendor_invitation': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'get_vendor_invitation_funnel': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'invite_superadmin_team_member': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'resend_superadmin_team_invitation': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'create_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'update_vendor_prospect': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'get_vendor_conversion_report': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
@@ -1700,12 +1729,15 @@ Deno.serve(async (req) => {
           const lastName = nameParts.join(' ');
 
           // Sin contraseña: el invitado la crea él mismo desde el link (igual patrón que
-          // Fel.Api.Tenant/TenantDevelopersController en Facil Factura).
+          // Fel.Api.Tenant/TenantDevelopersController en Facil Factura). email_confirm:true
+          // a propósito — así Supabase NO dispara su propio correo de confirmación (sin
+          // formato y con un link que no es el nuestro); invitation_pending:true en
+          // user_metadata es lo que de verdad indica "todavía no creó su contraseña".
           let userId: string;
           const { data: newUser, error: createError } = await coreSupabase.auth.admin.createUser({
             email,
-            email_confirm: false,
-            user_metadata: { full_name: fullName, first_name: firstName, last_name: lastName },
+            email_confirm: true,
+            user_metadata: { full_name: fullName, first_name: firstName, last_name: lastName, invitation_pending: true },
             app_metadata: { assignments: [{ role: 'vendor' }] },
           });
 
@@ -1719,13 +1751,13 @@ Deno.serve(async (req) => {
             if (listError) throw listError;
             const existing = existingList.users.find((u: any) => u.email === email);
             if (!existing) throw createError;
-            if (existing.email_confirmed_at) {
+            if (existing.user_metadata?.invitation_pending === false) {
               throw new Error('Ya existe una cuenta activa con este correo.');
             }
 
             userId = existing.id;
             const { error: updateError } = await coreSupabase.auth.admin.updateUserById(userId, {
-              user_metadata: { full_name: fullName, first_name: firstName, last_name: lastName },
+              user_metadata: { full_name: fullName, first_name: firstName, last_name: lastName, invitation_pending: true },
               app_metadata: { assignments: [{ role: 'vendor' }] },
             });
             if (updateError) throw updateError;
@@ -1744,27 +1776,28 @@ Deno.serve(async (req) => {
             .upsert(commissionRows, { onConflict: 'user_id, platform_id' });
           if (commissionError) throw commissionError;
 
-          const { data: linkData, error: linkError } = await coreSupabase.auth.admin.generateLink({
-            type: 'invite',
-            email,
-            options: { redirectTo: 'https://admin.facil-apps.online/invitacion' },
-          });
-          if (linkError) throw linkError;
-          const actionLink = linkData?.properties?.action_link;
-          if (!actionLink) throw new Error('No se pudo generar el link de invitación.');
-
-          // Invitación genérica de Facil Apps Online: platform_id NULL a propósito, no
-          // referencia ningún producto/plataforma.
-          const { error: queueError } = await coreSupabase.rpc('queue_platform_email', {
-            p_platform_id: null,
-            p_recipient_email: email,
-            p_template_type: 'team_invitation',
-            p_template_data: { reset_link: actionLink, user_name: fullName },
-            p_tenant_id: null,
-          });
-          if (queueError) throw queueError;
+          await generateAndQueueTeamInvitation(coreSupabase, email, fullName);
 
           responseData = { success: true, userId };
+          break;
+        }
+
+        case 'resend_superadmin_team_invitation': {
+          const { userId: targetUserId } = payload;
+          if (!targetUserId) throw new Error('userId es requerido.');
+
+          const { data: userData, error: userError } = await coreSupabase.auth.admin.getUserById(targetUserId);
+          if (userError) throw userError;
+          const targetUser = userData.user;
+          if (!targetUser) throw new Error('Usuario no encontrado.');
+          if (targetUser.user_metadata?.invitation_pending === false) {
+            throw new Error('Este usuario ya activó su cuenta; no se puede reenviar la invitación.');
+          }
+
+          const fullNameForResend = `${targetUser.user_metadata?.first_name || ''} ${targetUser.user_metadata?.last_name || ''}`.trim() || targetUser.email;
+          await generateAndQueueTeamInvitation(coreSupabase, targetUser.email, fullNameForResend);
+
+          responseData = { success: true };
           break;
         }
 
