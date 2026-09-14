@@ -220,6 +220,10 @@ Deno.serve(async (req) => {
       'assign_vendor_role': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'remove_vendor_tenant_assignment': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'get_tenant_vendor_assignment': ['super_admin', 'app_super_admin', 'comercial_admin'],
+      'list_vendor_commissions_admin': ['super_admin', 'app_super_admin'],
+      'mark_vendor_commissions_paid': ['super_admin', 'app_super_admin'],
+      'revert_vendor_commission_payment': ['super_admin', 'app_super_admin'],
+      'reassign_vendor_pipeline': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'assign_vendor_platform_commissions': ['super_admin', 'app_super_admin', 'comercial_admin'],
       'create_vendor_invitation': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
       'get_platform_trial_plan': ['super_admin', 'app_super_admin', 'comercial_admin', 'vendor'],
@@ -1533,6 +1537,90 @@ Deno.serve(async (req) => {
             .eq('tenant_id', tenantId);
           if (error) throw error;
           responseData = { success: true };
+          break;
+        }
+
+        case 'list_vendor_commissions_admin': {
+          const { vendorUserId, platformId, onlyPending } = payload || {};
+          const { data, error } = await coreSupabase.rpc('get_vendor_commissions_admin', {
+            p_vendor_user_id: vendorUserId || null,
+            p_platform_id: platformId || null,
+            p_only_pending: !!onlyPending,
+          });
+          if (error) throw error;
+          responseData = data;
+          break;
+        }
+
+        case 'mark_vendor_commissions_paid': {
+          const { payments, reference } = payload || {};
+          if (!Array.isArray(payments) || payments.length === 0) throw new Error('payments es requerido.');
+
+          const rows = payments.map((p: any) => ({
+            transaction_id: p.transactionId,
+            user_id: p.vendorUserId,
+            platform_id: p.platformId,
+            commission_amount: p.commissionAmount,
+            reference: reference || null,
+            paid_by: callerUserId,
+          }));
+
+          // ON CONFLICT DO NOTHING: si alguna fila ya estaba liquidada (misma transacción +
+          // vendedor), se ignora en vez de fallar el resto del lote.
+          const { data, error } = await coreSupabase
+            .from('vendor_commission_payments')
+            .upsert(rows, { onConflict: 'transaction_id, user_id', ignoreDuplicates: true })
+            .select('id');
+          if (error) throw error;
+          responseData = { success: true, marked: data?.length || 0 };
+          break;
+        }
+
+        case 'revert_vendor_commission_payment': {
+          const { transactionId, vendorUserId } = payload || {};
+          if (!transactionId || !vendorUserId) throw new Error('transactionId y vendorUserId son requeridos.');
+          const { error } = await coreSupabase
+            .from('vendor_commission_payments')
+            .delete()
+            .eq('transaction_id', transactionId)
+            .eq('user_id', vendorUserId);
+          if (error) throw error;
+          responseData = { success: true };
+          break;
+        }
+
+        // Traslada la cartera ABIERTA (prospectos sin convertir, invitaciones que aún no
+        // terminaron en cliente) de un vendedor a otro — típicamente cuando el primero se
+        // retira de la empresa. Lo ya convertido/cerrado (comisiones, vendor_tenants) se queda
+        // con el vendedor original a propósito: es historial, no cartera activa.
+        case 'reassign_vendor_pipeline': {
+          const { fromVendorUserId, toVendorUserId, platformId: reassignPlatformId } = payload || {};
+          if (!fromVendorUserId || !toVendorUserId) throw new Error('fromVendorUserId y toVendorUserId son requeridos.');
+          if (fromVendorUserId === toVendorUserId) throw new Error('El vendedor de origen y destino no pueden ser el mismo.');
+
+          let prospectsQuery = coreSupabase
+            .from('vendor_prospects')
+            .update({ vendor_user_id: toVendorUserId })
+            .eq('vendor_user_id', fromVendorUserId)
+            .neq('status', 'convertido');
+          if (reassignPlatformId) prospectsQuery = prospectsQuery.eq('platform_id', reassignPlatformId);
+          const { data: movedProspects, error: prospectsError } = await prospectsQuery.select('id');
+          if (prospectsError) throw prospectsError;
+
+          let invitationsQuery = coreSupabase
+            .from('vendor_invitations')
+            .update({ vendor_user_id: toVendorUserId })
+            .eq('vendor_user_id', fromVendorUserId)
+            .not('status', 'in', '(cuenta_creada,activo,activo_con_plan,perdido,duplicado)');
+          if (reassignPlatformId) invitationsQuery = invitationsQuery.eq('platform_id', reassignPlatformId);
+          const { data: movedInvitations, error: invitationsError } = await invitationsQuery.select('id');
+          if (invitationsError) throw invitationsError;
+
+          responseData = {
+            success: true,
+            prospectsMoved: movedProspects?.length || 0,
+            invitationsMoved: movedInvitations?.length || 0,
+          };
           break;
         }
 
