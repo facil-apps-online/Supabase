@@ -70,6 +70,52 @@ async function generateAndQueueTeamInvitation(coreSupabase: any, userId: string,
   if (queueError) throw queueError;
 }
 
+// La página pública de alta de tenant vive en /register-tenant en todas las plataformas
+// (Glamtica, Tattoo Suite, NexuHR, etc.) — NO en /registro.
+function buildVendorInviteLink(baseUrl: string | null): { inviteToken: string; inviteUrl: string } {
+  const inviteToken = crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
+  const base = baseUrl?.replace(/\/$/, '') || '';
+  const inviteUrl = `${base}/register-tenant?ref=${inviteToken}`;
+  return { inviteToken, inviteUrl };
+}
+
+// Correo de invitación con el logo/color de la plataforma destino (una fila de
+// email_templates por platform_id, template_type 'vendor_invitation'). Best-effort: sin
+// correo del prospecto, o si falla el encolado, el vendedor igual tiene el link para
+// compartirlo a mano.
+async function queueVendorInvitationEmail(coreSupabase: any, params: {
+  platformId: string;
+  platformName: string;
+  vendorUserId: string;
+  prospectFirstName: string;
+  prospectLastName?: string | null;
+  prospectEmail?: string | null;
+  inviteUrl: string;
+}) {
+  if (!params.prospectEmail) return;
+  try {
+    const { data: vendorUserData } = await coreSupabase.auth.admin.getUserById(params.vendorUserId);
+    const vendorName = `${vendorUserData?.user?.user_metadata?.first_name || ''} ${vendorUserData?.user?.user_metadata?.last_name || ''}`.trim() || 'El equipo comercial';
+    const prospectName = `${params.prospectFirstName} ${params.prospectLastName || ''}`.trim();
+
+    const { error: queueError } = await coreSupabase.rpc('queue_platform_email', {
+      p_platform_id: params.platformId,
+      p_recipient_email: params.prospectEmail,
+      p_template_type: 'vendor_invitation',
+      p_template_data: {
+        prospect_name: prospectName,
+        vendor_name: vendorName,
+        platform_name: params.platformName,
+        invite_url: params.inviteUrl,
+      },
+      p_tenant_id: null,
+    });
+    if (queueError) console.error('Error al encolar el correo de invitación:', queueError.message);
+  } catch (emailError) {
+    console.error('Error inesperado encolando el correo de invitación:', (emailError as Error).message);
+  }
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -1570,14 +1616,12 @@ Deno.serve(async (req) => {
 
           const { data: platform, error: platformError } = await coreSupabase
             .from('platforms')
-            .select('base_url')
+            .select('name, base_url')
             .eq('id', platformId)
             .single();
           if (platformError) throw platformError;
 
-          const inviteToken = crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
-          const base = platform.base_url?.replace(/\/$/, '') || '';
-          const inviteUrl = `${base}/registro?ref=${inviteToken}`;
+          const { inviteToken, inviteUrl } = buildVendorInviteLink(platform.base_url);
 
           const { data, error } = await coreSupabase
             .from('vendor_invitations')
@@ -1599,6 +1643,17 @@ Deno.serve(async (req) => {
             .select(`*, platform:platforms (name)`)
             .single();
           if (error) throw error;
+
+          await queueVendorInvitationEmail(coreSupabase, {
+            platformId,
+            platformName: platform.name,
+            vendorUserId: targetVendorUserId,
+            prospectFirstName: prospect.firstName,
+            prospectLastName: prospect.lastName,
+            prospectEmail: prospect.email,
+            inviteUrl,
+          });
+
           responseData = { ...data, platform_name: data.platform.name, platform: undefined };
           break;
         }
@@ -2058,14 +2113,12 @@ Deno.serve(async (req) => {
 
           const { data: platform, error: platformError } = await coreSupabase
             .from('platforms')
-            .select('base_url')
+            .select('name, base_url')
             .eq('id', prospectRow.platform_id)
             .single();
           if (platformError) throw platformError;
 
-          const inviteToken = crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
-          const base = platform.base_url?.replace(/\/$/, '') || '';
-          const inviteUrl = `${base}/registro?ref=${inviteToken}`;
+          const { inviteToken, inviteUrl } = buildVendorInviteLink(platform.base_url);
 
           const { data: invitation, error: invitationError } = await coreSupabase
             .from('vendor_invitations')
@@ -2103,6 +2156,16 @@ Deno.serve(async (req) => {
             .update({ status: 'convertido', invitation_id: invitation.id })
             .eq('id', prospectId);
           if (updateProspectError2) throw updateProspectError2;
+
+          await queueVendorInvitationEmail(coreSupabase, {
+            platformId: prospectRow.platform_id,
+            platformName: platform.name,
+            vendorUserId: prospectRow.vendor_user_id,
+            prospectFirstName: prospectRow.first_name,
+            prospectLastName: prospectRow.last_name,
+            prospectEmail: prospectRow.email,
+            inviteUrl,
+          });
 
           responseData = { ...invitation, platform_name: invitation.platform.name, platform: undefined };
           break;
