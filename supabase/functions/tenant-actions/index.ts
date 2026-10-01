@@ -4335,13 +4335,38 @@ serve(async (req) => {
         break;
       }
 
-      case 'get_regional_settings_data': {
-        const { data: countriesData, error: countriesError } = await supabaseAdmin
-          .rpc('get_countries_with_timezones');
+      // Países con sus zonas horarias: countries/timezones viven en Core (la RPC de Services ya no puede leerlas).
+      // Catálogo de zonas horarias (Core).
+      case 'get_timezones': {
+        const { data, error } = await coreSupabase.from('timezones').select('*').order('name', { ascending: true });
+        if (error) throw error;
+        responseData = data;
+        break;
+      }
 
+      // Países con moneda, idioma y prefijo telefónico por defecto (Core).
+      case 'get_countries_detailed': {
+        const { data, error } = await coreSupabase
+          .from('countries')
+          .select('*, currencies!default_currency_id(name, code), languages!default_localization_id(name), phone_prefixes!phone_prefix_id(prefix)')
+          .order('name');
+        if (error) throw error;
+        responseData = data;
+        break;
+      }
+
+      case 'get_regional_settings_data': {
+        const { data: countriesRaw, error: countriesError } = await coreSupabase
+          .from('countries')
+          .select('*, country_timezones(timezones(name))')
+          .order('name');
         if (countriesError) {
           throw new Error(`Error fetching countries: ${countriesError.message}`);
         }
+        const countriesData = (countriesRaw || []).map(({ country_timezones, ...c }: any) => ({
+          ...c,
+          timezones: (country_timezones || []).map((ct: any) => ct.timezones?.name).filter(Boolean),
+        }));
 
         const { data: localizationsData, error: localizationsError } = await coreSupabase // languages vive en Core
           .from('languages')
