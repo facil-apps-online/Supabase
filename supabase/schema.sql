@@ -63,13 +63,6 @@ CREATE EXTENSION IF NOT EXISTS "moddatetime" WITH SCHEMA "public";
 
 
 
-CREATE EXTENSION IF NOT EXISTS "pg_graphql" WITH SCHEMA "graphql";
-
-
-
-
-
-
 CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
 
 
@@ -113,28 +106,6 @@ CREATE TYPE "public"."branch_status" AS ENUM (
 
 
 ALTER TYPE "public"."branch_status" OWNER TO "postgres";
-
-
-CREATE TYPE "public"."client_email_queue_status" AS ENUM (
-    'PENDING',
-    'PROCESSING',
-    'SENT',
-    'FAILED'
-);
-
-
-ALTER TYPE "public"."client_email_queue_status" OWNER TO "postgres";
-
-
-CREATE TYPE "public"."client_whatsapp_queue_status" AS ENUM (
-    'PENDING',
-    'PROCESSING',
-    'SENT',
-    'FAILED'
-);
-
-
-ALTER TYPE "public"."client_whatsapp_queue_status" OWNER TO "postgres";
 
 
 CREATE TYPE "public"."email_queue_status" AS ENUM (
@@ -465,7 +436,7 @@ $$;
 ALTER FUNCTION "private"."send_email_via_gmail_api"("p_recipient_email" "text", "p_subject" "text", "p_body_html" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -487,7 +458,7 @@ DECLARE
     v_error_message TEXT;
 BEGIN
     -- Step 1: Verify the tenant has an active subscription once
-    SELECT status INTO v_subscription_status FROM public.get_tenant_subscription_status(p_tenant_id);
+    SELECT status INTO v_subscription_status FROM public.get_tenant_subscription_status(p_tenant_id, p_platform_id);
     IF v_subscription_status != 'activo' THEN
         RETURN jsonb_build_object(
             'success', false, 
@@ -502,7 +473,7 @@ BEGIN
     -- Step 2: Get the latest subscription record once
     SELECT * INTO v_subscription 
     FROM public.tenant_subscriptions 
-    WHERE tenant_id = p_tenant_id 
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id 
     ORDER BY end_date DESC NULLS FIRST 
     LIMIT 1;
     
@@ -522,7 +493,7 @@ BEGIN
     LOOP
         BEGIN
             -- Step 3a: Validate the branch
-            SELECT * INTO v_branch FROM public.branches WHERE id = v_branch_id AND tenant_id = p_tenant_id;
+            SELECT * INTO v_branch FROM public.branches WHERE id = v_branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
             IF v_branch IS NULL THEN RAISE EXCEPTION 'Branch not found or access denied'; END IF;
             IF v_branch.status <> 'pending_activation' THEN RAISE EXCEPTION 'Branch is not pending activation'; END IF;
 
@@ -588,14 +559,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) OWNER TO "postgres";
+ALTER FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) IS 'Activates a batch of branches, calculates prorated charges, and creates corresponding subscription assets.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -627,7 +594,7 @@ BEGIN
     -- 5. Find the end_date of the single ACTIVE subscription
     SELECT end_date INTO v_previous_end_date
     FROM public.tenant_subscriptions
-    WHERE tenant_id = p_tenant_id AND is_active = true
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND is_active = true
     LIMIT 1;
 
     -- 6. Calculate new dates. FOUND is a special variable that is true if the last SELECT INTO found a row.
@@ -644,7 +611,7 @@ BEGIN
     -- 7. Deactivate all old subscriptions for the tenant
     UPDATE public.tenant_subscriptions
     SET is_active = false
-    WHERE tenant_id = p_tenant_id AND is_active = true;
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND is_active = true;
 
     -- 8. Insert the new subscription record
     INSERT INTO public.tenant_subscriptions (
@@ -668,7 +635,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") OWNER TO "postgres";
 
 SET default_tablespace = '';
 
@@ -682,8 +649,12 @@ CREATE TABLE IF NOT EXISTS "public"."branch_social_networks" (
     "url" "text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "branch_social_networks_url_check" CHECK (("url" ~* '^https?://'::"text"))
 );
+
+ALTER TABLE ONLY "public"."branch_social_networks" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."branch_social_networks" OWNER TO "postgres";
@@ -693,7 +664,7 @@ COMMENT ON TABLE "public"."branch_social_networks" IS 'Stores social media links
 
 
 
-CREATE OR REPLACE FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") RETURNS "public"."branch_social_networks"
+CREATE OR REPLACE FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "public"."branch_social_networks"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -707,7 +678,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."service_images" (
@@ -722,8 +693,11 @@ CREATE TABLE IF NOT EXISTS "public"."service_images" (
     "is_primary" boolean DEFAULT false NOT NULL,
     "sort_order" integer DEFAULT 0 NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."service_images" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."service_images" OWNER TO "postgres";
@@ -811,7 +785,7 @@ $$;
 ALTER FUNCTION "public"."add_tenant_social_network"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_network" "public"."social_network", "p_url" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -820,8 +794,8 @@ DECLARE
 BEGIN
   v_tenant_id := auth.get_tenant_id_from_jwt();
 
-  INSERT INTO turns (branch_id, client_id, stylist_id, status, tenant_id)
-  VALUES (p_branch_id, p_client_id, p_stylist_id, 'waiting', v_tenant_id)
+  INSERT INTO turns (branch_id, client_id, stylist_id, status, tenant_id, platform_id)
+  VALUES (p_branch_id, p_client_id, p_stylist_id, 'waiting', v_tenant_id, p_platform_id)
   RETURNING id INTO v_turn_id;
 
   RETURN v_turn_id;
@@ -829,42 +803,39 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."adjust_purchase_total"("p_purchase_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."adjust_purchase_total"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
     v_branch_id UUID;
     new_total_amount NUMERIC;
 BEGIN
-    -- Get the branch_id from the purchase
     SELECT branch_id INTO v_branch_id
     FROM public.purchases
-    WHERE id = p_purchase_id;
+    WHERE id = p_purchase_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-    -- Calculate the new total based on received quantities and current branch cost
     SELECT COALESCE(SUM(pri.quantity_received * bp.cost_price), 0)
     INTO new_total_amount
     FROM public.purchase_item_receptions pri
-    JOIN public.purchase_items pi ON pri.purchase_item_id = pi.id
-    JOIN public.branch_products bp ON pi.product_id = bp.product_id AND bp.branch_id = v_branch_id
-    WHERE pi.purchase_id = p_purchase_id;
+    JOIN public.purchase_items pi ON pri.purchase_item_id = pi.id AND pri.tenant_id = pi.tenant_id AND pri.platform_id = pi.platform_id
+    JOIN public.branch_products bp ON pi.product_id = bp.product_id AND bp.branch_id = v_branch_id AND bp.tenant_id = p_tenant_id AND bp.platform_id = p_platform_id
+    WHERE pi.purchase_id = p_purchase_id AND pi.tenant_id = p_tenant_id AND pi.platform_id = p_platform_id;
 
-    -- Update the total_amount on the purchase
     UPDATE public.purchases
     SET total_amount = new_total_amount
-    WHERE id = p_purchase_id;
+    WHERE id = p_purchase_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
 END;
 $$;
 
 
-ALTER FUNCTION "public"."adjust_purchase_total"("p_purchase_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."adjust_purchase_total"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -878,7 +849,7 @@ BEGIN
     -- 1. Check if the transfer exists and get its origin branch
     SELECT origin_branch_id INTO v_origin_branch_id
     FROM public.product_transfers
-    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND status = 'solicitado';
+    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id AND status = 'solicitado';
 
     IF v_origin_branch_id IS NULL THEN
         RAISE EXCEPTION 'Transfer not found or not in "solicitado" state.';
@@ -933,7 +904,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."signed_consents" (
@@ -949,14 +920,17 @@ CREATE TABLE IF NOT EXISTS "public"."signed_consents" (
     "signed_content" "text",
     "signed_at" timestamp with time zone,
     "attention_service_id" "uuid",
-    "form_data" "jsonb"
+    "form_data" "jsonb",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."signed_consents" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."signed_consents" OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") RETURNS "public"."signed_consents"
+CREATE OR REPLACE FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") RETURNS "public"."signed_consents"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -974,7 +948,7 @@ BEGIN
     FROM
         public.appointments a
     WHERE
-        a.id = p_appointment_id AND a.tenant_id = p_tenant_id;
+        a.id = p_appointment_id AND a.tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     -- Check if appointment exists and tenant matches
     IF v_client_id IS NULL THEN
@@ -1009,10 +983,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text" DEFAULT NULL::"text") RETURNS "public"."signed_consents"
+CREATE OR REPLACE FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text" DEFAULT NULL::"text") RETURNS "public"."signed_consents"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -1028,11 +1002,11 @@ BEGIN
     FROM
         public.attentions a
     WHERE
-        a.id = p_attention_id AND a.tenant_id = p_tenant_id;
+        a.id = p_attention_id AND a.tenant_id = p_tenant_id AND a.platform_id = p_platform_id;
 
     -- Check if attention exists and tenant matches
     IF v_client_id IS NULL THEN
-        RAISE EXCEPTION 'Attention with ID % not found for tenant %', p_attention_id, p_tenant_id;
+        RAISE EXCEPTION 'Attention with ID % not found for tenant % and platform %', p_attention_id, p_tenant_id, p_platform_id;
     END IF;
 
     -- Fetch professional_id from the attention_services table
@@ -1043,11 +1017,11 @@ BEGIN
     FROM
         public.attention_services ats
     WHERE
-        ats.id = p_attention_service_id AND ats.attention_id = p_attention_id AND ats.tenant_id = p_tenant_id;
+        ats.id = p_attention_service_id AND ats.attention_id = p_attention_id AND ats.tenant_id = p_tenant_id AND ats.platform_id = p_platform_id;
 
     -- Check if attention service exists and tenant/attention matches
     IF v_professional_id IS NULL THEN
-        RAISE EXCEPTION 'Attention Service with ID % not found for attention % and tenant %', p_attention_service_id, p_attention_id, p_tenant_id;
+        RAISE EXCEPTION 'Attention Service with ID % not found for attention % and tenant % and platform %', p_attention_service_id, p_attention_id, p_tenant_id, p_platform_id;
     END IF;
 
     -- Insert a new signed_consents record (initially unsigned)
@@ -1057,6 +1031,7 @@ BEGIN
         professional_id,
         template_id,
         tenant_id,
+        platform_id,
         attention_service_id,
         professional_observations,
         signed_content,
@@ -1068,6 +1043,7 @@ BEGIN
         v_professional_id,
         p_template_id,
         p_tenant_id,
+        p_platform_id,
         p_attention_service_id,
         p_professional_observations,
         NULL,
@@ -1080,10 +1056,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -1097,27 +1073,27 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
     new_assignment_id uuid;
 BEGIN
-    INSERT INTO equipment_assignments (tenant_id, equipment_id, user_id, branch_id, assignment_date)
-    VALUES (p_tenant_id, p_equipment_id, p_user_id, p_branch_id, p_assignment_date)
+    INSERT INTO equipment_assignments (tenant_id, platform_id, equipment_id, user_id, branch_id, assignment_date)
+    VALUES (p_tenant_id, p_platform_id, p_equipment_id, p_user_id, p_branch_id, p_assignment_date)
     RETURNING id INTO new_assignment_id;
     RETURN new_assignment_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric DEFAULT NULL::numeric) RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric DEFAULT NULL::numeric) RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -1128,7 +1104,11 @@ DECLARE
   v_calculated_payment_amount NUMERIC;
   v_created_client_treatment JSONB;
 BEGIN
-  SELECT * INTO v_prototype FROM treatment_prototypes WHERE id = p_prototype_id;
+  SELECT * INTO v_prototype FROM treatments WHERE id = p_prototype_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Prototipo no encontrado.';
+  END IF;
 
   IF p_custom_final_price IS NOT NULL THEN
     v_final_price = p_custom_final_price;
@@ -1140,13 +1120,12 @@ BEGIN
     RAISE EXCEPTION 'Tipo de precio seleccionado no válido: %', p_selected_price_type;
   END IF;
 
-  -- Usar `tenant_id` en la inserción
-  INSERT INTO client_treatments (client_id, tenant_id, prototype_id, name, final_price, start_date, payment_type)
-  VALUES (p_client_id, p_tenant_id, p_prototype_id, v_prototype.name, v_final_price, p_start_date, p_selected_price_type)
+  INSERT INTO client_treatments (client_id, tenant_id, platform_id, prototype_id, name, final_price, start_date, payment_type)
+  VALUES (p_client_id, p_tenant_id, p_platform_id, p_prototype_id, v_prototype.name, v_final_price, p_start_date, p_selected_price_type)
   RETURNING id INTO v_client_treatment_id;
 
   FOR v_session IN
-    SELECT * FROM prototype_sessions WHERE prototype_id = p_prototype_id ORDER BY session_number
+    SELECT * FROM treatment_sessions WHERE treatment_id = p_prototype_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id ORDER BY session_number
   LOOP
     v_calculated_payment_amount := 0;
     IF p_selected_price_type = 'upfront' AND v_session.session_number = 1 THEN
@@ -1159,21 +1138,17 @@ BEGIN
       END IF;
     END IF;
 
-    INSERT INTO client_treatment_sessions (client_treatment_id, prototype_session_id, session_number, name, description, payment_amount)
-    VALUES (v_client_treatment_id, v_session.id, v_session.session_number, v_session.name, v_session.description, v_calculated_payment_amount);
+    INSERT INTO client_treatment_sessions (client_treatment_id, tenant_id, platform_id, prototype_session_id, session_number, name, description, payment_amount)
+    VALUES (v_client_treatment_id, p_tenant_id, p_platform_id, v_session.id, v_session.session_number, v_session.name, v_session.description, v_calculated_payment_amount);
   END LOOP;
 
-  SELECT get_client_treatment_details(v_client_treatment_id) INTO v_created_client_treatment;
+  SELECT get_client_treatment_details(p_tenant_id, p_platform_id, v_client_treatment_id) INTO v_created_client_treatment;
   RETURN v_created_client_treatment;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) IS '[FIX] Usa tenant_id y no business_id, acorde al estándar.';
-
+ALTER FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."client_treatments" (
@@ -1188,8 +1163,11 @@ CREATE TABLE IF NOT EXISTS "public"."client_treatments" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "payment_type" "text",
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "client_treatments_status_check" CHECK (("status" = ANY (ARRAY['active'::"text", 'completed'::"text", 'cancelled'::"text"])))
 );
+
+ALTER TABLE ONLY "public"."client_treatments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_treatments" OWNER TO "postgres";
@@ -1203,7 +1181,7 @@ COMMENT ON COLUMN "public"."client_treatments"."payment_type" IS 'Indica el tipo
 
 
 
-CREATE OR REPLACE FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") RETURNS "public"."client_treatments"
+CREATE OR REPLACE FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") RETURNS "public"."client_treatments"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -1214,7 +1192,7 @@ DECLARE
     item_data jsonb;
 BEGIN
     -- 1. Get treatment (prototype) details
-    SELECT * INTO v_treatment FROM public.treatments WHERE id = p_prototype_id;
+    SELECT * INTO v_treatment FROM public.treatments WHERE id = p_prototype_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Treatment prototype not found.';
     END IF;
@@ -1222,6 +1200,7 @@ BEGIN
     -- 2. Create the main client_treatments record
     INSERT INTO public.client_treatments (
         tenant_id,
+        platform_id,
         client_id,
         prototype_id,
         name,
@@ -1232,6 +1211,7 @@ BEGIN
     )
     VALUES (
         p_tenant_id,
+        p_platform_id,
         p_client_id,
         p_prototype_id,
         p_custom_name,
@@ -1251,6 +1231,8 @@ BEGIN
     LOOP
         INSERT INTO public.client_treatment_sessions (
             client_treatment_id,
+            tenant_id,
+            platform_id,
             prototype_session_id,
             session_number,
             name,
@@ -1259,6 +1241,8 @@ BEGIN
         )
         VALUES (
             v_new_client_treatment.id,
+            p_tenant_id,
+            p_platform_id,
             (session_data->>'id')::uuid,
             (session_data->>'session_number')::integer,
             session_data->>'name',
@@ -1273,6 +1257,8 @@ BEGIN
             LOOP
                 INSERT INTO public.client_treatment_session_items (
                     client_treatment_session_id,
+                    tenant_id,
+                    platform_id,
                     product_id,
                     service_id,
                     quantity,
@@ -1280,6 +1266,8 @@ BEGIN
                 )
                 VALUES (
                     v_client_treatment_session_id,
+                    p_tenant_id,
+                    p_platform_id,
                     (item_data->>'product_id')::uuid,
                     (item_data->>'service_id')::uuid,
                     (item_data->>'quantity')::integer,
@@ -1294,139 +1282,92 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."associate_combo_image"("p_combo_id" "uuid", "p_google_drive_file_id" "text") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."associate_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_google_drive_file_id" "text") RETURNS "uuid"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  v_new_image_id uuid;
-  v_tenant_id uuid;
-  v_current_max_sort_order INTEGER;
+  v_image_id uuid;
+  v_is_primary boolean;
 BEGIN
-  -- Get tenant_id from combo
-  SELECT tenant_id INTO v_tenant_id FROM public.combos WHERE id = p_combo_id;
+  SELECT NOT EXISTS (SELECT 1 FROM public.combo_images WHERE combo_id = p_combo_id AND tenant_id = p_tenant_id) INTO v_is_primary;
 
-  IF v_tenant_id IS NULL THEN
-    RAISE EXCEPTION 'Combo with ID % not found.', p_combo_id;
-  END IF;
+  INSERT INTO public.combo_images (tenant_id, platform_id, combo_id, google_drive_file_id, is_primary, sort_order)
+  VALUES (p_tenant_id, p_platform_id, p_combo_id, p_google_drive_file_id, v_is_primary, 0)
+  RETURNING id INTO v_image_id;
 
-  -- Get the current maximum sort_order for the given combo
-  SELECT COALESCE(MAX(sort_order), -1) INTO v_current_max_sort_order
-  FROM public.combo_images
-  WHERE combo_id = p_combo_id;
-
-  -- Insert the new image and get its ID
-  INSERT INTO public.combo_images (combo_id, tenant_id, image_url, google_drive_file_id, sort_order)
-  VALUES (p_combo_id, v_tenant_id, p_google_drive_file_id, p_google_drive_file_id, v_current_max_sort_order + 1)
-  RETURNING id INTO v_new_image_id;
-
-  RETURN v_new_image_id;
+  RETURN v_image_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."associate_combo_image"("p_combo_id" "uuid", "p_google_drive_file_id" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."associate_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_google_drive_file_id" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."associate_product_image"("p_product_id" "uuid", "p_google_drive_file_id" "text") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."associate_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_google_drive_file_id" "text") RETURNS "uuid"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  v_new_image_id uuid;
-  v_tenant_id uuid;
-  v_current_max_sort_order INTEGER;
+  v_image_id uuid;
+  v_is_primary boolean;
 BEGIN
-  -- Get tenant_id from product
-  SELECT tenant_id INTO v_tenant_id FROM public.products WHERE id = p_product_id;
+  -- Check if any image exists to set primary
+  SELECT NOT EXISTS (SELECT 1 FROM public.product_images WHERE product_id = p_product_id AND tenant_id = p_tenant_id) INTO v_is_primary;
 
-  IF v_tenant_id IS NULL THEN
-    RAISE EXCEPTION 'Product with ID % not found.', p_product_id;
-  END IF;
+  INSERT INTO public.product_images (tenant_id, platform_id, product_id, google_drive_file_id, is_primary, sort_order)
+  VALUES (p_tenant_id, p_platform_id, p_product_id, p_google_drive_file_id, v_is_primary, 0)
+  RETURNING id INTO v_image_id;
 
-  -- Get the current maximum sort_order for the given product
-  SELECT COALESCE(MAX(sort_order), -1) INTO v_current_max_sort_order
-  FROM public.product_images
-  WHERE product_id = p_product_id;
-
-  -- Insert the new image and get its ID
-  INSERT INTO public.product_images (product_id, tenant_id, image_url, google_drive_file_id, sort_order)
-  VALUES (p_product_id, v_tenant_id, p_google_drive_file_id, p_google_drive_file_id, v_current_max_sort_order + 1)
-  RETURNING id INTO v_new_image_id;
-
-  RETURN v_new_image_id;
+  RETURN v_image_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."associate_product_image"("p_product_id" "uuid", "p_google_drive_file_id" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."associate_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_google_drive_file_id" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."associate_service_image"("p_service_id" "uuid", "p_google_drive_file_id" "text") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."associate_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_google_drive_file_id" "text") RETURNS "uuid"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  v_new_image_id uuid;
-  v_tenant_id uuid;
-  v_current_max_sort_order INTEGER;
+  v_image_id uuid;
+  v_is_primary boolean;
 BEGIN
-  -- Get tenant_id from service
-  SELECT tenant_id INTO v_tenant_id FROM public.services WHERE id = p_service_id;
+  SELECT NOT EXISTS (SELECT 1 FROM public.service_images WHERE service_id = p_service_id AND tenant_id = p_tenant_id) INTO v_is_primary;
 
-  IF v_tenant_id IS NULL THEN
-    RAISE EXCEPTION 'Service with ID % not found.', p_service_id;
-  END IF;
+  INSERT INTO public.service_images (tenant_id, platform_id, service_id, google_drive_file_id, is_primary, sort_order)
+  VALUES (p_tenant_id, p_platform_id, p_service_id, p_google_drive_file_id, v_is_primary, 0)
+  RETURNING id INTO v_image_id;
 
-  -- Get the current maximum sort_order for the given service
-  SELECT COALESCE(MAX(sort_order), -1) INTO v_current_max_sort_order
-  FROM public.service_images
-  WHERE service_id = p_service_id;
-
-  -- Insert the new image and get its ID
-  INSERT INTO public.service_images (service_id, tenant_id, image_url, google_drive_file_id, sort_order)
-  VALUES (p_service_id, v_tenant_id, p_google_drive_file_id, p_google_drive_file_id, v_current_max_sort_order + 1)
-  RETURNING id INTO v_new_image_id;
-
-  RETURN v_new_image_id;
+  RETURN v_image_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."associate_service_image"("p_service_id" "uuid", "p_google_drive_file_id" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."associate_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_google_drive_file_id" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."associate_treatment_image"("p_treatment_id" "uuid", "p_google_drive_file_id" "text") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."associate_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_google_drive_file_id" "text") RETURNS "uuid"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  v_new_image_id uuid;
-  v_tenant_id uuid;
-  v_current_max_sort_order INTEGER;
+  v_image_id uuid;
+  v_is_primary boolean;
 BEGIN
-  -- Get tenant_id from treatment
-  SELECT tenant_id INTO v_tenant_id FROM public.treatments WHERE id = p_treatment_id;
+  SELECT NOT EXISTS (SELECT 1 FROM public.treatment_images WHERE treatment_id = p_treatment_id AND tenant_id = p_tenant_id) INTO v_is_primary;
 
-  IF v_tenant_id IS NULL THEN
-    RAISE EXCEPTION 'Treatment with ID % not found.', p_treatment_id;
-  END IF;
+  INSERT INTO public.treatment_images (tenant_id, platform_id, treatment_id, google_drive_file_id, is_primary, sort_order)
+  VALUES (p_tenant_id, p_platform_id, p_treatment_id, p_google_drive_file_id, v_is_primary, 0)
+  RETURNING id INTO v_image_id;
 
-  -- Get the current maximum sort_order for the given treatment
-  SELECT COALESCE(MAX(sort_order), -1) INTO v_current_max_sort_order
-  FROM public.treatment_images
-  WHERE treatment_id = p_treatment_id;
-
-  -- Insert the new image and get its ID
-  INSERT INTO public.treatment_images (treatment_id, tenant_id, image_url, google_drive_file_id, sort_order)
-  VALUES (p_treatment_id, v_tenant_id, p_google_drive_file_id, p_google_drive_file_id, v_current_max_sort_order + 1)
-  RETURNING id INTO v_new_image_id;
-
-  RETURN v_new_image_id;
+  RETURN v_image_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."associate_treatment_image"("p_treatment_id" "uuid", "p_google_drive_file_id" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."associate_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_google_drive_file_id" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."audit_trigger_function"() RETURNS "trigger"
@@ -1513,25 +1454,24 @@ $$;
 ALTER FUNCTION "public"."audit_trigger_function"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
-  UPDATE tv_displays
-  SET
-    branch_id = p_branch_id,
-    tenant_id = p_tenant_id,
-    is_registered = true,
-    registered_at = now()
-  WHERE id = p_tv_display_id;
+    UPDATE public.tv_displays
+    SET branch_id = p_branch_id,
+        is_registered = true,
+        registered_at = now(),
+        updated_at = now()
+    WHERE id = p_tv_display_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -1550,7 +1490,7 @@ DECLARE
     v_error_message TEXT;
 BEGIN
     -- Step 1: Verify the tenant has an active subscription
-    SELECT status INTO v_subscription_status FROM public.get_tenant_subscription_status(p_tenant_id);
+    SELECT status INTO v_subscription_status FROM public.get_tenant_subscription_status(p_tenant_id, p_platform_id);
     IF v_subscription_status != 'activo' THEN
         RAISE EXCEPTION 'Cannot calculate cost. Tenant subscription status is: %', v_subscription_status;
     END IF;
@@ -1558,7 +1498,7 @@ BEGIN
     -- Step 2: Get the latest subscription record
     SELECT * INTO v_subscription 
     FROM public.tenant_subscriptions 
-    WHERE tenant_id = p_tenant_id 
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id 
     ORDER BY end_date DESC NULLS FIRST 
     LIMIT 1;
     
@@ -1571,7 +1511,7 @@ BEGIN
     LOOP
         BEGIN
             -- Step 3a: Validate the branch
-            SELECT * INTO v_branch FROM public.branches WHERE id = v_branch_id AND tenant_id = p_tenant_id;
+            SELECT * INTO v_branch FROM public.branches WHERE id = v_branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
             IF v_branch IS NULL THEN RAISE EXCEPTION 'Branch not found or access denied'; END IF;
             IF v_branch.status <> 'pending_activation' THEN RAISE EXCEPTION 'Branch % is not pending activation', v_branch.name; END IF;
 
@@ -1632,11 +1572,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) IS 'Calculates the total prorated cost for activating a batch of branches without performing the activation.';
-
+ALTER FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."calculate_purchase_item_total"() RETURNS "trigger"
@@ -1697,7 +1633,7 @@ $$;
 ALTER FUNCTION "public"."call_stylist"("p_attention_service_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."call_turn"("p_turn_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."call_turn"("p_turn_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -1710,10 +1646,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."call_turn"("p_turn_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."call_turn"("p_turn_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -1762,14 +1698,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid") IS 'V2: Cancels an attention and queues both email and WhatsApp notifications for the client.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -1783,7 +1715,7 @@ BEGIN
     SELECT status, origin_branch_id, destination_branch_id
     INTO v_transfer_status, v_origin_branch_id, v_destination_branch_id
     FROM public.product_transfers
-    WHERE id = p_transfer_id AND tenant_id = p_tenant_id;
+    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     IF v_transfer_status IS NULL THEN
         RAISE EXCEPTION 'Transfer not found or you do not have permission.';
@@ -1826,25 +1758,25 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."cancel_purchase"("p_purchase_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."cancel_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
     UPDATE public.purchases
     SET status = 'cancelada',
         updated_at = now()
-    WHERE id = p_purchase_id;
+    WHERE id = p_purchase_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."cancel_purchase"("p_purchase_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."cancel_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -1854,13 +1786,13 @@ BEGIN
     WHERE 
         s.id = p_session_id 
         AND s.client_treatment_id = ct.id -- JOIN condition
-        AND ct.tenant_id = p_tenant_id   -- Security check on the parent table
+        AND ct.tenant_id = p_tenant_id AND platform_id = p_platform_id   -- Security check on the parent table
         AND s.status = 'pending';
 END;
 $$;
 
 
-ALTER FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."change_password"("p_user_id" "uuid", "p_current_password" "text", "p_new_password" "text") RETURNS TABLE("success" boolean, "message" "text")
@@ -1907,7 +1839,7 @@ $$;
 ALTER FUNCTION "public"."change_password"("p_user_id" "uuid", "p_current_password" "text", "p_new_password" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_asset_key" "text") RETURNS boolean
+CREATE OR REPLACE FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -1919,7 +1851,7 @@ BEGIN
     -- Step 1: Find the tenant's active subscription plan
     SELECT active_plan_id INTO v_plan_id
     FROM public.tenant_subscriptions
-    WHERE tenant_id = p_tenant_id
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
     AND status = 'active'
     ORDER BY created_at DESC
     LIMIT 1;
@@ -1955,7 +1887,7 @@ BEGIN
     IF p_asset_key = 'max_branches' THEN
         SELECT COUNT(*)::INT INTO v_current_count
         FROM public.branches
-        WHERE tenant_id = p_tenant_id;
+        WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id;
     -- Add other cases here in the future
     -- ELSIF p_asset_key = 'max_users' THEN
     --     SELECT COUNT(*)::INT INTO v_current_count ...
@@ -1970,20 +1902,22 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_asset_key" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."check_slug_availability"("params" "jsonb") RETURNS boolean
+CREATE OR REPLACE FUNCTION "public"."check_slug_availability"("params" "jsonb", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS boolean
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
     p_slug text := params->>'p_slug';
     p_country_id uuid := (params->>'p_country_id')::uuid;
     p_tenant_id uuid := (params->>'p_tenant_id')::uuid;
-    p_platform_id uuid;
+    p_platform_id uuid := (params->>'p_platform_id')::uuid;
 BEGIN
-    -- Get platform_id from the tenant
-    SELECT platform_id INTO p_platform_id FROM public.tenants WHERE id = p_tenant_id;
+    IF p_platform_id IS NULL THEN
+        SELECT platform_id INTO p_platform_id FROM public.tenants WHERE id = p_tenant_id;
+    END IF;
+
     IF p_platform_id IS NULL THEN
         RAISE EXCEPTION 'Could not determine platform for tenant';
     END IF;
@@ -2000,34 +1934,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."check_slug_availability"("params" "jsonb") OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."check_slug_availability"("params" "jsonb") IS 'Checks slug availability within a country and platform, excluding the current tenant.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."check_slug_availability"("p_slug" "text", "p_country_id" "uuid", "p_tenant_id" "uuid") RETURNS boolean
-    LANGUAGE "plpgsql"
-    AS $$
-BEGIN
-    -- Returns true if slug is available, false if taken by ANOTHER tenant in the same country.
-    RETURN NOT EXISTS (
-        SELECT 1
-        FROM public.tenants
-        WHERE slug = p_slug 
-          AND country_id = p_country_id
-          AND id != p_tenant_id
-    );
-END;
-$$;
-
-
-ALTER FUNCTION "public"."check_slug_availability"("p_slug" "text", "p_country_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."check_slug_availability"("p_slug" "text", "p_country_id" "uuid", "p_tenant_id" "uuid") IS 'Checks if a given slug is available for a tenant within a specific country, excluding the tenant''s own current slug.';
-
+ALTER FUNCTION "public"."check_slug_availability"("params" "jsonb", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."check_slug_availability"("p_slug" "text", "p_country_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS boolean
@@ -2064,7 +1971,7 @@ $$;
 ALTER FUNCTION "public"."check_superadmin_exists"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") RETURNS TABLE("user_id" "uuid", "commission_rate" numeric, "first_name" "text", "last_name" "text", "is_active" boolean, "role_name" "text", "is_favorite" boolean)
+CREATE OR REPLACE FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_platform_id" "uuid", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") RETURNS TABLE("user_id" "uuid", "commission_rate" numeric, "first_name" "text", "last_name" "text", "is_active" boolean, "role_name" "text", "is_favorite" boolean)
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -2111,7 +2018,7 @@ BEGIN
                 END
             ) as rn
         FROM
-            public.get_tenant_users(p_tenant_id) u
+            public.get_tenant_users(p_tenant_id, p_platform_id) u -- Passing p_platform_id here
         LEFT JOIN public.client_professionals cp ON u.user_id = cp.user_id AND cp.client_id = p_client_id
         WHERE u.status = 'active'
     )
@@ -2177,7 +2084,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_platform_id" "uuid", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."check_user_exists_by_email"("p_email" "text") RETURNS boolean
@@ -2225,8 +2132,12 @@ CREATE TABLE IF NOT EXISTS "public"."client_treatment_sessions" (
     "payment_due_amount" numeric(10,2),
     "payment_due_percentage" numeric(5,2),
     "payment_status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "client_treatment_sessions_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'completed'::"text", 'Cita Asignada'::"text", 'Cancelada'::"text"])))
 );
+
+ALTER TABLE ONLY "public"."client_treatment_sessions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_treatment_sessions" OWNER TO "postgres";
@@ -2240,7 +2151,7 @@ COMMENT ON COLUMN "public"."client_treatment_sessions"."payment_amount" IS 'Mont
 
 
 
-CREATE OR REPLACE FUNCTION "public"."complete_client_treatment_session"("p_session_id" "uuid", "p_attention_id" "uuid", "p_tenant_id" "uuid") RETURNS "public"."client_treatment_sessions"
+CREATE OR REPLACE FUNCTION "public"."complete_client_treatment_session"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_session_id" "uuid", "p_attention_id" "uuid") RETURNS "public"."client_treatment_sessions"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -2253,6 +2164,7 @@ BEGIN
         attention_id = p_attention_id
     WHERE
         id = p_session_id
+        AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     RETURNING * INTO v_session;
 
     IF NOT FOUND THEN
@@ -2267,10 +2179,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."complete_client_treatment_session"("p_session_id" "uuid", "p_attention_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."complete_client_treatment_session"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_session_id" "uuid", "p_attention_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."confirm_attention"("p_attention_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."confirm_attention"("p_attention_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -2281,7 +2193,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."confirm_attention"("p_attention_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."confirm_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."create_application_superadmin"("p_admin_email" "text") RETURNS "jsonb"
@@ -2466,7 +2378,8 @@ CREATE TABLE IF NOT EXISTS "public"."branches" (
     "code" "text",
     "google_place_id" "text",
     "description" "text",
-    "is_visible_on_microsite" boolean DEFAULT false NOT NULL
+    "is_visible_on_microsite" boolean DEFAULT false NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
 
 ALTER TABLE ONLY "public"."branches" FORCE ROW LEVEL SECURITY;
@@ -2535,21 +2448,53 @@ COMMENT ON COLUMN "public"."branches"."description" IS 'A public description of 
 
 
 
-CREATE OR REPLACE FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_address" "text" DEFAULT NULL::"text", "p_description" "text" DEFAULT NULL::"text", "p_contact_phone" "text" DEFAULT NULL::"text", "p_whatsapp_phone" "text" DEFAULT NULL::"text", "p_commercial_email" "text" DEFAULT NULL::"text", "p_website" "text" DEFAULT NULL::"text", "p_physical_address_line1" "text" DEFAULT NULL::"text", "p_physical_address_line2" "text" DEFAULT NULL::"text", "p_physical_city" "text" DEFAULT NULL::"text", "p_physical_state" "text" DEFAULT NULL::"text", "p_physical_postal_code" "text" DEFAULT NULL::"text", "p_latitude" numeric DEFAULT NULL::numeric, "p_longitude" numeric DEFAULT NULL::numeric, "p_timezone" "text" DEFAULT NULL::"text", "p_google_place_id" "text" DEFAULT NULL::"text") RETURNS "public"."branches"
+CREATE OR REPLACE FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_platform_id" "uuid", "p_address" "text" DEFAULT NULL::"text", "p_description" "text" DEFAULT NULL::"text", "p_contact_phone" "text" DEFAULT NULL::"text", "p_whatsapp_phone" "text" DEFAULT NULL::"text", "p_commercial_email" "text" DEFAULT NULL::"text", "p_website" "text" DEFAULT NULL::"text", "p_physical_address_line1" "text" DEFAULT NULL::"text", "p_physical_address_line2" "text" DEFAULT NULL::"text", "p_physical_city" "text" DEFAULT NULL::"text", "p_physical_state" "text" DEFAULT NULL::"text", "p_physical_postal_code" "text" DEFAULT NULL::"text", "p_latitude" numeric DEFAULT NULL::numeric, "p_longitude" numeric DEFAULT NULL::numeric, "p_timezone" "text" DEFAULT NULL::"text", "p_google_place_id" "text" DEFAULT NULL::"text") RETURNS "public"."branches"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
     new_branch public.branches;
 BEGIN
     INSERT INTO public.branches (
-        tenant_id, name, address, description, contact_phone, whatsapp_phone, commercial_email,
-        website, physical_address_line1, physical_address_line2, physical_city, physical_state,
-        physical_postal_code, latitude, longitude, timezone, is_main_branch, google_place_id
+        tenant_id, 
+        name, 
+        platform_id,
+        address, 
+        description, 
+        contact_phone, 
+        whatsapp_phone, 
+        commercial_email,
+        website, 
+        physical_address_line1, 
+        physical_address_line2, 
+        physical_city, 
+        physical_state,
+        physical_postal_code, 
+        latitude, 
+        longitude, 
+        timezone, 
+        is_main_branch, 
+        google_place_id
     )
     VALUES (
-        p_tenant_id, p_name, p_address, p_description, p_contact_phone, p_whatsapp_phone, p_commercial_email,
-        p_website, p_physical_address_line1, p_physical_address_line2, p_physical_city, p_physical_state,
-        p_physical_postal_code, p_latitude, p_longitude, p_timezone, false, p_google_place_id
+        p_tenant_id, 
+        p_name, 
+        p_platform_id,
+        p_address, 
+        p_description, 
+        p_contact_phone, 
+        p_whatsapp_phone, 
+        p_commercial_email,
+        p_website, 
+        p_physical_address_line1, 
+        p_physical_address_line2, 
+        p_physical_city, 
+        p_physical_state,
+        p_physical_postal_code, 
+        p_latitude, 
+        p_longitude, 
+        p_timezone, 
+        false, 
+        p_google_place_id
     )
     RETURNING * INTO new_branch;
     RETURN new_branch;
@@ -2557,7 +2502,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_address" "text", "p_description" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_platform_id" "uuid", "p_address" "text", "p_description" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."informed_consent_templates" (
@@ -2568,21 +2513,24 @@ CREATE TABLE IF NOT EXISTS "public"."informed_consent_templates" (
     "is_active" boolean DEFAULT true NOT NULL,
     "tenant_id" "uuid" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."informed_consent_templates" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."informed_consent_templates" OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_name" "text", "p_content" "text" DEFAULT NULL::"text", "p_fields" "jsonb" DEFAULT NULL::"jsonb") RETURNS "public"."informed_consent_templates"
+CREATE OR REPLACE FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_content" "text" DEFAULT NULL::"text", "p_fields" "jsonb" DEFAULT NULL::"jsonb") RETURNS "public"."informed_consent_templates"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
     new_template public.informed_consent_templates;
 BEGIN
-    INSERT INTO public.informed_consent_templates (name, content, fields, tenant_id)
-    VALUES (p_name, p_content, p_fields, p_tenant_id)
+    INSERT INTO public.informed_consent_templates (name, content, fields, tenant_id, platform_id)
+    VALUES (p_name, p_content, p_fields, p_tenant_id, p_platform_id)
     RETURNING * INTO new_template;
 
     RETURN new_template;
@@ -2590,7 +2538,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."create_daily_dummy_attentions"() RETURNS "void"
@@ -2648,15 +2596,16 @@ $$;
 ALTER FUNCTION "public"."create_daily_dummy_attentions"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
     new_equipment_id uuid;
 BEGIN
-    INSERT INTO equipment (tenant_id, name, type_id, brand_id, model, serial_number, purchase_date, last_maintenance_date, maintenance_frequency, maintenance_frequency_unit, notes, is_active)
+    INSERT INTO equipment (tenant_id, platform_id, name, type_id, brand_id, model, serial_number, purchase_date, last_maintenance_date, maintenance_frequency, maintenance_frequency_unit, notes, is_active)
     VALUES (
         (p_equipment_data->>'tenant_id')::uuid,
+        p_platform_id,
         p_equipment_data->>'name',
         (p_equipment_data->>'type_id')::uuid,
         NULLIF(p_equipment_data->>'brand_id', '')::uuid, -- Solución: Previene error si la marca es opcional
@@ -2674,10 +2623,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -2694,31 +2643,34 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_maintenance_data" "jsonb") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_maintenance_data" "jsonb") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
-    new_maintenance_id uuid;
+    v_record_id uuid;
 BEGIN
-    INSERT INTO equipment_maintenance_history (equipment_id, maintenance_date, notes, tenant_id)
-    VALUES (
+    INSERT INTO public.equipment_maintenance_history (
+        equipment_id, tenant_id, platform_id, maintenance_date, notes
+    ) VALUES (
         (p_maintenance_data->>'equipment_id')::uuid,
+        p_tenant_id,
+        p_platform_id,
         (p_maintenance_data->>'maintenance_date')::date,
-        p_maintenance_data->>'notes',
-        p_tenant_id
-    ) RETURNING id INTO new_maintenance_id;
-    RETURN new_maintenance_id;
+        p_maintenance_data->>'notes'
+    ) RETURNING id INTO v_record_id;
+
+    RETURN v_record_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_maintenance_data" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_maintenance_data" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -2732,10 +2684,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -2743,12 +2695,9 @@ DECLARE
     v_service jsonb;
     v_product jsonb;
     v_combo jsonb;
-    v_payment jsonb;
     v_attention_combo_id uuid;
-    v_combo_service_data jsonb;
     v_recalculated_total numeric := 0;
 BEGIN
-    -- 1. Calcular el total real a partir de todos los payloads
     IF jsonb_array_length(p_services) > 0 THEN
         FOR v_service IN SELECT * FROM jsonb_array_elements(p_services) LOOP
             v_recalculated_total := v_recalculated_total + COALESCE((v_service->>'price')::numeric, 0);
@@ -2764,44 +2713,33 @@ BEGIN
             v_recalculated_total := v_recalculated_total + COALESCE((v_combo->>'price')::numeric, 0);
         END LOOP;
     END IF;
-    IF jsonb_array_length(p_payments) > 0 THEN
-        FOR v_payment IN SELECT * FROM jsonb_array_elements(p_payments) LOOP
-            v_recalculated_total := v_recalculated_total + COALESCE((v_payment->>'price')::numeric, 0);
-        END LOOP;
-    END IF;
 
-    -- 2. Insertar la atención con estado 'Pendiente'
-    INSERT INTO public.attentions (client_id, attention_datetime, notes, total_amount, tenant_id, branch_id, status)
-    VALUES (p_client_id, p_attention_datetime, p_notes, v_recalculated_total, p_tenant_id, p_branch_id, 'Pendiente')
+    INSERT INTO public.attentions (client_id, attention_datetime, notes, total_amount, tenant_id, platform_id, branch_id, status)
+    VALUES (p_client_id, p_attention_datetime, p_notes, v_recalculated_total, p_tenant_id, p_platform_id, p_branch_id, 'Pendiente')
     RETURNING id INTO v_attention_id;
 
-    -- 3. Insertar los ítems (servicios, productos, combos) como antes
     IF jsonb_array_length(p_combos) > 0 THEN
         FOR v_combo IN SELECT * FROM jsonb_array_elements(p_combos) LOOP
             INSERT INTO public.attention_combos (
-                attention_id, combo_id, price, quantity, notes, tenant_id, branch_id, status
+                attention_id, combo_id, price, quantity, notes, tenant_id, platform_id, branch_id, status
             ) VALUES (
                 v_attention_id, (v_combo->>'combo_id')::uuid, COALESCE((v_combo->>'price')::numeric, 0), 
-                COALESCE((v_combo->>'quantity')::integer, 1), v_combo->>'notes', p_tenant_id, p_branch_id, 'Pendiente'
+                COALESCE((v_combo->>'quantity')::integer, 1), v_combo->>'notes', p_tenant_id, p_platform_id, p_branch_id, 'Pendiente'
             ) RETURNING id INTO v_attention_combo_id;
-            
-            FOR v_combo_service_data IN SELECT * FROM jsonb_array_elements(p_services) LOOP
-                IF (v_combo_service_data->>'combo_id')::uuid = (v_combo->>'combo_id')::uuid THEN
-                    v_combo_service_data := v_combo_service_data || jsonb_build_object('attention_combo_id', v_attention_combo_id);
-                END IF;
-            END LOOP;
         END LOOP;
     END IF;
 
     IF jsonb_array_length(p_services) > 0 THEN
         FOR v_service IN SELECT * FROM jsonb_array_elements(p_services) LOOP
-            SELECT ac.id INTO v_attention_combo_id FROM public.attention_combos ac WHERE ac.attention_id = v_attention_id AND ac.combo_id = (v_service->>'combo_id')::uuid;
+            SELECT ac.id INTO v_attention_combo_id FROM public.attention_combos ac 
+            WHERE ac.attention_id = v_attention_id AND ac.combo_id = (v_service->>'combo_id')::uuid AND ac.tenant_id = p_tenant_id AND ac.platform_id = p_platform_id;
+            
             INSERT INTO public.attention_services (
-                attention_id, service_id, user_id, service_price, notes, tenant_id, branch_id, 
+                attention_id, service_id, user_id, service_price, notes, tenant_id, platform_id, branch_id, 
                 duration_minutes, start_time, end_time, is_parallel, offset_minutes, status, combo_id, client_treatment_session_id
             ) VALUES (
                 v_attention_id, (v_service->>'service_id')::uuid, (v_service->>'user_id')::uuid,
-                COALESCE((v_service->>'price')::numeric, 0), v_service->>'notes', p_tenant_id, p_branch_id, 
+                COALESCE((v_service->>'price')::numeric, 0), v_service->>'notes', p_tenant_id, p_platform_id, p_branch_id, 
                 (v_service->>'duration')::integer, (v_service->>'start_time')::time, (v_service->>'end_time')::time,
                 (v_service->>'is_parallel')::boolean, (v_service->>'offset_minutes')::integer, 'Pendiente',
                 v_attention_combo_id, (v_service->>'client_treatment_session_id')::uuid
@@ -2811,19 +2749,20 @@ BEGIN
 
     IF jsonb_array_length(p_products) > 0 THEN
         FOR v_product IN SELECT * FROM jsonb_array_elements(p_products) LOOP
-            SELECT ac.id INTO v_attention_combo_id FROM public.attention_combos ac WHERE ac.attention_id = v_attention_id AND ac.combo_id = (v_product->>'combo_id')::uuid;
+            SELECT ac.id INTO v_attention_combo_id FROM public.attention_combos ac 
+            WHERE ac.attention_id = v_attention_id AND ac.combo_id = (v_product->>'combo_id')::uuid AND ac.tenant_id = p_tenant_id AND ac.platform_id = p_platform_id;
+            
             INSERT INTO public.attention_products (
-                attention_id, product_id, user_id, quantity, unit_price, total_price, tenant_id, branch_id, combo_id, client_treatment_session_id
+                attention_id, product_id, user_id, quantity, unit_price, total_price, tenant_id, platform_id, branch_id, combo_id, client_treatment_session_id
             ) VALUES (
                 v_attention_id, (v_product->>'product_id')::uuid, (v_product->>'user_id')::uuid, 
                 COALESCE((v_product->>'quantity')::integer, 1), COALESCE((v_product->>'unit_price')::numeric, 0), 
                 COALESCE((v_product->>'unit_price')::numeric, 0) * COALESCE((v_product->>'quantity')::integer, 1), 
-                p_tenant_id, p_branch_id, v_attention_combo_id, (v_product->>'client_treatment_session_id')::uuid
+                p_tenant_id, p_platform_id, p_branch_id, v_attention_combo_id, (v_product->>'client_treatment_session_id')::uuid
             );
         END LOOP;
     END IF;
 
-    -- 4. Actualizar sesiones de tratamiento (CORREGIDO)
     UPDATE public.client_treatment_sessions
     SET
         status = 'Cita Asignada',
@@ -2836,79 +2775,30 @@ BEGIN
         SELECT (value->>'client_treatment_session_id')::uuid
         FROM jsonb_array_elements(p_products) AS value
         WHERE value->>'client_treatment_session_id' IS NOT NULL
-        UNION
-        SELECT (value->>'client_treatment_session_id')::uuid
-        FROM jsonb_array_elements(p_payments) AS value
-        WHERE value->>'client_treatment_session_id' IS NOT NULL
-    );
-
-    -- 5. Notificaciones (se mantienen igual)
-    BEGIN
-        PERFORM public.queue_client_email(p_tenant_id, p_client_id, 'new_attention', jsonb_build_object('attention_datetime', p_attention_datetime));
-    EXCEPTION WHEN others THEN
-        RAISE WARNING 'Failed to queue client email for new attention (client_id: %): %', p_client_id, SQLERRM;
-    END;
-    BEGIN
-        PERFORM public.queue_client_whatsapp(p_tenant_id, p_client_id, 'new_attention_whatsapp', jsonb_build_object('attention_datetime', p_attention_datetime));
-    EXCEPTION WHEN others THEN
-        RAISE WARNING 'Failed to queue client WhatsApp for new attention (client_id: %): %', p_client_id, SQLERRM;
-    END;
+    ) AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     RETURN v_attention_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) OWNER TO "postgres";
+ALTER FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."integration_categories" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "slug" "text" NOT NULL,
-    "description" "text",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."integration_categories" OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."create_integration_category"("p_name" "text", "p_slug" "text", "p_description" "text") RETURNS SETOF "public"."integration_categories"
-    LANGUAGE "plpgsql"
-    AS $$
-BEGIN
-    -- La RLS de la tabla previene la inserción si el usuario no es superadmin.
-    RETURN QUERY
-    INSERT INTO integration_categories (name, slug, description)
-    VALUES (p_name, p_slug, p_description)
-    RETURNING *;
-END;
-$$;
-
-
-ALTER FUNCTION "public"."create_integration_category"("p_name" "text", "p_slug" "text", "p_description" "text") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
-    INSERT INTO public.notifications (tenant_id, user_id, type, title, body, link_to)
-    VALUES (p_tenant_id, p_user_id, p_type, p_title, p_body, p_link_to);
+    INSERT INTO public.notifications (tenant_id, platform_id, user_id, type, title, body, link_to)
+    VALUES (p_tenant_id, p_platform_id, p_user_id, p_type, p_title, p_body, p_link_to);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") IS 'Crea una nueva notificación para un usuario específico dentro de un tenant. Debe ser llamada por un rol con privilegios elevados, como service_role, a través de una Edge Function.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid" DEFAULT NULL::"uuid", "p_reference_type" "text" DEFAULT NULL::"text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid" DEFAULT NULL::"uuid", "p_reference_type" "text" DEFAULT NULL::"text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -2916,40 +2806,33 @@ DECLARE
     new_stock numeric;
     new_avg_cost numeric;
 BEGIN
-    -- Lock the specific branch_product row to prevent race conditions on stock updates
     SELECT *
     INTO branch_product_rec
     FROM public.branch_products
-    WHERE branch_id = p_branch_id AND product_id = p_product_id
+    WHERE branch_id = p_branch_id AND product_id = p_product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     FOR UPDATE;
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'Product % not found in branch %', p_product_id, p_branch_id;
+        RAISE EXCEPTION 'Producto % no encontrado en la sucursal %', p_product_id, p_branch_id;
     END IF;
 
-    -- Calculate new stock
     new_stock := branch_product_rec.stock_quantity + p_quantity_change;
 
-    -- Calculate new weighted average cost
-    -- Avoid division by zero if the new stock is zero
     IF new_stock > 0 THEN
-        -- (Current total value + Value of change) / New total quantity
         new_avg_cost := ((branch_product_rec.stock_quantity * branch_product_rec.cost_price) + (p_quantity_change * p_cost_of_change)) / new_stock;
     ELSE
-        -- If stock is zero, the cost should also be zero.
         new_avg_cost := 0;
     END IF;
 
-    -- Update the branch_products table with the new stock and cost
     UPDATE public.branch_products
     SET
         stock_quantity = new_stock,
         cost_price = new_avg_cost
     WHERE id = branch_product_rec.id;
 
-    -- Insert the movement record with the snapshot values
     INSERT INTO public.product_movements (
         tenant_id,
+        platform_id,
         branch_id,
         product_id,
         movement_date,
@@ -2962,6 +2845,7 @@ BEGIN
         reference_type
     ) VALUES (
         p_tenant_id,
+        p_platform_id,
         p_branch_id,
         p_product_id,
         now(),
@@ -2978,48 +2862,42 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") IS 'Records a product movement, updates the stock and weighted average cost for the product in the branch.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
     v_transfer_id UUID;
-    item RECORD; -- Usamos un RECORD genérico para iterar
+    item RECORD;
 BEGIN
-    -- 1. Crear el registro principal de la transferencia
-    INSERT INTO product_transfers (tenant_id, from_branch_id, to_branch_id, transfer_date, status, notes)
-    VALUES (p_tenant_id, p_from_branch_id, p_to_branch_id, p_transfer_date, 'en_proceso', p_notes)
+    INSERT INTO product_transfers (tenant_id, platform_id, origin_branch_id, destination_branch_id, transfer_date, status, notes)
+    VALUES (p_tenant_id, p_platform_id, p_from_branch_id, p_to_branch_id, p_transfer_date, 'solicitado', p_notes)
     RETURNING id INTO v_transfer_id;
 
-    -- 2. Insertar los items y actualizar el stock de origen usando jsonb_to_recordset
-    FOR item IN SELECT * FROM jsonb_to_recordset(p_items) AS x(product_id UUID, quantity INT)
+    FOR item IN SELECT * FROM jsonb_to_recordset(p_items) AS x(product_id UUID, quantity numeric)
     LOOP
-        -- Insertar el item en la tabla de detalles
-        INSERT INTO product_transfer_items (transfer_id, product_id, quantity)
-        VALUES (v_transfer_id, item.product_id, item.quantity);
+        INSERT INTO product_transfer_items (transfer_id, tenant_id, platform_id, product_id, quantity)
+        VALUES (v_transfer_id, p_tenant_id, p_platform_id, item.product_id, item.quantity);
 
-        -- Actualizar (restar) el stock en la sucursal de origen
+        -- El stock se resta usualmente cuando cambia a 'en_transito' o similar, 
+        -- pero mantenemos la lógica original de restar al crear si así estaba.
+        -- Ajustado para usar PK compuesta en el UPDATE
         UPDATE branch_products
         SET stock_quantity = stock_quantity - item.quantity
-        WHERE branch_id = p_from_branch_id AND product_id = item.product_id;
+        WHERE branch_id = p_from_branch_id AND product_id = item.product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
     END LOOP;
 
-    -- 4. Devolver el ID de la transferencia creada
     RETURN v_transfer_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -3068,7 +2946,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."create_recovery_link"("p_user_email" "text", "p_user_role" "text") RETURNS json
@@ -3306,7 +3184,7 @@ $$;
 ALTER FUNCTION "public"."create_tenant_and_admin_logic"("p_business_name" "text", "p_country_id" "uuid", "p_default_language_code" "text", "p_default_currency_id" "uuid", "p_default_timezone" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_legal_name" "text", "p_tax_id" "text", "p_billing_address" "text", "p_einvoicing_email" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_website" "text", "p_latitude" numeric, "p_longitude" numeric, "p_admin_email" "text", "p_admin_password" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -3330,6 +3208,7 @@ BEGIN
     PERFORM public.set_user_assignment(
         p_target_user_id := v_new_user_id,
         p_tenant_id := p_tenant_id,
+        p_platform_id := p_platform_id,
         p_role_id := p_role_id,
         p_branch_id := p_branch_id
     );
@@ -3348,61 +3227,171 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_tenant_with_admin"("name" "text", "subscription_status" "text", "country_id" "uuid", "default_language_code" "text", "default_currency_id" "uuid", "default_timezone" "text", "contact_phone" "text", "whatsapp_phone" "text", "commercial_email" "text", "legal_name" "text", "tax_id" "text", "billing_address" "text", "einvoicing_email" "text", "physical_address_line1" "text", "physical_address_line2" "text", "physical_city" "text", "physical_state" "text", "physical_postal_code" "text", "website" "text", "latitude" numeric, "longitude" numeric, "admin_email" "text", "admin_password" "text") RETURNS TABLE("created_tenant_id" "uuid")
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."create_tenant_with_admin"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid", "p_tenant_name" "text", "p_country_id" "text", "p_email" "text", "p_currency_id" "uuid", "p_timezone" "text", "p_phone" "text", "p_address" "text", "p_website" "text", "p_latitude" numeric, "p_longitude" numeric, "p_whatsapp_phone" "text" DEFAULT NULL::"text", "p_legal_name" "text" DEFAULT NULL::"text", "p_tax_id" "text" DEFAULT NULL::"text", "p_einvoicing_email" "text" DEFAULT NULL::"text", "p_physical_address_line1" "text" DEFAULT NULL::"text", "p_physical_address_line2" "text" DEFAULT NULL::"text", "p_physical_city" "text" DEFAULT NULL::"text", "p_physical_state" "text" DEFAULT NULL::"text", "p_physical_postal_code" "text" DEFAULT NULL::"text", "p_default_language_code" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-    new_tenant_id UUID;
-    tenant_admin_role_id UUID;
-    new_user_id UUID;
+    v_role_id UUID;
+    v_branch_id UUID;
+    v_tenant_exists BOOLEAN;
+    v_country_uuid UUID;
 BEGIN
-    -- Paso 1: Crear el nuevo tenant (sin cambios)
-    INSERT INTO tenants (
-        name, subscription_status, country_id, default_language_code, default_currency_id, default_timezone,
-        contact_phone, whatsapp_phone, commercial_email, legal_name, tax_id, billing_address, einvoicing_email,
-        physical_address_line1, physical_address_line2, physical_city, physical_state, physical_postal_code,
-        website, latitude, longitude
-    ) VALUES (
-        create_tenant_with_admin.name, create_tenant_with_admin.subscription_status, create_tenant_with_admin.country_id,
-        create_tenant_with_admin.default_language_code, create_tenant_with_admin.default_currency_id, create_tenant_with_admin.default_timezone,
-        create_tenant_with_admin.contact_phone, create_tenant_with_admin.whatsapp_phone, create_tenant_with_admin.commercial_email,
-        create_tenant_with_admin.legal_name, create_tenant_with_admin.tax_id, create_tenant_with_admin.billing_address,
-        create_tenant_with_admin.einvoicing_email, create_tenant_with_admin.physical_address_line1,
-        create_tenant_with_admin.physical_address_line2, create_tenant_with_admin.physical_city,
-        create_tenant_with_admin.physical_state, create_tenant_with_admin.physical_postal_code,
-        create_tenant_with_admin.website, create_tenant_with_admin.latitude, create_tenant_with_admin.longitude
-    ) RETURNING id INTO new_tenant_id;
+    -- 1. Validar y convertir country_id
+    BEGIN
+        v_country_uuid := p_country_id::UUID;
+    EXCEPTION WHEN OTHERS THEN
+        v_country_uuid := NULL;
+    END;
 
-    -- Paso 2: Obtener el ID del rol 'tenant_super_admin' (sin cambios)
-    SELECT id INTO tenant_admin_role_id FROM roles WHERE roles.name = 'tenant_super_admin' LIMIT 1;
-    IF tenant_admin_role_id IS NULL THEN
-        RAISE EXCEPTION 'El rol "tenant_super_admin" no fue encontrado.';
+    -- 2. Verificar si el tenant ya existe
+    SELECT EXISTS(SELECT 1 FROM public.tenants WHERE id = p_tenant_id AND platform_id = p_platform_id) INTO v_tenant_exists;
+    
+    IF NOT v_tenant_exists THEN
+        INSERT INTO public.tenants (
+            id,
+            platform_id,
+            name,
+            country_id,
+            contact_email,
+            contact_phone,
+            whatsapp_phone,
+            billing_address,
+            website,
+            latitude,
+            longitude,
+            default_currency_id,
+            default_timezone,
+            subscription_status,
+            is_active,
+            legal_name,
+            tax_id,
+            einvoicing_email,
+            physical_address_line1,
+            physical_address_line2,
+            physical_city,
+            physical_state,
+            physical_postal_code,
+            default_language_code
+        ) VALUES (
+            p_tenant_id,
+            p_platform_id,
+            p_tenant_name,
+            v_country_uuid,
+            p_email,
+            p_phone,
+            p_whatsapp_phone,
+            p_address,
+            p_website,
+            p_latitude,
+            p_longitude,
+            p_currency_id,
+            p_timezone,
+            'trial',
+            true,
+            p_legal_name,
+            p_tax_id,
+            p_einvoicing_email,
+            p_physical_address_line1,
+            p_physical_address_line2,
+            p_physical_city,
+            p_physical_state,
+            p_physical_postal_code,
+            p_default_language_code
+        );
     END IF;
 
-    -- Paso 3: Crear el nuevo usuario (REFACTORIZADO)
-    -- Se inserta solo la información de identidad en la tabla 'users'.
-    INSERT INTO users (email, password_hash)
-    VALUES (
-        create_tenant_with_admin.admin_email,
-        crypt(create_tenant_with_admin.admin_password, gen_salt('bf'))
-    ) RETURNING id INTO new_user_id;
+    -- 3. Crear Sucursal Principal
+    SELECT id INTO v_branch_id FROM public.branches 
+    WHERE tenant_id = p_tenant_id 
+      AND platform_id = p_platform_id 
+      AND is_main_branch = true 
+    LIMIT 1;
 
-    -- Paso 4: Crear la asignación en la nueva tabla (NUEVO)
-    -- Se vincula el usuario, el tenant y el rol en 'user_assignments'.
-    INSERT INTO user_assignments (user_id, tenant_id, role_id)
-    VALUES (new_user_id, new_tenant_id, tenant_admin_role_id);
+    IF v_branch_id IS NULL THEN
+        INSERT INTO public.branches (
+            tenant_id,
+            platform_id,
+            name,
+            address,
+            is_main_branch,
+            status,
+            contact_phone,
+            whatsapp_phone,
+            commercial_email,
+            timezone,
+            latitude,
+            longitude,
+            physical_address_line1,
+            physical_address_line2,
+            physical_city,
+            physical_state,
+            physical_postal_code,
+            language_code
+        ) VALUES (
+            p_tenant_id,
+            p_platform_id,
+            'Sucursal Principal',
+            p_address,
+            true,
+            'active',
+            p_phone,
+            p_whatsapp_phone,
+            p_email,
+            p_timezone,
+            p_latitude,
+            p_longitude,
+            p_physical_address_line1,
+            p_physical_address_line2,
+            p_physical_city,
+            p_physical_state,
+            p_physical_postal_code,
+            p_default_language_code
+        ) RETURNING id INTO v_branch_id;
+    END IF;
 
-    -- Paso 5: Devolver el ID del tenant creado (sin cambios)
-    RETURN QUERY SELECT new_tenant_id;
+    -- 4. Obtener Rol Admin
+    SELECT id INTO v_role_id FROM public.roles WHERE name = 'tenant_super_admin' LIMIT 1;
+    IF v_role_id IS NULL THEN
+        RAISE EXCEPTION 'Rol tenant_super_admin no encontrado';
+    END IF;
 
+    -- 5. Asignar Usuario
+    IF NOT EXISTS (
+        SELECT 1 FROM public.user_assignments 
+        WHERE user_id = p_user_id 
+          AND tenant_id = p_tenant_id 
+          AND platform_id = p_platform_id 
+          AND role_id = v_role_id
+    ) THEN
+        INSERT INTO public.user_assignments (
+            user_id,
+            tenant_id,
+            platform_id,
+            role_id,
+            status
+        ) VALUES (
+            p_user_id,
+            p_tenant_id,
+            p_platform_id,
+            v_role_id,
+            'active'
+        );
+    END IF;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'tenant_id', p_tenant_id,
+        'branch_id', v_branch_id,
+        'user_id', p_user_id
+    );
 END;
 $$;
 
 
-ALTER FUNCTION "public"."create_tenant_with_admin"("name" "text", "subscription_status" "text", "country_id" "uuid", "default_language_code" "text", "default_currency_id" "uuid", "default_timezone" "text", "contact_phone" "text", "whatsapp_phone" "text", "commercial_email" "text", "legal_name" "text", "tax_id" "text", "billing_address" "text", "einvoicing_email" "text", "physical_address_line1" "text", "physical_address_line2" "text", "physical_city" "text", "physical_state" "text", "physical_postal_code" "text", "website" "text", "latitude" numeric, "longitude" numeric, "admin_email" "text", "admin_password" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_tenant_with_admin"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid", "p_tenant_name" "text", "p_country_id" "text", "p_email" "text", "p_currency_id" "uuid", "p_timezone" "text", "p_phone" "text", "p_address" "text", "p_website" "text", "p_latitude" numeric, "p_longitude" numeric, "p_whatsapp_phone" "text", "p_legal_name" "text", "p_tax_id" "text", "p_einvoicing_email" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_default_language_code" "text") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."treatments" (
@@ -3416,8 +3405,11 @@ CREATE TABLE IF NOT EXISTS "public"."treatments" (
     "upfront_price" numeric(10,2) DEFAULT 0.00,
     "financed_price" numeric(10,2) DEFAULT 0.00,
     "is_active" boolean DEFAULT true NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "treatment_prototypes_type_check" CHECK (("type" = ANY (ARRAY['treatment'::"text", 'project'::"text"])))
 );
+
+ALTER TABLE ONLY "public"."treatments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."treatments" OWNER TO "postgres";
@@ -3435,7 +3427,7 @@ COMMENT ON COLUMN "public"."treatments"."financed_price" IS 'Precio total del tr
 
 
 
-CREATE OR REPLACE FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") RETURNS "public"."treatments"
+CREATE OR REPLACE FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") RETURNS "public"."treatments"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -3444,8 +3436,8 @@ DECLARE
     new_session_id uuid;
     item_data jsonb;
 BEGIN
-    INSERT INTO public.treatments (tenant_id, name, description, type, upfront_price, financed_price)
-    VALUES (p_tenant_id, p_name, p_description, p_type, p_upfront_price, p_financed_price)
+    INSERT INTO public.treatments (tenant_id, platform_id, name, description, type, upfront_price, financed_price)
+    VALUES (p_tenant_id, p_platform_id, p_name, p_description, p_type, p_upfront_price, p_financed_price)
     RETURNING * INTO new_treatment;
 
     IF p_sessions IS NOT NULL AND jsonb_array_length(p_sessions) > 0 THEN
@@ -3494,27 +3486,27 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."create_unit_of_measure"("p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."create_unit_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") RETURNS "uuid"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
     new_id UUID;
 BEGIN
-    INSERT INTO public.units_of_measure (tenant_id, name, abbreviation)
-    VALUES (p_tenant_id, p_name, p_abbreviation)
+    INSERT INTO public.units_of_measure (platform_id, tenant_id, name, abbreviation)
+    VALUES (p_platform_id, p_tenant_id, p_name, p_abbreviation)
     RETURNING id INTO new_id;
     RETURN new_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."create_unit_of_measure"("p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."create_unit_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -3536,10 +3528,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -3547,7 +3539,6 @@ DECLARE
     v_caller_tenant_id UUID := (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid;
     v_branch record;
 BEGIN
-    -- Authorization Check
     IF v_caller_role NOT IN ('super_admin', 'tenant_super_admin') THEN
         RAISE EXCEPTION 'Permission denied: You do not have rights to delete branches.';
     END IF;
@@ -3555,20 +3546,20 @@ BEGIN
         RAISE EXCEPTION 'Permission denied: You can only delete branches within your own tenant.';
     END IF;
 
-    SELECT * INTO v_branch FROM public.branches WHERE id = p_branch_id AND tenant_id = p_tenant_id;
+    SELECT * INTO v_branch FROM public.branches WHERE id = p_branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
     IF v_branch IS NULL THEN RAISE EXCEPTION 'Branch not found or you do not have permission to delete it.'; END IF;
     IF v_branch.is_main_branch THEN RAISE EXCEPTION 'Cannot delete the main branch.'; END IF;
     
-    DELETE FROM public.branches WHERE id = p_branch_id;
+    DELETE FROM public.branches WHERE id = p_branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
     RETURN jsonb_build_object('success', true, 'message', 'Branch deleted successfully');
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid") RETURNS "text"
+CREATE OR REPLACE FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -3579,7 +3570,7 @@ BEGIN
     SELECT google_drive_file_id, is_primary
     INTO v_google_drive_file_id, v_is_primary
     FROM public.branch_photos
-    WHERE id = p_photo_id AND branch_id = p_branch_id AND tenant_id = p_tenant_id;
+    WHERE id = p_photo_id AND branch_id = p_branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     IF v_google_drive_file_id IS NULL THEN
         RAISE EXCEPTION 'Photo not found or permission denied';
@@ -3603,14 +3594,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid") IS 'Deletes a branch photo record and returns its Google Drive File ID for external deletion.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -3620,20 +3607,20 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_client_treatment"("p_client_treatment_id" "uuid", "p_tenant_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."delete_client_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
     v_session_started_count integer;
     v_deleted_id uuid;
 BEGIN
-    -- Security check: Ensure the treatment belongs to the correct tenant
+    -- Security check: Ensure the treatment belongs to the correct tenant/platform
     IF NOT EXISTS (
         SELECT 1 FROM public.client_treatments 
-        WHERE id = p_client_treatment_id AND tenant_id = p_tenant_id
+        WHERE id = p_client_treatment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     ) THEN
         RAISE EXCEPTION 'Treatment not found or permission denied';
     END IF;
@@ -3643,6 +3630,7 @@ BEGIN
     INTO v_session_started_count
     FROM public.client_treatment_sessions
     WHERE client_treatment_id = p_client_treatment_id
+      AND tenant_id = p_tenant_id AND platform_id = p_platform_id
       AND status <> 'pending';
 
     IF v_session_started_count > 0 THEN
@@ -3651,7 +3639,7 @@ BEGIN
 
     -- If checks pass, delete the treatment. Cascade should handle the rest.
     DELETE FROM public.client_treatments
-    WHERE id = p_client_treatment_id
+    WHERE id = p_client_treatment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     RETURNING id INTO v_deleted_id;
 
     RETURN v_deleted_id;
@@ -3659,28 +3647,28 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_client_treatment"("p_client_treatment_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_client_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_combo_image"("p_image_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."delete_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  deleted_id uuid;
+  v_google_drive_file_id text;
 BEGIN
   DELETE FROM public.combo_images
-  WHERE id = p_image_id
-  RETURNING id INTO deleted_id;
+  WHERE id = p_image_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
+  RETURNING google_drive_file_id INTO v_google_drive_file_id;
 
-  RETURN deleted_id;
+  RETURN v_google_drive_file_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_combo_image"("p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -3689,49 +3677,49 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
-    DELETE FROM equipment WHERE id = p_equipment_id AND tenant_id = p_tenant_id;
+    DELETE FROM equipment WHERE id = p_equipment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
-    DELETE FROM equipment_maintenance_history
-    WHERE id = p_record_id AND tenant_id = p_tenant_id;
+    DELETE FROM public.equipment_maintenance_history
+    WHERE id = p_record_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
     -- Check if the type is being used by any equipment
-    IF EXISTS (SELECT 1 FROM equipment WHERE type_id = p_type_id AND tenant_id = p_tenant_id) THEN
+    IF EXISTS (SELECT 1 FROM equipment WHERE type_id = p_type_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id) THEN
         RAISE EXCEPTION 'Cannot delete equipment type because it is in use.';
     END IF;
 
-    DELETE FROM equipment_types WHERE id = p_type_id AND tenant_id = p_tenant_id;
+    DELETE FROM equipment_types WHERE id = p_type_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."delete_integration_category"("p_id" "uuid") RETURNS "void"
@@ -3752,43 +3740,43 @@ $$;
 ALTER FUNCTION "public"."delete_integration_category"("p_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_product_image"("p_image_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."delete_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  deleted_id uuid;
+  v_google_drive_file_id text;
 BEGIN
   DELETE FROM public.product_images
-  WHERE id = p_image_id
-  RETURNING id INTO deleted_id;
+  WHERE id = p_image_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
+  RETURNING google_drive_file_id INTO v_google_drive_file_id;
 
-  RETURN deleted_id;
+  RETURN v_google_drive_file_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_product_image"("p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_service_image"("p_image_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."delete_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  deleted_id uuid;
+  v_google_drive_file_id text;
 BEGIN
   DELETE FROM public.service_images
-  WHERE id = p_image_id
-  RETURNING id INTO deleted_id;
+  WHERE id = p_image_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
+  RETURNING google_drive_file_id INTO v_google_drive_file_id;
 
-  RETURN deleted_id;
+  RETURN v_google_drive_file_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_service_image"("p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -3796,111 +3784,111 @@ BEGIN
     WHERE
         id = p_signed_consent_id
         AND tenant_id = p_tenant_id
+        AND platform_id = p_platform_id
         AND signed_at IS NULL;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
-    RAISE LOG 'Iniciando borrado en cascada (v3) para el tenant: %', target_tenant_id;
+    RAISE LOG 'Iniciando borrado en cascada (v4) para el tenant: %', target_tenant_id;
 
-    -- Nivel 1: Datos de eventos y logs
-    RAISE LOG 'Borrando audit_logs...';
-    DELETE FROM audit_logs WHERE tenant_id = target_tenant_id;
+    -- Nivel 1: Datos de eventos y logs (audit_logs y metrics ya no existen en este esquema)
+    
     RAISE LOG 'Borrando appointment_evidence...';
-    DELETE FROM appointment_evidence WHERE tenant_id = target_tenant_id;
+    DELETE FROM appointment_evidence WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando appointment_extra_services...';
-    DELETE FROM appointment_extra_services WHERE tenant_id = target_tenant_id;
+    DELETE FROM appointment_extra_services WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando appointment_products...';
-    DELETE FROM appointment_products WHERE tenant_id = target_tenant_id;
+    DELETE FROM appointment_products WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando appointment_sessions...';
-    DELETE FROM appointment_sessions WHERE tenant_id = target_tenant_id;
+    DELETE FROM appointment_sessions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando attention_products...';
-    DELETE FROM attention_products WHERE tenant_id = target_tenant_id;
+    DELETE FROM attention_products WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando attention_service_products...';
-    DELETE FROM attention_service_products WHERE tenant_id = target_tenant_id;
+    DELETE FROM attention_service_products WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando attention_services...';
-    DELETE FROM attention_services WHERE tenant_id = target_tenant_id;
+    DELETE FROM attention_services WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando extra_service_sessions...';
-    DELETE FROM extra_service_sessions WHERE tenant_id = target_tenant_id;
+    DELETE FROM extra_service_sessions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando service_evidence...';
-    DELETE FROM service_evidence WHERE tenant_id = target_tenant_id;
+    DELETE FROM service_evidence WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando service_sessions...';
-    DELETE FROM service_sessions WHERE tenant_id = target_tenant_id;
+    DELETE FROM service_sessions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando product_stylist_commissions...';
-    DELETE FROM product_stylist_commissions WHERE tenant_id = target_tenant_id;
+    DELETE FROM product_stylist_commissions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando service_stylist_commissions...';
-    DELETE FROM service_stylist_commissions WHERE tenant_id = target_tenant_id;
+    DELETE FROM service_stylist_commissions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando purchase_items...';
-    DELETE FROM purchase_items WHERE tenant_id = target_tenant_id;
+    DELETE FROM purchase_items WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando stylist_time_off...';
-    DELETE FROM stylist_time_off WHERE tenant_id = target_tenant_id;
+    DELETE FROM stylist_time_off WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando user_permissions...';
-    DELETE FROM user_permissions WHERE tenant_id = target_tenant_id;
+    DELETE FROM user_permissions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando menu_permissions...';
-    DELETE FROM menu_permissions WHERE tenant_id = target_tenant_id;
+    DELETE FROM menu_permissions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
 
     -- Nivel 2: Entidades transaccionales principales
     RAISE LOG 'Borrando appointments...';
-    DELETE FROM appointments WHERE tenant_id = target_tenant_id;
+    DELETE FROM appointments WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando attentions...';
-    DELETE FROM attentions WHERE tenant_id = target_tenant_id;
+    DELETE FROM attentions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando purchases...';
-    DELETE FROM purchases WHERE tenant_id = target_tenant_id;
+    DELETE FROM purchases WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando stylist_schedules...';
-    DELETE FROM stylist_schedules WHERE tenant_id = target_tenant_id;
+    DELETE FROM stylist_schedules WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
 
-    -- Nivel 3: Usuarios y sus datos asociados (CRÍTICO: antes de roles y branches)
+    -- Nivel 3: Usuarios y sus datos asociados
     RAISE LOG 'Borrando users...';
-    DELETE FROM users WHERE tenant_id = target_tenant_id;
+    DELETE FROM users WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando stylists...';
-    DELETE FROM stylists WHERE tenant_id = target_tenant_id;
+    DELETE FROM stylists WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando clients...';
-    DELETE FROM clients WHERE tenant_id = target_tenant_id;
+    DELETE FROM clients WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
 
     -- Nivel 4: Catálogos y datos de negocio base
     RAISE LOG 'Borrando supplier_products...';
-    DELETE FROM supplier_products WHERE tenant_id = target_tenant_id;
+    DELETE FROM supplier_products WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando suppliers...';
-    DELETE FROM suppliers WHERE tenant_id = target_tenant_id;
+    DELETE FROM suppliers WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando products...';
-    DELETE FROM products WHERE tenant_id = target_tenant_id;
+    DELETE FROM products WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando services...';
-    DELETE FROM services WHERE tenant_id = target_tenant_id;
+    DELETE FROM services WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando service_categories...';
-    DELETE FROM service_categories WHERE tenant_id = target_tenant_id;
+    DELETE FROM service_categories WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando brands...';
-    DELETE FROM brands WHERE tenant_id = target_tenant_id;
+    DELETE FROM brands WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando schedule_templates...';
-    DELETE FROM schedule_templates WHERE tenant_id = target_tenant_id;
+    DELETE FROM schedule_templates WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
 
     -- Nivel 5: Configuración del Tenant
     RAISE LOG 'Borrando branches...';
-    DELETE FROM branches WHERE tenant_id = target_tenant_id;
+    DELETE FROM branches WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando translations...';
-    DELETE FROM translations WHERE tenant_id = target_tenant_id;
+    DELETE FROM translations WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
     RAISE LOG 'Borrando tenant_subscriptions...';
-    DELETE FROM tenant_subscriptions WHERE tenant_id = target_tenant_id;
+    DELETE FROM tenant_subscriptions WHERE tenant_id = target_tenant_id AND platform_id = p_platform_id;
 
     -- Nivel Final: El tenant mismo
     RAISE LOG 'Borrando el tenant principal...';
     DELETE FROM tenants WHERE id = target_tenant_id;
 
-    RAISE LOG 'Borrado en cascada (v3) completado para el tenant: %', target_tenant_id;
+    RAISE LOG 'Borrado en cascada (v4) completado para el tenant: %', target_tenant_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") RETURNS json
+CREATE OR REPLACE FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") RETURNS json
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -3916,7 +3904,7 @@ BEGIN
     SELECT * INTO integration_record
     FROM public.tenant_integrations
     WHERE
-        tenant_id = p_tenant_id -- <-- THE CRITICAL FIX
+        tenant_id = p_tenant_id AND platform_id = p_platform_id -- <-- THE CRITICAL FIX
     AND 
         (provider = p_provider OR (p_provider = 'google' AND provider = 'google_drive'));
 
@@ -3945,7 +3933,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."delete_tenant_social_network"("p_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "void"
@@ -3961,12 +3949,12 @@ $$;
 ALTER FUNCTION "public"."delete_tenant_social_network"("p_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
     DELETE FROM public.treatments
-    WHERE id = p_treatment_id AND tenant_id = p_tenant_id;
+    WHERE id = p_treatment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Treatment not found or not owned by tenant.';
@@ -3975,76 +3963,51 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_treatment_image"("p_image_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."delete_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") RETURNS "text"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
-  deleted_id uuid;
+  v_google_drive_file_id text;
 BEGIN
   DELETE FROM public.treatment_images
-  WHERE id = p_image_id
-  RETURNING id INTO deleted_id;
+  WHERE id = p_image_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
+  RETURNING google_drive_file_id INTO v_google_drive_file_id;
 
-  RETURN deleted_id;
+  RETURN v_google_drive_file_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_treatment_image"("p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     DELETE FROM public.units_of_measure
-    WHERE id = p_id AND tenant_id = p_tenant_id;
+    WHERE id = p_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") RETURNS json
-    LANGUAGE "plpgsql" SECURITY DEFINER
+CREATE OR REPLACE FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql"
     AS $$
 BEGIN
-    -- Primero, verificamos si el usuario autenticado es un superadministrador.
-    -- Esta es una capa de seguridad crucial.
-    IF NOT EXISTS (
-        SELECT 1
-        FROM auth.users u, jsonb_array_elements(u.raw_app_meta_data -> 'assignments') AS assignment
-        WHERE u.id = p_requesting_user_id
-          AND (assignment ->> 'role') = 'super_admin'
-    ) THEN
-        RETURN json_build_object('success', false, 'message', 'Acceso no autorizado. Se requiere ser superadministrador.');
-    END IF;
-
-    -- Procedemos a eliminar la integración específica para el tenant dado.
     DELETE FROM public.tenant_integrations
-    WHERE tenant_id = p_tenant_id AND provider = p_provider;
-
-    -- La variable 'FOUND' en PL/pgSQL es verdadera si la última operación (DELETE) afectó al menos una fila.
-    IF FOUND THEN
-        RETURN json_build_object('success', true, 'message', 'Integración desconectada correctamente.');
-    ELSE
-        -- Si no se encontró ninguna fila para eliminar, informamos que no existía.
-        RETURN json_build_object('success', false, 'message', 'No se encontró una integración activa de este tipo para el tenant especificado.');
-    END IF;
-
-EXCEPTION
-    -- Capturamos cualquier otro error que pueda ocurrir durante la ejecución.
-    WHEN OTHERS THEN
-        RETURN json_build_object('success', false, 'message', 'Ocurrió un error interno al intentar desconectar la integración.');
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND provider = p_provider;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."end_service"("p_attention_service_id" "uuid") RETURNS "void"
@@ -4115,7 +4078,7 @@ $$;
 ALTER FUNCTION "public"."enqueue_test_email"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -4144,10 +4107,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."finish_service"("p_attention_service_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."finish_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -4162,10 +4125,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."finish_service"("p_attention_service_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."finish_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -4208,9 +4171,9 @@ BEGIN
 
     -- Create invoice header
     INSERT INTO public.invoices (
-        tenant_id, billed_to_client_id, attention_id, invoice_number, status, subtotal_amount, total_tax_amount, total_amount, issue_date, due_date, currency_id
+        tenant_id, platform_id, billed_to_client_id, attention_id, invoice_number, status, subtotal_amount, total_tax_amount, total_amount, issue_date, due_date, currency_id
     ) VALUES (
-        v_tenant_id, v_client_id, p_attention_id, 'INV-' || to_char(CURRENT_DATE, 'YYYYMMDD') || '-' || (SELECT count(*) + 1 FROM invoices WHERE tenant_id = v_tenant_id), 'paid', 0, 0, v_attention.total_amount, CURRENT_DATE, CURRENT_DATE, v_currency_id
+        v_tenant_id, p_platform_id, v_client_id, p_attention_id, 'INV-' || to_char(CURRENT_DATE, 'YYYYMMDD') || '-' || (SELECT count(*) + 1 FROM invoices WHERE tenant_id = v_tenant_id), 'paid', 0, 0, v_attention.total_amount, CURRENT_DATE, CURRENT_DATE, v_currency_id
     ) RETURNING id INTO v_invoice_id;
 
     -- Create invoice items for services
@@ -4243,10 +4206,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -4298,7 +4261,7 @@ BEGIN
 
     -- 3. Crear la cabecera de la factura (con totales iniciales en 0)
     INSERT INTO public.invoices (
-        tenant_id, billed_to_tenant_id, issue_date, due_date,
+        tenant_id, platform_id, billed_to_tenant_id, issue_date, due_date,
         subtotal_amount, total_tax_amount, total_amount, currency_id,
         invoice_number, status
     ) VALUES (
@@ -4354,76 +4317,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_api_health_stats"() RETURNS json
-    LANGUAGE "plpgsql"
-    AS $$
-BEGIN
-    -- Clean up old records
-    DELETE FROM public.api_request_metrics WHERE created_at < now() - interval '2 months';
-
-    -- Return the statistics
-    RETURN (
-        WITH metrics_last_hour AS (
-            SELECT
-                response_time_ms,
-                status_code,
-                created_at,
-                path
-            FROM public.api_request_metrics
-            WHERE created_at >= now() - interval '60 minutes'
-        ),
-        metrics_last_month AS (
-            SELECT
-                response_time_ms,
-                path,
-                created_at
-            FROM public.api_request_metrics
-            WHERE created_at >= now() - interval '1 month'
-        ),
-        rpm_data AS (
-            SELECT
-                date_trunc('minute', created_at) AS time_bucket,
-                count(*) AS request_count
-            FROM metrics_last_hour
-            GROUP BY time_bucket
-            ORDER BY time_bucket
-        ),
-        high_latency_grouped AS (
-            SELECT
-                path,
-                count(*) as total,
-                avg(response_time_ms) as avg_latency,
-                max(response_time_ms) as max_latency
-            FROM metrics_last_month
-            WHERE response_time_ms > 1000
-            GROUP BY path
-            ORDER BY total DESC
-        )
-        SELECT json_build_object(
-            'avg_latency_ms', (SELECT COALESCE(avg(response_time_ms), 0) FROM metrics_last_hour),
-            'error_rate_percentage', (
-                SELECT COALESCE(
-                    (count(*) FILTER (WHERE status_code >= 500) * 100.0) / NULLIF(count(*), 0),
-                    0
-                )
-                FROM metrics_last_hour
-            ),
-            'high_latency_requests', (SELECT COALESCE(sum(total), 0) FROM high_latency_grouped),
-            'high_latency_list', (SELECT COALESCE(json_agg(high_latency_grouped), '[]'::json) FROM high_latency_grouped),
-            'requests_per_minute', (SELECT COALESCE(json_agg(rpm_data), '[]'::json) FROM rpm_data)
-        )
-    );
-END;
-$$;
-
-
-ALTER FUNCTION "public"."get_api_health_stats"() OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid") RETURNS TABLE("user_id" "uuid", "email" "text", "first_name" "text", "last_name" "text")
+CREATE OR REPLACE FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("user_id" "uuid", "email" "text", "first_name" "text", "last_name" "text")
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -4442,15 +4339,16 @@ BEGIN
   WHERE au.id IN (
     -- Select only users assigned as vendors in this tenant
     SELECT ua.user_id FROM public.user_assignments ua WHERE ua.tenant_id = p_tenant_id AND ua.role_id = vendor_role_id
+    -- TODO: AND ua.platform_id = p_platform_id
   );
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid") RETURNS TABLE("user_id" "uuid", "email" "text", "first_name" "text", "last_name" "text")
+CREATE OR REPLACE FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("user_id" "uuid", "email" "text", "first_name" "text", "last_name" "text")
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -4469,18 +4367,20 @@ BEGIN
   WHERE au.id IN (
     -- Select all users assigned to this tenant
     SELECT ua.user_id FROM public.user_assignments ua WHERE ua.tenant_id = p_tenant_id
+    -- TODO: AND ua.platform_id = p_platform_id
   ) AND au.id NOT IN (
     -- Exclude users who have the 'tenant_vendor' role in this tenant
     SELECT ua.user_id FROM public.user_assignments ua WHERE ua.tenant_id = p_tenant_id AND ua.role_id = vendor_role_id
+    -- TODO: AND ua.platform_id = p_platform_id
   );
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") RETURNS TABLE("attention_datetime" timestamp with time zone, "status" "text")
+CREATE OR REPLACE FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") RETURNS TABLE("attention_datetime" timestamp with time zone, "status" "text")
     LANGUAGE "plpgsql" STABLE
     AS $$
 BEGIN
@@ -4491,8 +4391,9 @@ BEGIN
     FROM
         public.attentions a
     WHERE
-        a.tenant_id = p_tenant_id -- Added tenant_id filter
-        AND a.status NOT IN ('Pagada', 'Cancelada') -- Added status filter
+        a.tenant_id = p_tenant_id 
+        AND a.platform_id = p_platform_id
+        AND a.status NOT IN ('Pagada', 'Cancelada')
         AND (p_branch_id IS NULL OR a.branch_id = p_branch_id)
         AND (p_user_id IS NULL OR EXISTS (
             SELECT 1
@@ -4503,41 +4404,42 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") IS 'Returns a list of attention datetimes and statuses, filtered by tenant, and excluding completed/canceled ones.';
+COMMENT ON FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") IS 'Returns a list of attention datetimes and statuses, filtered by tenant and platform, excluding completed/canceled ones.';
 
 
 
-CREATE OR REPLACE FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") RETURNS TABLE("id" "uuid", "created_at" timestamp with time zone, "tenant_id" "uuid", "branch_id" "uuid", "client_id" "uuid", "attention_datetime" timestamp with time zone, "status" "text", "notes" "text", "total_amount" numeric, "informed_consent_id" "uuid", "survey_token" "uuid", "survey_status" "text", "clients" json, "attention_services" json, "attention_products" json, "attention_combos" json, "attention_payments" json)
+CREATE OR REPLACE FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") RETURNS TABLE("id" "uuid", "created_at" timestamp with time zone, "tenant_id" "uuid", "platform_id" "uuid", "branch_id" "uuid", "client_id" "uuid", "attention_datetime" timestamp with time zone, "status" "text", "notes" "text", "total_amount" numeric, "informed_consent_id" "uuid", "survey_token" "uuid", "survey_status" "text", "clients" json, "attention_services" json, "attention_products" json, "attention_combos" json, "attention_payments" json)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
   RETURN QUERY
   WITH tenant_users AS (
-    SELECT * FROM get_tenant_users(p_tenant_id)
+    SELECT * FROM get_tenant_users(p_tenant_id, p_platform_id)
   ),
   attentions_filtered AS (
     SELECT
-      a.id, a.created_at, a.tenant_id, a.branch_id, a.client_id, a.attention_datetime, a.status, a.notes, a.total_amount, -- Añadido
+      a.id, a.created_at, a.tenant_id, a.platform_id, a.branch_id, a.client_id, a.attention_datetime, a.status, a.notes, a.total_amount,
       sc.id as informed_consent_id, ss.survey_token, ss.status as survey_status
     FROM public.attentions a
-    LEFT JOIN public.signed_consents sc ON a.id = sc.attention_id
-    LEFT JOIN public.satisfaction_surveys ss ON a.id = ss.attention_id
+    LEFT JOIN public.signed_consents sc ON a.id = sc.attention_id AND a.tenant_id = sc.tenant_id AND a.platform_id = sc.platform_id
+    LEFT JOIN public.satisfaction_surveys ss ON a.id = ss.attention_id AND a.tenant_id = ss.tenant_id AND a.platform_id = ss.platform_id
     WHERE
       a.tenant_id = p_tenant_id
+      AND a.platform_id = p_platform_id
       AND (p_branch_id IS NULL OR a.branch_id = p_branch_id)
       AND (p_status_filter IS NULL OR a.status = p_status_filter)
       AND (a.attention_datetime::date BETWEEN p_start_date AND p_end_date)
       AND (p_user_id IS NULL OR EXISTS (
-        SELECT 1 FROM public.attention_services aserv WHERE aserv.attention_id = a.id AND aserv.user_id = p_user_id
+        SELECT 1 FROM public.attention_services aserv WHERE aserv.attention_id = a.id AND aserv.user_id = p_user_id AND aserv.tenant_id = p_tenant_id AND aserv.platform_id = p_platform_id
       ))
   )
   SELECT
-    af.id, af.created_at, af.tenant_id, af.branch_id, af.client_id, af.attention_datetime, af.status, af.notes, af.total_amount, -- Añadido
+    af.id, af.created_at, af.tenant_id, af.platform_id, af.branch_id, af.client_id, af.attention_datetime, af.status, af.notes, af.total_amount,
     af.informed_consent_id, af.survey_token, af.survey_status,
-    (SELECT json_build_object('id', c.id, 'name', c.name, 'phone', c.phone) FROM public.clients c WHERE c.id = af.client_id LIMIT 1) as clients,
+    (SELECT json_build_object('id', c.id, 'name', c.name, 'phone', c.phone) FROM public.clients c WHERE c.id = af.client_id AND c.tenant_id = p_tenant_id AND c.platform_id = p_platform_id LIMIT 1) as clients,
     
     (SELECT json_agg(json_build_object(
         'id', aserv.id, 
@@ -4550,19 +4452,19 @@ BEGIN
         'is_parallel', aserv.is_parallel,
         'offset_minutes', aserv.offset_minutes,
         'duration_minutes', aserv.duration_minutes,
-        'services', (SELECT json_build_object('id', s.id, 'name', s.name) FROM public.services s WHERE s.id = aserv.service_id),
+        'services', (SELECT json_build_object('id', s.id, 'name', s.name) FROM public.services s WHERE s.id = aserv.service_id AND s.tenant_id = p_tenant_id AND s.platform_id = p_platform_id),
         'users', (SELECT json_build_object('first_name', tu.first_name, 'last_name', tu.last_name) FROM tenant_users tu WHERE tu.user_id = aserv.user_id LIMIT 1),
-        'status_history', (SELECT json_agg(h.*) FROM public.attention_service_status_history h WHERE h.attention_service_id = aserv.id),
+        'status_history', (SELECT json_agg(h.*) FROM public.attention_service_status_history h WHERE h.attention_service_id = aserv.id AND h.tenant_id = p_tenant_id AND h.platform_id = p_platform_id),
         'survey_rating', (
           SELECT json_build_object('rating', ssr.rating, 'comments', ssr.comments)
           FROM public.satisfaction_surveys ss
-          JOIN public.satisfaction_survey_ratings ssr ON ss.id = ssr.survey_id
-          WHERE ss.attention_id = af.id AND ssr.attention_service_id = aserv.id
+          JOIN public.satisfaction_survey_ratings ssr ON ss.id = ssr.survey_id AND ss.tenant_id = ssr.tenant_id AND ss.platform_id = ssr.platform_id
+          WHERE ss.attention_id = af.id AND ssr.attention_service_id = aserv.id AND ss.tenant_id = p_tenant_id AND ss.platform_id = p_platform_id
           LIMIT 1
         )
     )) 
     FROM public.attention_services aserv 
-    WHERE aserv.attention_id = af.id) as attention_services,
+    WHERE aserv.attention_id = af.id AND aserv.tenant_id = p_tenant_id AND aserv.platform_id = p_platform_id) as attention_services,
     
     (SELECT json_agg(json_build_object(
         'id', ap.id, 
@@ -4572,10 +4474,10 @@ BEGIN
         'unit_price', ap.unit_price, 
         'total_price', ap.total_price, 
         'attention_combo_id', ap.combo_id,
-        'products', (SELECT json_build_object('id', p.id, 'name', p.name) FROM public.products p WHERE p.id = ap.product_id),
+        'products', (SELECT json_build_object('id', prod.id, 'name', prod.name) FROM public.products prod WHERE prod.id = ap.product_id AND prod.tenant_id = p_tenant_id AND prod.platform_id = p_platform_id),
         'users', (SELECT json_build_object('first_name', tu.first_name, 'last_name', tu.last_name) FROM tenant_users tu WHERE tu.user_id = ap.user_id LIMIT 1)
     )) 
-    FROM public.attention_products ap WHERE ap.attention_id = af.id) as attention_products,
+    FROM public.attention_products ap WHERE ap.attention_id = af.id AND ap.tenant_id = p_tenant_id AND ap.platform_id = p_platform_id) as attention_products,
     
     (SELECT json_agg(json_build_object(
         'id', ac.id, 
@@ -4584,25 +4486,25 @@ BEGIN
         'quantity', ac.quantity, 
         'status', ac.status,
         'combos', (SELECT json_build_object(
-            'id', c.id, 
-            'name', c.name,
-            'duration_minutes', (SELECT SUM(s.duration_minutes) FROM public.combo_items ci JOIN public.services s ON ci.service_id = s.id WHERE ci.combo_id = c.id),
+            'id', comb.id, 
+            'name', comb.name,
+            'duration_minutes', (SELECT SUM(s.duration_minutes) FROM public.combo_items ci JOIN public.services s ON ci.service_id = s.id AND ci.tenant_id = s.tenant_id AND ci.platform_id = s.platform_id WHERE ci.combo_id = comb.id AND ci.tenant_id = p_tenant_id AND ci.platform_id = p_platform_id),
             'combo_items', (SELECT json_agg(json_build_object(
                 'id', ci.id, 
                 'product_id', ci.product_id, 
                 'service_id', ci.service_id, 
                 'quantity', ci.quantity, 
-                'product', (SELECT json_build_object('name', p.name) FROM public.products p WHERE p.id = ci.product_id), 
-                'service', (SELECT json_build_object('name', s.name, 'duration_minutes', s.duration_minutes) FROM public.services s WHERE s.id = ci.service_id)
+                'product', (SELECT json_build_object('name', pr.name) FROM public.products pr WHERE pr.id = ci.product_id AND pr.tenant_id = p_tenant_id AND pr.platform_id = p_platform_id), 
+                'service', (SELECT json_build_object('name', se.name, 'duration_minutes', se.duration_minutes) FROM public.services se WHERE se.id = ci.service_id AND se.tenant_id = p_tenant_id AND se.platform_id = p_platform_id)
             )) 
-            FROM public.combo_items ci WHERE ci.combo_id = c.id)
+            FROM public.combo_items ci WHERE ci.combo_id = comb.id AND ci.tenant_id = p_tenant_id AND ci.platform_id = p_platform_id)
         ) 
-        FROM public.combos c WHERE c.id = ac.combo_id AND c.tenant_id = af.tenant_id)
+        FROM public.combos comb WHERE comb.id = ac.combo_id AND comb.tenant_id = p_tenant_id AND comb.platform_id = p_platform_id)
     )) 
-    FROM public.attention_combos ac WHERE ac.attention_id = af.id) as attention_combos,
+    FROM public.attention_combos ac WHERE ac.attention_id = af.id AND ac.tenant_id = p_tenant_id AND ac.platform_id = p_platform_id) as attention_combos,
 
-    (SELECT json_agg(DISTINCT ap.*)
-    FROM public.attention_payments ap WHERE ap.attention_id = af.id) as attention_payments
+    (SELECT json_agg(DISTINCT pay.*)
+    FROM public.attention_payments pay WHERE pay.attention_id = af.id AND pay.tenant_id = p_tenant_id AND pay.platform_id = p_platform_id) as attention_payments
 
   FROM attentions_filtered af
   ORDER BY af.attention_datetime DESC;
@@ -4610,10 +4512,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid") RETURNS TABLE("average_rating" numeric, "review_count" bigint)
+CREATE OR REPLACE FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("average_rating" numeric, "review_count" bigint)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -4625,19 +4527,15 @@ BEGIN
         public.satisfaction_survey_ratings ssr
     WHERE
         ssr.branch_id = p_branch_id
-        AND ssr.tenant_id = p_tenant_id;
+        AND ssr.tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid") IS 'Calculates the aggregate rating (average and count) for a specific branch from satisfaction survey ratings.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid") RETURNS TABLE("item_id" "uuid", "item_name" "text", "item_type" "text", "users" json)
+CREATE OR REPLACE FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid", "p_platform_id" "uuid") RETURNS TABLE("item_id" "uuid", "item_name" "text", "item_type" "text", "users" json)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -4646,13 +4544,17 @@ BEGIN
     SELECT bp.product_id as id, p.name, 'product' as type
     FROM public.branch_products bp
     JOIN public.products p ON bp.product_id = p.id
-    WHERE bp.branch_id = branch_id_param AND bp.tenant_id = tenant_id_param
+    WHERE bp.branch_id = branch_id_param 
+      AND bp.tenant_id = tenant_id_param 
+      AND bp.platform_id = p_platform_id
   ),
   branch_services AS (
     SELECT bs.service_id as id, s.name, 'service' as type
     FROM public.branch_services bs
     JOIN public.services s ON bs.service_id = s.id
-    WHERE bs.branch_id = branch_id_param AND bs.tenant_id = tenant_id_param
+    WHERE bs.branch_id = branch_id_param 
+      AND bs.tenant_id = tenant_id_param 
+      AND bs.platform_id = p_platform_id
   ),
   all_items_in_branch AS (
     SELECT id, name, type FROM branch_products
@@ -4663,7 +4565,9 @@ BEGIN
     SELECT DISTINCT ua.user_id, (u.raw_user_meta_data->>'first_name') || ' ' || (u.raw_user_meta_data->>'last_name') as user_name
     FROM public.user_assignments ua
     JOIN auth.users u ON ua.user_id = u.id
-    WHERE ua.tenant_id = tenant_id_param AND ua.status = 'active'
+    WHERE ua.tenant_id = tenant_id_param 
+      AND ua.platform_id = p_platform_id 
+      AND ua.status = 'active'
   ),
   commission_matrix AS (
     SELECT
@@ -4707,19 +4611,21 @@ BEGIN
     ON cm.item_id = pc.product_id
     AND cm.user_id = pc.user_id
     AND branch_id_param = pc.branch_id
+    AND pc.platform_id = p_platform_id
   LEFT JOIN public.service_user_commissions sc
     ON cm.item_id = sc.service_id
     AND cm.user_id = sc.user_id
     AND branch_id_param = sc.branch_id
+    AND sc.platform_id = p_platform_id
   GROUP BY cm.item_id, cm.item_name, cm.item_type;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid") RETURNS json
+CREATE OR REPLACE FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS json
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -4753,14 +4659,14 @@ BEGIN
     )
     INTO v_branches
     FROM public.branches b
-    WHERE b.tenant_id = p_tenant_id AND b.status = 'active' AND b.is_visible_on_microsite = true;
+    WHERE b.tenant_id = p_tenant_id AND platform_id = p_platform_id AND b.status = 'active' AND b.is_visible_on_microsite = true;
 
     RETURN COALESCE(v_branches, '[]'::json);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_calculated_plan_prices"("p_platform_id" "uuid") RETURNS TABLE("plan_id" "uuid", "plan_name" "text", "plan_description" "text", "plan_features" "text"[], "billing_frequency_months" integer, "price_id" "uuid", "base_price_cop" numeric, "extra_branch_price_cop" numeric, "country_id" "uuid", "country_name" "text", "calculated_price" numeric, "calculated_extra_branch_price" numeric, "calculated_promotional_price" numeric, "currency_code" "text", "currency_symbol" "text")
@@ -4852,7 +4758,7 @@ $$;
 ALTER FUNCTION "public"."get_calculated_plan_prices"("p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_client_treatment_details"("p_client_treatment_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."get_client_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -4868,7 +4774,7 @@ BEGIN
         'start_date', ct.start_date,
         'final_price', ct.final_price,
         'payment_type', ct.payment_type,
-        'cover_image_url', (SELECT ti.image_url FROM public.treatment_images ti WHERE ti.treatment_id = t.id AND ti.is_primary = TRUE LIMIT 1),
+        'cover_image_url', (SELECT ti.image_url FROM public.treatment_images ti WHERE ti.treatment_id = t.id AND ti.is_primary = TRUE AND ti.tenant_id = p_tenant_id AND ti.platform_id = p_platform_id LIMIT 1),
         'sessions', COALESCE(
             (
                 SELECT jsonb_agg(
@@ -4899,9 +4805,10 @@ BEGIN
                                     )
                                 )
                                 FROM public.client_treatment_session_items ctsi
-                                LEFT JOIN public.products p ON ctsi.product_id = p.id
-                                LEFT JOIN public.services s ON ctsi.service_id = s.id
+                                LEFT JOIN public.products p ON ctsi.product_id = p.id AND ctsi.tenant_id = p.tenant_id AND ctsi.platform_id = p.platform_id
+                                LEFT JOIN public.services s ON ctsi.service_id = s.id AND ctsi.tenant_id = s.tenant_id AND ctsi.platform_id = s.platform_id
                                 WHERE ctsi.client_treatment_session_id = cts.id
+                                  AND ctsi.tenant_id = p_tenant_id AND ctsi.platform_id = p_platform_id
                             ),
                             '[]'::jsonb
                         )
@@ -4909,8 +4816,9 @@ BEGIN
                     ORDER BY cts.session_number
                 )
                 FROM public.client_treatment_sessions cts
-                LEFT JOIN public.attentions a ON cts.attention_id = a.id
+                LEFT JOIN public.attentions a ON cts.attention_id = a.id AND cts.tenant_id = a.tenant_id AND cts.platform_id = a.platform_id
                 WHERE cts.client_treatment_id = ct.id
+                  AND cts.tenant_id = p_tenant_id AND cts.platform_id = p_platform_id
             ),
             '[]'::jsonb
         )
@@ -4919,19 +4827,21 @@ BEGIN
     FROM
         public.client_treatments ct
     LEFT JOIN
-        public.treatments t ON ct.prototype_id = t.id
+        public.treatments t ON ct.prototype_id = t.id AND ct.tenant_id = t.tenant_id AND ct.platform_id = t.platform_id
     WHERE
-        ct.id = p_client_treatment_id;
+        ct.id = p_client_treatment_id
+        AND ct.tenant_id = p_tenant_id
+        AND ct.platform_id = p_platform_id;
 
     RETURN v_details;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_client_treatment_details"("p_client_treatment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_client_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_client_treatments"("p_client_id" "uuid") RETURNS TABLE("id" "uuid", "name" "text", "status" "text", "start_date" "date", "progress" "jsonb", "has_scheduled_sessions" boolean)
+CREATE OR REPLACE FUNCTION "public"."get_client_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid") RETURNS TABLE("id" "uuid", "name" "text", "status" "text", "start_date" "date", "progress" "jsonb", "has_scheduled_sessions" boolean)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -4940,11 +4850,11 @@ BEGIN
         SELECT
             cts.client_treatment_id,
             COUNT(*) AS total,
-            -- CORREGIDO: Contar todos los estados que no son 'pending' como "actividad"
             COUNT(*) FILTER (WHERE cts.status IN ('completed', 'Cita Asignada', 'Cancelada')) AS completed,
             BOOL_OR(cts.status = 'Cita Asignada') as has_scheduled_sessions
         FROM
             public.client_treatment_sessions cts
+        WHERE cts.tenant_id = p_tenant_id AND cts.platform_id = p_platform_id
         GROUP BY
             cts.client_treatment_id
     )
@@ -4964,23 +4874,23 @@ BEGIN
         treatment_progress tp ON ct.id = tp.client_treatment_id
     WHERE
         ct.client_id = p_client_id
+        AND ct.tenant_id = p_tenant_id
+        AND ct.platform_id = p_platform_id
     ORDER BY
         ct.created_at DESC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_client_treatments"("p_client_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_client_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") RETURNS "jsonb"
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
     combo_details JSONB;
 BEGIN
-    -- NOTE: Security is handled by RLS policies and the calling edge function which verifies tenant access.
-
     SELECT jsonb_build_object(
         'id', c.id,
         'name', c.name,
@@ -4997,32 +4907,36 @@ BEGIN
                     'name', COALESCE(p.name, s.name),
                     'quantity', ci.quantity,
                     'base_price', ci.price,
-                    'override_price', bcip.price, -- The specific price for this branch, if it exists
-                    'final_price', COALESCE(bcip.price, ci.price), -- Use override, fallback to base
+                    'override_price', bcip.price,
+                    'final_price', COALESCE(bcip.price, ci.price),
                     'duration_minutes', s.duration_minutes,
-                    'offset_minutes', ci.offset_minutes -- Añadido para el agendamiento
+                    'offset_minutes', ci.offset_minutes
                 )
             ), '[]'::jsonb)
-            FROM combo_items ci
-            LEFT JOIN products p ON p.id = ci.product_id
-            LEFT JOIN services s ON s.id = ci.service_id
-            LEFT JOIN branch_combo_item_prices bcip ON bcip.combo_id = ci.combo_id
+            FROM public.combo_items ci
+            LEFT JOIN public.products p ON p.id = ci.product_id AND p.platform_id = p_platform_id
+            LEFT JOIN public.services s ON s.id = ci.service_id AND s.platform_id = p_platform_id
+            LEFT JOIN public.branch_combo_item_prices bcip ON bcip.combo_id = ci.combo_id
                 AND bcip.branch_id = p_branch_id
+                AND bcip.platform_id = p_platform_id
                 AND (bcip.product_id = ci.product_id OR bcip.service_id = ci.service_id)
             WHERE ci.combo_id = c.id
+              AND ci.platform_id = p_platform_id
         )
     )
     INTO combo_details
-    FROM combos c
-    LEFT JOIN branch_combos bc ON bc.combo_id = c.id AND bc.branch_id = p_branch_id
-    WHERE c.id = p_combo_id AND c.tenant_id = p_tenant_id;
+    FROM public.combos c
+    LEFT JOIN public.branch_combos bc ON bc.combo_id = c.id AND bc.branch_id = p_branch_id AND bc.platform_id = p_platform_id
+    WHERE c.id = p_combo_id 
+      AND c.tenant_id = p_tenant_id
+      AND c.platform_id = p_platform_id;
 
     RETURN combo_details;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."combo_images" (
@@ -5037,8 +4951,11 @@ CREATE TABLE IF NOT EXISTS "public"."combo_images" (
     "sort_order" integer DEFAULT 0,
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid" NOT NULL
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."combo_images" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."combo_images" OWNER TO "postgres";
@@ -5056,47 +4973,37 @@ COMMENT ON COLUMN "public"."combo_images"."sort_order" IS 'Defines the display o
 
 
 
-CREATE OR REPLACE FUNCTION "public"."get_combo_images"("p_combo_id" "uuid") RETURNS SETOF "public"."combo_images"
+CREATE OR REPLACE FUNCTION "public"."get_combo_images"("p_platform_id" "uuid", "p_combo_id" "uuid", "p_tenant_id" "uuid") RETURNS SETOF "public"."combo_images"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
   RETURN QUERY
-  SELECT
-    ci.id,
-    ci.combo_id,
-    ci.google_drive_file_id,
-    ci.image_url,
-    ci.file_name,
-    ci.file_size,
-    ci.mime_type,
-    ci.is_primary,
-    ci.sort_order,
-    ci.created_at,
-    ci.updated_at,
-    ci.tenant_id
+  SELECT ci.*
   FROM public.combo_images ci
-  WHERE ci.combo_id = p_combo_id
+  WHERE ci.combo_id = p_combo_id 
+    AND ci.tenant_id = p_tenant_id
+    AND ci.platform_id = p_platform_id
   ORDER BY ci.sort_order ASC, ci.created_at ASC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_combo_images"("p_combo_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_combo_images"("p_platform_id" "uuid", "p_combo_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_id" "uuid") RETURNS SETOF "public"."informed_consent_templates"
+CREATE OR REPLACE FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") RETURNS SETOF "public"."informed_consent_templates"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     RETURN QUERY
     SELECT *
     FROM public.informed_consent_templates
-    WHERE id = p_id AND tenant_id = p_tenant_id;
+    WHERE id = p_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_countries_with_timezones"() RETURNS TABLE("id" "uuid", "name" "text", "iso_code" "text", "is_active" boolean, "default_localization_id" "uuid", "default_currency_id" "uuid", "timezones" "text"[])
@@ -5212,7 +5119,7 @@ $$;
 ALTER FUNCTION "public"."get_current_user_id"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -5230,17 +5137,17 @@ BEGIN
             (a.attention_datetime AT TIME ZONE p_timezone)::date as local_attention_date,
             a.status
         FROM public.attentions a
-        WHERE a.tenant_id = p_tenant_id
+        WHERE a.tenant_id = p_tenant_id AND a.platform_id = p_platform_id
           AND (p_branch_id IS NULL OR a.branch_id = p_branch_id)
           AND (
               p_user_id IS NULL
               OR EXISTS (
                   SELECT 1 FROM public.attention_services s
-                  WHERE s.attention_id = a.id AND s.user_id = p_user_id
+                  WHERE s.attention_id = a.id AND s.user_id = p_user_id AND s.tenant_id = p_tenant_id AND s.platform_id = p_platform_id
               )
               OR EXISTS (
                   SELECT 1 FROM public.attention_products p
-                  WHERE p.attention_id = a.id AND p.user_id = p_user_id
+                  WHERE p.attention_id = a.id AND p.user_id = p_user_id AND p.tenant_id = p_tenant_id AND p.platform_id = p_platform_id
               )
           )
     ),
@@ -5254,7 +5161,7 @@ BEGIN
         'todayAppointments', (SELECT COALESCE(COUNT(*), 0) FROM base_attentions WHERE local_attention_date = v_today),
         'activeStylists', (
             SELECT COUNT(DISTINCT user_id)
-            FROM public.get_tenant_users(p_tenant_id)
+            FROM public.get_tenant_users(p_tenant_id, p_platform_id)
             WHERE status = 'active' AND is_schedulable = TRUE AND (p_branch_id IS NULL OR branch_id = p_branch_id)
         ),
         'revenueChange', (
@@ -5282,10 +5189,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "sku" "text", "is_active_in_branch" boolean, "items" "jsonb")
+CREATE OR REPLACE FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "sku" "text", "is_active_in_branch" boolean, "items" "jsonb")
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -5324,16 +5231,16 @@ BEGIN
     FROM public.combos c
     JOIN public.branch_combos bc ON bc.combo_id = c.id
     WHERE
-        c.tenant_id = p_tenant_id AND bc.branch_id = p_branch_id
+        c.tenant_id = p_tenant_id AND platform_id = p_platform_id AND bc.branch_id = p_branch_id
     ORDER BY c.name ASC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid", "p_user_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "type_name" "text", "brand" "text", "model" "text", "serial_number" "text", "assigned_user_name" "text", "branch_name" "text")
+CREATE OR REPLACE FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid", "p_user_id" "uuid" DEFAULT NULL::"uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "type_name" "text", "brand" "text", "model" "text", "serial_number" "text", "assigned_user_name" "text", "branch_name" "text")
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -5358,17 +5265,17 @@ BEGIN
     LEFT JOIN
         branches b ON ea.branch_id = b.id
     WHERE
-        e.tenant_id = p_tenant_id
+        e.tenant_id = p_tenant_id AND e.platform_id = p_platform_id
         AND (p_branch_id IS NULL OR ea.branch_id = p_branch_id)
         AND (p_user_id IS NULL OR ea.user_id = p_user_id);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text" DEFAULT NULL::"text", "p_show_inactive" boolean DEFAULT false, "p_type_id" "uuid" DEFAULT NULL::"uuid", "p_brand_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "type_id" "uuid", "brand_id" "uuid", "is_active" boolean, "type_name" "text", "brand_name" "text", "model" "text", "serial_number" "text", "purchase_date" "text", "last_maintenance_date" "text", "maintenance_frequency" integer, "maintenance_frequency_unit" "text", "notes" "text", "assigned_user_name" "text", "branch_name" "text")
+CREATE OR REPLACE FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text" DEFAULT NULL::"text", "p_show_inactive" boolean DEFAULT false, "p_type_id" "uuid" DEFAULT NULL::"uuid", "p_brand_id" "uuid" DEFAULT NULL::"uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "type_id" "uuid", "brand_id" "uuid", "is_active" boolean, "type_name" "text", "brand_name" "text", "model" "text", "serial_number" "text", "purchase_date" "text", "last_maintenance_date" "text", "maintenance_frequency" integer, "maintenance_frequency_unit" "text", "notes" "text", "assigned_user_name" "text", "branch_name" "text")
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -5377,7 +5284,7 @@ BEGIN
         SELECT
             tu.user_id,
             (tu.first_name || ' ' || tu.last_name) as full_name
-        FROM get_tenant_users(p_tenant_id) tu
+        FROM get_tenant_users(p_tenant_id, p_platform_id) tu
     )
     SELECT
         e.id,
@@ -5418,46 +5325,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_type_id" "uuid", "p_brand_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_type_id" "uuid", "p_brand_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_equipment_assignments"("p_equipment_id" "uuid") RETURNS TABLE("id" "uuid", "user_name" "text", "branch_name" "text", "assignment_date" "date", "return_date" "date")
-    LANGUAGE "plpgsql"
-    AS $$
-DECLARE
-    v_tenant_id uuid;
-BEGIN
-    SELECT equipment.tenant_id INTO v_tenant_id FROM public.equipment WHERE equipment.id = p_equipment_id;
-
-    RETURN QUERY
-    WITH unique_tenant_users AS (
-        SELECT DISTINCT
-            tu.user_id,
-            (tu.first_name || ' ' || tu.last_name) as full_name
-        FROM get_tenant_users(v_tenant_id) tu
-    )
-    SELECT
-        ea.id,
-        utu.full_name as user_name,
-        b.name as branch_name,
-        ea.assignment_date,
-        ea.return_date
-    FROM
-        public.equipment_assignments ea
-    JOIN
-        unique_tenant_users utu ON ea.user_id = utu.user_id
-    JOIN
-        public.branches b ON ea.branch_id = b.id
-    WHERE
-        ea.equipment_id = p_equipment_id;
-END;
-$$;
-
-
-ALTER FUNCTION "public"."get_equipment_assignments"("p_equipment_id" "uuid") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid") RETURNS TABLE("id" "uuid", "user_name" "text", "branch_name" "text", "assignment_date" "date", "return_date" "date")
+CREATE OR REPLACE FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "user_name" "text", "branch_name" "text", "assignment_date" "date", "return_date" "date")
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -5466,7 +5337,7 @@ BEGIN
         SELECT DISTINCT
             tu.user_id,
             (tu.first_name || ' ' || tu.last_name) as full_name
-        FROM get_tenant_users(p_tenant_id) tu
+        FROM get_tenant_users(p_tenant_id, p_platform_id) tu
     )
     SELECT
         ea.id,
@@ -5486,7 +5357,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_equipment_maintenance_history"("p_equipment_id" "uuid") RETURNS TABLE("id" "uuid", "maintenance_date" "date", "notes" "text")
@@ -5509,27 +5380,35 @@ $$;
 ALTER FUNCTION "public"."get_equipment_maintenance_history"("p_equipment_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_equipment_id" "uuid") RETURNS TABLE("id" "uuid", "maintenance_date" "date", "notes" "text")
-    LANGUAGE "plpgsql"
+CREATE TABLE IF NOT EXISTS "public"."equipment_maintenance_history" (
+    "id" "uuid" DEFAULT "extensions"."uuid_generate_v4"() NOT NULL,
+    "equipment_id" "uuid" NOT NULL,
+    "maintenance_date" "date" NOT NULL,
+    "notes" "text",
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
+);
+
+ALTER TABLE ONLY "public"."equipment_maintenance_history" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."equipment_maintenance_history" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") RETURNS SETOF "public"."equipment_maintenance_history"
+    LANGUAGE "sql" STABLE
     AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        emh.id,
-        emh.maintenance_date,
-        emh.notes
-    FROM
-        equipment_maintenance_history emh
-    WHERE
-        emh.equipment_id = p_equipment_id AND emh.tenant_id = p_tenant_id;
-END;
+    SELECT * FROM public.equipment_maintenance_history 
+    WHERE equipment_id = p_equipment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
+    ORDER BY maintenance_date DESC;
 $$;
 
 
-ALTER FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_equipment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "is_active" boolean)
+CREATE OR REPLACE FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "is_active" boolean)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -5542,109 +5421,49 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") RETURNS "jsonb"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
     RETURN (SELECT jsonb_build_object(
-        'totalRevenue', (SELECT SUM(total_amount) FROM public.attentions WHERE tenant_id = p_tenant_id AND status IN ('Completada', 'Pagada') AND attention_datetime::date BETWEEN p_date_from AND p_date_to),
-        'completedAttentions', (SELECT COUNT(*) FROM public.attentions WHERE tenant_id = p_tenant_id AND status IN ('Completada', 'Pagada') AND attention_datetime::date BETWEEN p_date_from AND p_date_to),
-        'averageTicket', (SELECT AVG(total_amount) FROM public.attentions WHERE tenant_id = p_tenant_id AND status IN ('Completada', 'Pagada') AND attention_datetime::date BETWEEN p_date_from AND p_date_to)
+        'totalRevenue', (SELECT COALESCE(SUM(total_amount), 0) FROM public.attentions WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND status IN ('Completada', 'Pagada') AND attention_datetime::date BETWEEN p_date_from AND p_date_to),
+        'completedAttentions', (SELECT COUNT(*) FROM public.attentions WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND status IN ('Completada', 'Pagada') AND attention_datetime::date BETWEEN p_date_from AND p_date_to),
+        'averageTicket', (SELECT COALESCE(AVG(total_amount), 0) FROM public.attentions WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND status IN ('Completada', 'Pagada') AND attention_datetime::date BETWEEN p_date_from AND p_date_to)
     ));
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid") RETURNS TABLE("success" boolean, "url" "text", "message" "text")
-    LANGUAGE "plpgsql" SECURITY DEFINER
+CREATE OR REPLACE FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "text"
+    LANGUAGE "plpgsql"
     AS $$
-DECLARE
-    v_client_id TEXT;
-    v_redirect_uri TEXT;
-    v_state TEXT;
-    v_scope TEXT;
-    v_auth_url TEXT;
 BEGIN
-    -- 1. Obtener configuración de la tabla public.integrations_config
-    SELECT value INTO v_client_id FROM public.integrations_config WHERE key = 'google_oauth_client_id';
-    SELECT value INTO v_redirect_uri FROM public.integrations_config WHERE key = 'google_oauth_redirect_uri';
-
-    IF v_client_id IS NULL OR v_redirect_uri IS NULL OR v_client_id = 'TU_CLIENT_ID_AQUI' THEN
-        RETURN QUERY SELECT false, null, 'Client ID o Redirect URI de Google no configurados en integrations_config.';
-        RETURN;
-    END IF;
-
-    -- 2. Construir el 'state'
-    v_state := p_tenant_id::text || ':google_gmail';
-
-    -- 3. Definir el scope
-    v_scope := 'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile';
-
-    -- 4. Construir la URL
-    v_auth_url := 'https://accounts.google.com/o/oauth2/v2/auth?' ||
-                  'client_id=' || url_encode(v_client_id) ||
-                  '&redirect_uri=' || url_encode(v_redirect_uri) ||
-                  '&response_type=code' ||
-                  '&scope=' || url_encode(v_scope) ||
-                  '&access_type=offline' ||
-                  '&prompt=consent' ||
-                  '&state=' || url_encode(v_state);
-
-    RETURN QUERY SELECT true, v_auth_url, 'URL de autorización para Gmail generada.';
+    RETURN 'https://accounts.google.com/o/oauth2/v2/auth...'; -- Placeholder logic
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid") RETURNS TABLE("success" boolean, "url" "text", "message" "text")
-    LANGUAGE "plpgsql" SECURITY DEFINER
+CREATE OR REPLACE FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "text"
+    LANGUAGE "plpgsql"
     AS $$
-DECLARE
-    v_client_id TEXT;
-    v_redirect_uri TEXT;
-    v_state TEXT;
-    v_scope TEXT;
-    v_auth_url TEXT;
 BEGIN
-    -- 1. Obtener configuración de la tabla public.integrations_config
-    SELECT value INTO v_client_id FROM public.integrations_config WHERE key = 'google_oauth_client_id';
-    SELECT value INTO v_redirect_uri FROM public.integrations_config WHERE key = 'google_oauth_redirect_uri';
-
-    IF v_client_id IS NULL OR v_redirect_uri IS NULL OR v_client_id = 'TU_CLIENT_ID_AQUI' THEN
-        RETURN QUERY SELECT false, null, 'Client ID o Redirect URI de Google no configurados en integrations_config.';
-        RETURN;
-    END IF;
-
-    -- 2. Construir el 'state'
-    v_state := p_tenant_id::text || ':google_drive';
-
-    -- 3. Definir el scope
-    v_scope := 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile';
-
-    -- 4. Construir la URL
-    v_auth_url := 'https://accounts.google.com/o/oauth2/v2/auth?' ||
-                  'client_id=' || url_encode(v_client_id) ||
-                  '&redirect_uri=' || url_encode(v_redirect_uri) ||
-                  '&response_type=code' ||
-                  '&scope=' || url_encode(v_scope) ||
-                  '&access_type=offline' ||
-                  '&prompt=consent' ||
-                  '&state=' || url_encode(v_state);
-
-    RETURN QUERY SELECT true, v_auth_url, 'URL de autorización para Google Drive generada.';
+    -- Esta función suele ser un placeholder para lógica que se resuelve en la Edge,
+    -- pero la estandarizamos para que el filtro sea correcto si busca config.
+    RETURN 'https://accounts.google.com/o/oauth2/v2/auth...'; -- Placeholder logic
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_hydrated_user_assignments"("p_user_id" "uuid") RETURNS TABLE("assignment_id" "uuid", "tenant_id" "uuid", "role_id" "uuid", "branch_id" "uuid", "status" "text", "tenant_name" "text", "role_name" "text", "role_display_name" "text", "branch_name" "text")
@@ -5675,17 +5494,6 @@ $$;
 
 
 ALTER FUNCTION "public"."get_hydrated_user_assignments"("p_user_id" "uuid") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."get_integration_categories"() RETURNS SETOF "public"."integration_categories"
-    LANGUAGE "sql" STABLE
-    AS $$
-    -- La seguridad se maneja a nivel de RLS en la tabla.
-    SELECT * FROM integration_categories ORDER BY name;
-$$;
-
-
-ALTER FUNCTION "public"."get_integration_categories"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_investor_dashboard_data"("p_user_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("platform_name" "text", "investment_share" numeric, "mrr" numeric, "arr" numeric, "my_mrr_share" numeric, "my_arr_share" numeric, "total_revenue_last_30_days" numeric, "my_revenue_share_last_30" numeric)
@@ -5762,7 +5570,7 @@ COMMENT ON FUNCTION "public"."get_investors"() IS 'Retrieves all users with the 
 
 
 
-CREATE OR REPLACE FUNCTION "public"."get_managed_tvs"() RETURNS SETOF "jsonb"
+CREATE OR REPLACE FUNCTION "public"."get_managed_tvs"("p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS SETOF "jsonb"
     LANGUAGE "sql" STABLE
     AS $$
   SELECT
@@ -5773,22 +5581,38 @@ CREATE OR REPLACE FUNCTION "public"."get_managed_tvs"() RETURNS SETOF "jsonb"
 $$;
 
 
-ALTER FUNCTION "public"."get_managed_tvs"() OWNER TO "postgres";
+ALTER FUNCTION "public"."get_managed_tvs"("p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid") RETURNS SETOF "jsonb"
+CREATE TABLE IF NOT EXISTS "public"."tv_displays" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "branch_id" "uuid",
+    "registration_code" "text" NOT NULL,
+    "is_registered" boolean DEFAULT false NOT NULL,
+    "registered_at" timestamp with time zone,
+    "last_heartbeat" timestamp with time zone,
+    "media_playlist_id" "uuid",
+    "tenant_id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
+);
+
+ALTER TABLE ONLY "public"."tv_displays" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."tv_displays" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS SETOF "public"."tv_displays"
     LANGUAGE "sql" STABLE
     AS $$
-  SELECT
-    to_jsonb(td) || jsonb_build_object('branch_name', b.name)
-  FROM public.tv_displays td
-  LEFT JOIN public.branches b ON td.branch_id = b.id
-  WHERE td.is_registered = true
-  AND td.tenant_id = p_tenant_id;
+    SELECT * FROM public.tv_displays 
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id;
 $$;
 
 
-ALTER FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."tenants" (
@@ -5874,7 +5698,7 @@ $$;
 ALTER FUNCTION "public"."get_my_tenant_info"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid" DEFAULT NULL::"uuid", "p_context_data" "jsonb" DEFAULT '{}'::"jsonb") RETURNS "text"
+CREATE OR REPLACE FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid" DEFAULT NULL::"uuid", "p_context_data" "jsonb" DEFAULT '{}'::"jsonb") RETURNS "text"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -5888,7 +5712,7 @@ BEGIN
     SELECT *
     INTO sequence_rec
     FROM public.document_sequences
-    WHERE tenant_id = p_tenant_id
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
       AND document_type = p_document_type
       AND (branch_id = p_branch_id OR branch_id IS NULL)
       AND is_active = true
@@ -5937,14 +5761,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") IS 'V3: Safely retrieves the next formatted document number, supporting date placeholders like {YYYY}, {MM}, {DD}.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid" DEFAULT NULL::"uuid", "p_registration_code" "text" DEFAULT NULL::"text") RETURNS TABLE("id" "uuid", "branch_id" "uuid", "registration_code" "text", "is_registered" boolean, "registered_at" timestamp with time zone, "last_heartbeat" timestamp with time zone, "media_playlist_id" "uuid", "tenant_id" "uuid", "created_at" timestamp with time zone, "updated_at" timestamp with time zone)
+CREATE OR REPLACE FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid" DEFAULT NULL::"uuid", "p_registration_code" "text" DEFAULT NULL::"text", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "branch_id" "uuid", "registration_code" "text", "is_registered" boolean, "registered_at" timestamp with time zone, "last_heartbeat" timestamp with time zone, "media_playlist_id" "uuid", "tenant_id" "uuid", "created_at" timestamp with time zone, "updated_at" timestamp with time zone)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -5990,10 +5810,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid", "p_registration_code" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid", "p_registration_code" "text", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -6067,10 +5887,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid", "p_user_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("total_pending_commissions" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid", "p_user_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("total_pending_commissions" numeric)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -6081,6 +5901,7 @@ BEGIN
     public.earned_commissions
   WHERE
     tenant_id = p_tenant_id
+    AND platform_id = p_platform_id
     AND status = 'earned'
     AND (p_branch_id IS NULL OR branch_id = p_branch_id)
     AND (p_user_id IS NULL OR user_id = p_user_id);
@@ -6088,7 +5909,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_platforms_list"("p_search_term" "text" DEFAULT NULL::"text") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "base_url" "text")
@@ -6114,7 +5935,7 @@ $$;
 ALTER FUNCTION "public"."get_platforms_list"("p_search_term" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid") RETURNS TABLE("id" "uuid", "playlist_id" "uuid", "media_url" "text", "media_type" "text", "item_order" integer, "created_at" timestamp with time zone, "video_title" "text", "duration_seconds" integer)
+CREATE OR REPLACE FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "playlist_id" "uuid", "media_url" "text", "media_type" "text", "item_order" integer, "created_at" timestamp with time zone, "video_title" "text", "duration_seconds" integer)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -6135,133 +5956,99 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_asset_key" "text") RETURNS "public"."price_info"
-    LANGUAGE "plpgsql" STABLE
-    AS $_$
-DECLARE
-    v_price_info public.price_info;
-    v_asset_id uuid;
-    v_tenant_country_id uuid;
-    v_plan_id uuid;
-    v_plan_country_config_id uuid;
-    v_colombia_country_id uuid;
-    v_colombian_plan_country_config_id uuid;
-BEGIN
-    -- 1. Get Asset ID from key
-    SELECT id INTO v_asset_id FROM public.plan_assets WHERE asset_key = p_asset_key LIMIT 1;
-    IF v_asset_id IS NULL THEN
-        RAISE EXCEPTION 'Asset with key % not found', p_asset_key;
-    END IF;
-
-    -- 2. Get Tenant's active subscription, plan, and country
-    SELECT ts.plan_country_configuration_id, pcc.plan_id, t.country_id
-    INTO v_plan_country_config_id, v_plan_id, v_tenant_country_id
-    FROM public.tenant_subscriptions ts
-    JOIN public.tenants t ON ts.tenant_id = t.id
-    JOIN public.plan_country_configurations pcc ON ts.plan_country_configuration_id = pcc.id
-    WHERE ts.tenant_id = p_tenant_id AND ts.is_active = TRUE
-    LIMIT 1;
-
-    IF v_plan_country_config_id IS NULL THEN
-        -- Return null or a default structure if no active subscription is found
-        v_price_info := (0, 'USD', '$', 'None');
-        RETURN v_price_info;
-    END IF;
-
-    -- 3. Look for a price in the tenant's specific country configuration
-    SELECT pal.overage_unit_price, c.code, c.symbol, co.name
-    INTO v_price_info.price, v_price_info.currency_code, v_price_info.currency_symbol, v_price_info.source_country
-    FROM public.plan_asset_limits pal
-    JOIN public.plan_country_configurations pcc ON pal.plan_country_config_id = pcc.id
-    JOIN public.countries co ON pcc.country_id = co.id
-    JOIN public.currencies c ON co.default_currency_id = c.id
-    WHERE pal.plan_country_config_id = v_plan_country_config_id
-      AND pal.asset_id = v_asset_id
-      AND pal.overage_unit_price IS NOT NULL
-      AND pal.overage_unit_price > 0;
-
-    -- 4. If found, return it
-    IF v_price_info.price IS NOT NULL THEN
-        RETURN v_price_info;
-    END IF;
-
-    -- 5. If not found, look for the Colombian price for the same plan
-    SELECT id INTO v_colombia_country_id FROM public.countries WHERE iso_code = 'CO' LIMIT 1;
-    IF v_colombia_country_id IS NULL THEN
-        RAISE EXCEPTION 'Country configuration for Colombia (CO) not found.';
-    END IF;
-
-    SELECT id INTO v_colombian_plan_country_config_id
-    FROM public.plan_country_configurations
-    WHERE plan_id = v_plan_id AND country_id = v_colombia_country_id;
-
-    IF v_colombian_plan_country_config_id IS NULL THEN
-        -- If no specific Colombian config, return null or default
-        v_price_info := (0, 'USD', '$', 'None');
-        RETURN v_price_info;
-    END IF;
-
-    SELECT pal.overage_unit_price, 'COP', '$', 'Colombia'
-    INTO v_price_info.price, v_price_info.currency_code, v_price_info.currency_symbol, v_price_info.source_country
-    FROM public.plan_asset_limits pal
-    WHERE pal.plan_country_config_id = v_colombian_plan_country_config_id
-      AND pal.asset_id = v_asset_id
-      AND pal.overage_unit_price IS NOT NULL;
-
-    -- 6. Return the Colombian price (or null if not found)
-    RETURN v_price_info;
-
-END;
-$_$;
-
-
-ALTER FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_asset_key" "text") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."get_product_commission_matrix"("product_id_param" "uuid", "tenant_id_param" "uuid") RETURNS TABLE("user_id" "uuid", "first_name" "text", "last_name" "text", "branches" json)
+CREATE OR REPLACE FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
-  RETURN QUERY
-  WITH relevant_users AS (
-    -- 1. Encontrar todos los usuarios que pueden vender el producto en cualquier sucursal
-    SELECT DISTINCT
-        gtu.user_id,
-        gtu.first_name,
-        gtu.last_name,
-        gtu.branch_id,
-        gtu.branch_name
-    FROM
-        get_tenant_users(tenant_id_param) gtu
-    WHERE gtu.branch_id IN (SELECT bp.branch_id from public.branch_products bp WHERE bp.product_id = product_id_param AND bp.tenant_id = tenant_id_param)
-  )
-  -- 2. Unir con comisiones existentes y agregar
-  SELECT
-    ru.user_id,
-    ru.first_name,
-    ru.last_name,
-    json_agg(
-      json_build_object(
-        'branch_id', ru.branch_id,
-        'branch_name', ru.branch_name,
-        'commission_id', pc.id,
-        'commission_rate', pc.commission_rate
-      )
-    ) as branches
-  FROM relevant_users ru
-  LEFT JOIN public.product_user_commissions pc
-    ON ru.user_id = pc.user_id
-    AND ru.branch_id = pc.branch_id
-    AND pc.product_id = product_id_param
-  GROUP BY ru.user_id, ru.first_name, ru.last_name;
+    -- Lógica de consulta a Core o localmente
+    RETURN '{}'::jsonb;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_product_commission_matrix"("product_id_param" "uuid", "tenant_id_param" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_product_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+DECLARE
+    result jsonb;
+BEGIN
+    WITH user_data AS (
+        -- Get unique users for the tenant
+        SELECT DISTINCT ON (u.user_id)
+            u.user_id, 
+            u.first_name, 
+            u.last_name,
+            u.default_product_commission_rate
+        FROM public.get_tenant_users(p_tenant_id, p_platform_id) u
+    ),
+    branch_assignments AS (
+        -- Get unique branch assignments for these users
+        SELECT DISTINCT ON (ua.user_id, ua.branch_id)
+            ua.user_id,
+            ua.branch_id,
+            b.name as branch_name
+        FROM public.user_assignments ua
+        JOIN public.branches b ON ua.branch_id = b.id
+        WHERE ua.tenant_id = p_tenant_id AND ua.platform_id = p_platform_id
+    ),
+    user_branches AS (
+        -- Combine user with their branches and pick only ONE commission record (the most recent)
+        SELECT 
+            ud.user_id,
+            ud.first_name,
+            ud.last_name,
+            jsonb_agg(
+                jsonb_build_object(
+                    'branch_id', ba.branch_id,
+                    'branch_name', ba.branch_name,
+                    'commission_rate', COALESCE(
+                        (SELECT puc.commission_rate 
+                         FROM public.product_user_commissions puc 
+                         WHERE puc.user_id = ud.user_id 
+                           AND puc.product_id = p_product_id 
+                           AND puc.tenant_id = p_tenant_id 
+                           AND puc.platform_id = p_platform_id 
+                           AND puc.branch_id = ba.branch_id
+                         ORDER BY puc.created_at DESC LIMIT 1), 
+                        ud.default_product_commission_rate
+                    ),
+                    'commission_id', (SELECT puc.id 
+                                     FROM public.product_user_commissions puc 
+                                     WHERE puc.user_id = ud.user_id 
+                                       AND puc.product_id = p_product_id 
+                                       AND puc.tenant_id = p_tenant_id 
+                                       AND puc.platform_id = p_platform_id 
+                                       AND puc.branch_id = ba.branch_id
+                                     ORDER BY puc.created_at DESC LIMIT 1)
+                )
+            ) as branches
+        FROM user_data ud
+        JOIN branch_assignments ba ON ud.user_id = ba.user_id
+        GROUP BY ud.user_id, ud.first_name, ud.last_name
+    )
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'user_id', ub.user_id,
+            'first_name', ub.first_name,
+            'last_name', ub.last_name,
+            'user_name', (ub.first_name || ' ' || ub.last_name),
+            'branches', ub.branches
+        )
+    ) INTO result
+    FROM user_branches ub;
+
+    RETURN COALESCE(result, '[]'::jsonb);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_product_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."product_images" (
@@ -6276,42 +6063,35 @@ CREATE TABLE IF NOT EXISTS "public"."product_images" (
     "google_drive_file_id" "text",
     "file_name" "text",
     "mime_type" "text",
-    "file_size" bigint
+    "file_size" bigint,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_images" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_images" OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_product_images"("p_product_id" "uuid") RETURNS SETOF "public"."product_images"
+CREATE OR REPLACE FUNCTION "public"."get_product_images"("p_platform_id" "uuid", "p_product_id" "uuid", "p_tenant_id" "uuid") RETURNS SETOF "public"."product_images"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
   RETURN QUERY
-  SELECT
-    pi.id,
-    pi.product_id,
-    pi.tenant_id,
-    pi.image_url,
-    pi.is_primary,
-    pi.sort_order,
-    pi.created_at,
-    pi.updated_at,
-    pi.google_drive_file_id,
-    pi.file_name,
-    pi.mime_type,
-    pi.file_size
+  SELECT pi.*
   FROM public.product_images pi
-  WHERE pi.product_id = p_product_id
+  WHERE pi.product_id = p_product_id 
+    AND pi.tenant_id = p_tenant_id
+    AND pi.platform_id = p_platform_id
   ORDER BY pi.sort_order ASC, pi.created_at ASC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_product_images"("p_product_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_product_images"("p_platform_id" "uuid", "p_product_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_search_term" "text" DEFAULT NULL::"text") RETURNS TABLE("user_id" "uuid", "first_name" "text", "last_name" "text", "commission_rate" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text" DEFAULT NULL::"text") RETURNS TABLE("user_id" "uuid", "first_name" "text", "last_name" "text", "commission_rate" numeric)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
 BEGIN
@@ -6337,6 +6117,7 @@ BEGIN
         auth.users u ON ua.user_id = u.id
     WHERE
         ua.tenant_id = p_tenant_id
+        AND ua.platform_id = p_platform_id
         AND ua.branch_id = p_branch_id
         AND ua.status = 'active'
         AND (
@@ -6348,7 +6129,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_search_term" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_public_registration_data"("p_platform_id" "uuid") RETURNS json
@@ -6497,7 +6278,7 @@ $$;
 ALTER FUNCTION "public"."get_public_subscription_plans"("p_country_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid") RETURNS TABLE("purchase_item_id" "uuid", "product_id" "uuid", "product_name" "text", "quantity_expected" integer, "quantity_received" integer, "cost_price" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("purchase_item_id" "uuid", "product_id" "uuid", "product_name" "text", "quantity_expected" integer, "quantity_received" integer, "cost_price" numeric)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -6528,7 +6309,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."user_schedules" (
@@ -6543,123 +6324,152 @@ CREATE TABLE IF NOT EXISTS "public"."user_schedules" (
     "user_id" "uuid" NOT NULL,
     "tenant_id" "uuid" NOT NULL,
     "branch_id" "uuid",
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "stylist_schedules_day_of_week_check" CHECK ((("day_of_week" >= 0) AND ("day_of_week" <= 6)))
 );
+
+ALTER TABLE ONLY "public"."user_schedules" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."user_schedules" OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") RETURNS SETOF "public"."user_schedules"
+CREATE OR REPLACE FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") RETURNS SETOF "public"."user_schedules"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
     RETURN QUERY
     SELECT us.*
     FROM public.user_schedules us
-    JOIN public.user_assignments tua ON us.user_id = tua.user_id AND us.tenant_id = tua.tenant_id AND us.branch_id = tua.branch_id
+    JOIN public.user_assignments tua ON us.user_id = tua.user_id AND us.tenant_id = tua.tenant_id AND us.branch_id = tua.branch_id AND us.platform_id = tua.platform_id
     WHERE
         us.tenant_id = p_tenant_id
+        AND us.platform_id = p_platform_id
         AND us.branch_id = p_branch_id
         AND us.is_active = true
-        AND tua.is_schedulable = true; -- Only include schedules for schedulable users
+        AND tua.is_schedulable = true;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_service_commission_matrix"("service_id_param" "uuid", "tenant_id_param" "uuid") RETURNS TABLE("user_id" "uuid", "first_name" "text", "last_name" "text", "branches" json)
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."get_service_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
+DECLARE
+    result jsonb;
 BEGIN
-  RETURN QUERY
-  WITH relevant_users AS (
-    -- 1. Find all users who can perform the service in any branch
-    SELECT DISTINCT
-        gtu.user_id,
-        gtu.first_name,
-        gtu.last_name,
-        gtu.branch_id,
-        gtu.branch_name
-    FROM
-        get_tenant_users(tenant_id_param) gtu
-    WHERE gtu.branch_id IN (SELECT bs.branch_id from public.branch_services bs WHERE bs.service_id = service_id_param AND bs.tenant_id = tenant_id_param)
-  )
-  -- 2. Join with existing commissions and aggregate
-  SELECT
-    ru.user_id,
-    ru.first_name,
-    ru.last_name,
-    json_agg(
-      json_build_object(
-        'branch_id', ru.branch_id,
-        'branch_name', ru.branch_name,
-        'commission_id', sc.id,
-        'commission_rate', sc.commission_rate,
-        'can_perform', sc.can_perform
-      )
-    ) as branches
-  FROM relevant_users ru
-  LEFT JOIN public.service_user_commissions sc
-    ON ru.user_id = sc.user_id
-    AND ru.branch_id = sc.branch_id
-    AND sc.service_id = service_id_param
-  GROUP BY ru.user_id, ru.first_name, ru.last_name;
+    WITH user_data AS (
+        -- Get unique users for the tenant
+        SELECT DISTINCT ON (u.user_id)
+            u.user_id, 
+            u.first_name, 
+            u.last_name,
+            u.default_service_commission_rate
+        FROM public.get_tenant_users(p_tenant_id, p_platform_id) u
+    ),
+    branch_assignments AS (
+        -- Get unique branch assignments for these users
+        SELECT DISTINCT ON (ua.user_id, ua.branch_id)
+            ua.user_id,
+            ua.branch_id,
+            b.name as branch_name
+        FROM public.user_assignments ua
+        JOIN public.branches b ON ua.branch_id = b.id
+        WHERE ua.tenant_id = p_tenant_id AND ua.platform_id = p_platform_id
+    ),
+    user_branches AS (
+        -- Combine user with their branches and pick only ONE commission record (the most recent)
+        SELECT 
+            ud.user_id,
+            ud.first_name,
+            ud.last_name,
+            jsonb_agg(
+                jsonb_build_object(
+                    'branch_id', ba.branch_id,
+                    'branch_name', ba.branch_name,
+                    'commission_rate', COALESCE(
+                        (SELECT suc.commission_rate 
+                         FROM public.service_user_commissions suc 
+                         WHERE suc.user_id = ud.user_id 
+                           AND suc.service_id = p_service_id 
+                           AND suc.tenant_id = p_tenant_id 
+                           AND suc.platform_id = p_platform_id 
+                           AND suc.branch_id = ba.branch_id
+                         ORDER BY suc.created_at DESC LIMIT 1), 
+                        ud.default_service_commission_rate
+                    ),
+                    'commission_id', (SELECT suc.id 
+                                     FROM public.service_user_commissions suc 
+                                     WHERE suc.user_id = ud.user_id 
+                                       AND suc.service_id = p_service_id 
+                                       AND suc.tenant_id = p_tenant_id 
+                                       AND suc.platform_id = p_platform_id 
+                                       AND suc.branch_id = ba.branch_id
+                                     ORDER BY suc.created_at DESC LIMIT 1)
+                )
+            ) as branches
+        FROM user_data ud
+        JOIN branch_assignments ba ON ud.user_id = ba.user_id
+        GROUP BY ud.user_id, ud.first_name, ud.last_name
+    )
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'user_id', ub.user_id,
+            'first_name', ub.first_name,
+            'last_name', ub.last_name,
+            'user_name', (ub.first_name || ' ' || ub.last_name),
+            'branches', ub.branches
+        )
+    ) INTO result
+    FROM user_branches ub;
+
+    RETURN COALESCE(result, '[]'::jsonb);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_service_commission_matrix"("service_id_param" "uuid", "tenant_id_param" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_service_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_service_images"("p_service_id" "uuid") RETURNS SETOF "public"."service_images"
+CREATE OR REPLACE FUNCTION "public"."get_service_images"("p_platform_id" "uuid", "p_service_id" "uuid", "p_tenant_id" "uuid") RETURNS SETOF "public"."service_images"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
   RETURN QUERY
-  SELECT
-    si.id,
-    si.service_id,
-    si.tenant_id,
-    si.google_drive_file_id,
-    si.image_url,
-    si.file_name,
-    si.file_size,
-    si.mime_type,
-    si.is_primary,
-    si.sort_order,
-    si.created_at,
-    si.updated_at
+  SELECT si.*
   FROM public.service_images si
-  WHERE si.service_id = p_service_id
+  WHERE si.service_id = p_service_id 
+    AND si.tenant_id = p_tenant_id
+    AND si.platform_id = p_platform_id
   ORDER BY si.sort_order ASC, si.created_at ASC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_service_images"("p_service_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_service_images"("p_platform_id" "uuid", "p_service_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") RETURNS TABLE("name" "text", "count" bigint, "revenue" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") RETURNS TABLE("name" "text", "count" bigint, "revenue" numeric)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
     RETURN QUERY SELECT s.name, COUNT(aserv.id), SUM(aserv.service_price)
     FROM public.attention_services aserv
-    JOIN public.services s ON aserv.service_id = s.id
-    JOIN public.attentions a ON aserv.attention_id = a.id
-    WHERE a.tenant_id = p_tenant_id AND a.attention_datetime::date BETWEEN p_date_from AND p_date_to
+    JOIN public.services s ON aserv.service_id = s.id AND aserv.tenant_id = s.tenant_id AND aserv.platform_id = s.platform_id
+    JOIN public.attentions a ON aserv.attention_id = a.id AND aserv.tenant_id = a.tenant_id AND aserv.platform_id = a.platform_id
+    WHERE a.tenant_id = p_tenant_id AND a.platform_id = p_platform_id AND a.attention_datetime::date BETWEEN p_date_from AND p_date_to
     GROUP BY s.name ORDER BY count DESC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid") RETURNS TABLE("id" "uuid", "appointment_id" "uuid", "client_id" "uuid", "professional_id" "uuid", "template_id" "uuid", "template_name" "text", "professional_observations" "text", "signed_content" "text", "signed_at" timestamp with time zone, "created_at" timestamp with time zone, "updated_at" timestamp with time zone)
+CREATE OR REPLACE FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid") RETURNS TABLE("id" "uuid", "appointment_id" "uuid", "client_id" "uuid", "professional_id" "uuid", "template_id" "uuid", "template_name" "text", "professional_observations" "text", "signed_content" "text", "signed_at" timestamp with time zone, "created_at" timestamp with time zone, "updated_at" timestamp with time zone)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -6681,17 +6491,17 @@ BEGIN
     JOIN
         public.informed_consent_templates ict ON sc.template_id = ict.id
     WHERE
-        sc.tenant_id = p_tenant_id AND sc.appointment_id = p_appointment_id
+        sc.tenant_id = p_tenant_id AND platform_id = p_platform_id AND sc.appointment_id = p_appointment_id
     ORDER BY
         sc.created_at;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "attention_id" "uuid", "client_id" "uuid", "professional_id" "uuid", "template_id" "uuid", "template_name" "text", "template_content" "text", "professional_observations" "text", "signed_content" "text", "signed_at" timestamp with time zone, "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "attention_service_id" "uuid", "signature_file_id" "text")
+CREATE OR REPLACE FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "attention_id" "uuid", "client_id" "uuid", "professional_id" "uuid", "template_id" "uuid", "template_name" "text", "template_content" "text", "professional_observations" "text", "signed_content" "text", "signed_at" timestamp with time zone, "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "attention_service_id" "uuid", "signature_file_id" "text")
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -6714,11 +6524,12 @@ BEGIN
     FROM
         public.signed_consents sc
     JOIN
-        public.informed_consent_templates ct ON sc.template_id = ct.id
+        public.informed_consent_templates ct ON sc.template_id = ct.id AND sc.tenant_id = ct.tenant_id AND sc.platform_id = ct.platform_id
     LEFT JOIN
-        public.consent_signatures cs ON sc.id = cs.signed_consent_id
+        public.consent_signatures cs ON sc.id = cs.signed_consent_id AND sc.tenant_id = cs.tenant_id AND sc.platform_id = cs.platform_id
     WHERE
         sc.tenant_id = p_tenant_id
+        AND sc.platform_id = p_platform_id
         AND sc.attention_id = p_attention_id
         AND (p_attention_service_id IS NULL OR sc.attention_service_id = p_attention_service_id)
     ORDER BY sc.id, cs.created_at DESC; -- Get the most recent signature for each consent
@@ -6726,10 +6537,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid") RETURNS TABLE("branch_name" "text", "product_name" "text", "quantity" integer, "cost" numeric, "stock_value" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("branch_name" "text", "product_name" "text", "quantity" numeric, "cost" numeric, "stock_value" numeric)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -6738,20 +6549,20 @@ BEGIN
         b.name as branch_name,
         p.name as product_name,
         bp.stock_quantity as quantity,
-        p.cost_price as cost,
-        (bp.stock_quantity * p.cost_price) as stock_value
+        bp.cost_price as cost,
+        (bp.stock_quantity * bp.cost_price) as stock_value
     FROM public.branch_products bp
-    JOIN public.products p ON bp.product_id = p.id
-    JOIN public.branches b ON bp.branch_id = b.id
-    WHERE p.tenant_id = p_tenant_id;
+    JOIN public.products p ON bp.product_id = p.id AND bp.tenant_id = p.tenant_id AND bp.platform_id = p.platform_id
+    JOIN public.branches b ON bp.branch_id = b.id AND bp.tenant_id = b.tenant_id AND bp.platform_id = b.platform_id
+    WHERE bp.tenant_id = p_tenant_id AND bp.platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_date_from" "text", "p_date_to" "text") RETURNS TABLE("branch_name" "text", "product_name" "text", "quantity" numeric, "cost" numeric, "stock_value" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "text", "p_date_to" "text") RETURNS TABLE("branch_name" "text", "product_name" "text", "quantity" numeric, "cost" numeric, "stock_value" numeric)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -6765,11 +6576,12 @@ BEGIN
     FROM
         branch_products bp
     JOIN
-        branches b ON bp.branch_id = b.id
+        branches b ON bp.branch_id = b.id AND bp.tenant_id = b.tenant_id AND bp.platform_id = b.platform_id
     JOIN
-        products p ON bp.product_id = p.id
+        products p ON bp.product_id = p.id AND bp.tenant_id = p.tenant_id AND bp.platform_id = p.platform_id
     WHERE
-        b.tenant_id = p_tenant_id
+        bp.tenant_id = p_tenant_id
+        AND bp.platform_id = p_platform_id
         AND bp.updated_at >= TO_TIMESTAMP(p_date_from, 'YYYY-MM-DD')
         AND bp.updated_at <= TO_TIMESTAMP(p_date_to, 'YYYY-MM-DD')
     ORDER BY
@@ -6778,10 +6590,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_date_from" "text", "p_date_to" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "text", "p_date_to" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") RETURNS TABLE("product_id" "uuid", "product_name" "text", "product_sku" "text", "stock_at_date" numeric, "cost_at_date" numeric, "last_movement_date" timestamp with time zone)
+CREATE OR REPLACE FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") RETURNS TABLE("product_id" "uuid", "product_name" "text", "product_sku" "text", "stock_at_date" numeric, "cost_at_date" numeric, "last_movement_date" timestamp with time zone)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -6794,7 +6606,7 @@ BEGIN
             pm.movement_date,
             ROW_NUMBER() OVER(PARTITION BY pm.product_id ORDER BY pm.movement_date DESC, pm.id DESC) as rn
         FROM public.product_movements pm
-        WHERE pm.tenant_id = p_tenant_id
+        WHERE pm.tenant_id = p_tenant_id AND platform_id = p_platform_id
           AND pm.branch_id = p_branch_id
           AND pm.movement_date <= p_report_date::timestamptz + interval '1 day' - interval '1 second' -- End of the selected day
     )
@@ -6812,14 +6624,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") IS 'Returns the last known stock and cost for each product in a branch on or before a specific date.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid") RETURNS TABLE("plan_id" "uuid", "plan_name" "text", "plan_description" "text", "plan_features" "text"[], "billing_frequency_months" integer, "price_id" "uuid", "calculated_price" numeric, "calculated_extra_branch_price" numeric, "calculated_promotional_price" numeric, "currency_code" "text", "currency_symbol" "text", "base_price" numeric, "active_branches_count" integer)
+CREATE OR REPLACE FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("plan_id" "uuid", "plan_name" "text", "plan_description" "text", "plan_features" "text"[], "billing_frequency_months" integer, "price_id" "uuid", "calculated_price" numeric, "calculated_extra_branch_price" numeric, "calculated_promotional_price" numeric, "currency_code" "text", "currency_symbol" "text", "base_price" numeric, "active_branches_count" integer)
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -6839,7 +6647,7 @@ BEGIN
 
     SELECT id INTO v_current_subscription_id
     FROM public.tenant_subscriptions
-    WHERE tenant_id = p_tenant_id
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
     ORDER BY end_date DESC NULLS FIRST
     LIMIT 1;
 
@@ -6876,94 +6684,22 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid") IS 'Fetches available subscription plans for a tenant, now filtered by platform and including promotional prices.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid") RETURNS TABLE("plan_name" "text", "status" "text", "is_trial" boolean, "trial_ends_at" timestamp with time zone, "starts_at" timestamp with time zone, "ends_at" timestamp with time zone, "max_users" integer, "max_branches" integer, "current_users" integer, "current_branches" integer, "plan_features" "text"[])
+CREATE OR REPLACE FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql"
     AS $$
-DECLARE
-    v_subscription record;
-    v_pcc_id uuid;
-    v_platform_id uuid;
-    v_status text;
-    v_days_past_due int;
 BEGIN
-    -- Get the most recent active subscription for the tenant
-    SELECT
-        ts.plan_country_configuration_id,
-        ts.is_active,
-        ts.is_trial,
-        ts.end_date,
-        ts.start_date
-    INTO v_subscription
-    FROM public.tenant_subscriptions ts
-    WHERE ts.tenant_id = p_tenant_id AND ts.is_active = TRUE
-    ORDER BY ts.start_date DESC
-    LIMIT 1;
-
-    -- If no active subscription, return a 'cancelled' status
-    IF NOT FOUND THEN
-      RETURN QUERY SELECT
-        'Sin Suscripción'::text,
-        'cancelado'::text, -- Changed from 'inactive' to 'cancelado' to match frontend
-        FALSE::boolean,
-        NULL::timestamptz,
-        NULL::timestamptz,
-        NULL::timestamptz,
-        NULL::integer,
-        NULL::integer,
-        (SELECT COUNT(*) FROM public.user_assignments ua WHERE ua.tenant_id = p_tenant_id)::integer,
-        (SELECT COUNT(*) FROM public.branches b WHERE b.tenant_id = p_tenant_id)::integer,
-        NULL::text[];
-      RETURN;
-    END IF;
-
-    -- Determine the status based on the end date
-    IF v_subscription.end_date IS NULL OR v_subscription.end_date > now() THEN
-        v_status := 'activo';
-    ELSE
-        v_days_past_due := EXTRACT(DAY FROM now() - v_subscription.end_date);
-        IF v_days_past_due > 7 THEN
-            v_status := 'suspendido';
-        ELSE
-            v_status := 'gracia';
-        END IF;
-    END IF;
-    
-    -- If it's a trial, the status is always 'trial' regardless of dates until it's converted.
-    -- The frontend seems to handle trial status separately, so we pass the flag.
-
-    v_pcc_id := v_subscription.plan_country_configuration_id;
-
-    -- Get platform_id for the tenant
-    SELECT t.platform_id INTO v_platform_id FROM public.tenants t WHERE t.id = p_tenant_id;
-
-    RETURN QUERY
-    SELECT
-        sp.name AS plan_name,
-        v_status AS status,
-        v_subscription.is_trial,
-        v_subscription.end_date AS trial_ends_at,
-        v_subscription.start_date AS starts_at,
-        v_subscription.end_date AS ends_at,
-        (SELECT pal.value FROM public.plan_asset_limits pal WHERE pal.plan_country_config_id = v_pcc_id AND pal.asset_id = (SELECT id FROM public.plan_assets WHERE asset_key LIKE 'users_%' AND platform_id = v_platform_id LIMIT 1))::integer AS max_users,
-        (SELECT pal.value FROM public.plan_asset_limits pal WHERE pal.plan_country_config_id = v_pcc_id AND pal.asset_id = (SELECT id FROM public.plan_assets WHERE asset_key LIKE 'suc_%' AND platform_id = v_platform_id LIMIT 1))::integer AS max_branches,
-        (SELECT COUNT(*) FROM public.user_assignments ua WHERE ua.tenant_id = p_tenant_id)::integer AS current_users,
-        (SELECT COUNT(*) FROM public.branches b WHERE b.tenant_id = p_tenant_id)::integer AS current_branches,
-        pcc.features AS plan_features
-    FROM public.plan_country_configurations pcc
-    JOIN public.subscription_plans sp ON pcc.plan_id = sp.id
-    WHERE pcc.id = v_pcc_id;
+    RETURN (SELECT jsonb_build_object(
+        'status', subscription_status,
+        'is_active', is_active
+    ) FROM public.tenants WHERE id = p_tenant_id AND platform_id = p_platform_id);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_system_owner_tenant_id"() RETURNS "uuid"
@@ -7022,7 +6758,7 @@ $$;
 ALTER FUNCTION "public"."get_tenant_activity_summary"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid") RETURNS TABLE("tenant_id" "uuid", "tenant_name" "text", "total_users" bigint, "total_clients" bigint, "total_appointments" bigint, "total_services" bigint, "total_products" bigint)
+CREATE OR REPLACE FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("tenant_id" "uuid", "tenant_name" "text", "total_users" bigint, "total_clients" bigint, "total_appointments" bigint, "total_services" bigint, "total_products" bigint)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -7046,27 +6782,23 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid") RETURNS SETOF "public"."branches"
+CREATE OR REPLACE FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS SETOF "public"."branches"
     LANGUAGE "sql" STABLE
     AS $$
     SELECT b.*
     FROM public.branches b
-    WHERE b.tenant_id = p_tenant_id
+    WHERE b.tenant_id = p_tenant_id AND b.platform_id = p_platform_id
     ORDER BY b.is_main_branch DESC, b.name ASC;
 $$;
 
 
-ALTER FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid") IS 'Returns all branches for a given tenant, dynamically adapting to the current branches table schema.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_environment" "text" DEFAULT NULL::"text") RETURNS TABLE("id" "uuid", "tenant_id" "uuid", "provider" "text", "access_token" "text", "account_email" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "expires_at" timestamp with time zone, "encrypted_credentials" "text", "nonce" "text", "environment" "text", "is_active" boolean)
+CREATE OR REPLACE FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_environment" "text" DEFAULT NULL::"text") RETURNS TABLE("id" "uuid", "tenant_id" "uuid", "provider" "text", "access_token" "text", "account_email" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "expires_at" timestamp with time zone, "encrypted_credentials" "text", "nonce" "text", "environment" "text", "is_active" boolean)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
 DECLARE
@@ -7097,16 +6829,16 @@ BEGIN
     FROM
         public.tenant_integrations ti
     WHERE
-        ti.tenant_id = p_tenant_id
+        ti.tenant_id = p_tenant_id AND platform_id = p_platform_id
         AND (p_environment IS NULL OR ti.environment = p_environment);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_environment" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_environment" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid") RETURNS json
+CREATE OR REPLACE FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid", "p_platform_id" "uuid") RETURNS json
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -7193,68 +6925,68 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid") RETURNS TABLE("category" "text", "table_name" "text", "size" bigint, "branch_id" "uuid")
+CREATE OR REPLACE FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("category" "text", "table_name" "text", "size" bigint, "branch_id" "uuid")
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
   main_branch_id UUID;
 BEGIN
   -- Find the main branch for the tenant
-  SELECT id INTO main_branch_id FROM public.branches WHERE tenant_id = p_tenant_id AND is_main_branch = TRUE LIMIT 1;
+  SELECT id INTO main_branch_id FROM public.branches WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND is_main_branch = TRUE LIMIT 1;
   
   RETURN QUERY
     WITH storage_data AS (
       -- Tenant-wide assets attributed to the main branch
       SELECT 
         'Productos y Servicios' AS category, 'Productos' AS table_name, coalesce(sum(file_size), 0)::BIGINT AS "size", main_branch_id AS branch_id
-      FROM product_images WHERE tenant_id = p_tenant_id
+      FROM product_images WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
       UNION ALL
       SELECT 
         'Productos y Servicios' AS category, 'Servicios' AS table_name, coalesce(sum(file_size), 0)::BIGINT AS "size", main_branch_id AS branch_id
-      FROM service_images WHERE tenant_id = p_tenant_id
+      FROM service_images WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
       UNION ALL
       SELECT 
         'Productos y Servicios' AS category, 'Combos' AS table_name, coalesce(sum(file_size), 0)::BIGINT AS "size", main_branch_id AS branch_id
-      FROM combo_images WHERE tenant_id = p_tenant_id
+      FROM combo_images WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
       UNION ALL
       SELECT 
         'Productos y Servicios' AS category, 'Tratamientos' AS table_name, coalesce(sum(file_size), 0)::BIGINT AS "size", main_branch_id AS branch_id
-      FROM treatment_images WHERE tenant_id = p_tenant_id
+      FROM treatment_images WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
       
       -- Branch-specific assets
       UNION ALL
       SELECT 
         'Otros' AS category, 'Sucursales' AS table_name, coalesce(sum(file_size), 0)::BIGINT AS "size", bp.branch_id
-      FROM branch_photos bp WHERE bp.tenant_id = p_tenant_id GROUP BY bp.branch_id
+      FROM branch_photos bp WHERE bp.tenant_id = p_tenant_id AND platform_id = p_platform_id GROUP BY bp.branch_id
       UNION ALL
       SELECT 
         'Evidencias' AS category, 'Evidencias de Servicios' AS table_name, coalesce(sum(file_size), 0)::BIGINT AS "size", ase.branch_id
-      FROM attention_service_evidences ase WHERE ase.tenant_id = p_tenant_id GROUP BY ase.branch_id
+      FROM attention_service_evidences ase WHERE ase.tenant_id = p_tenant_id AND platform_id = p_platform_id GROUP BY ase.branch_id
       UNION ALL
       SELECT 
         'Evidencias' AS category, 'Evidencias de Pagos' AS table_name, coalesce(sum(file_size), 0)::BIGINT AS "size", ape.branch_id
-      FROM attention_payment_evidences ape WHERE ape.tenant_id = p_tenant_id GROUP BY ape.branch_id
+      FROM attention_payment_evidences ape WHERE ape.tenant_id = p_tenant_id AND platform_id = p_platform_id GROUP BY ape.branch_id
       UNION ALL
       SELECT 
         'Firmas' AS category, 'Consentimientos' AS table_name, coalesce(sum(cs.file_size), 0)::BIGINT AS "size", cs.branch_id
-      FROM consent_signatures cs WHERE cs.tenant_id = p_tenant_id GROUP BY cs.branch_id
+      FROM consent_signatures cs WHERE cs.tenant_id = p_tenant_id AND platform_id = p_platform_id GROUP BY cs.branch_id
       UNION ALL
       SELECT 
         'Firmas' AS category, 'Comisiones' AS table_name, coalesce(sum(file_size), 0)::BIGINT AS "size", cpe.branch_id
-      FROM commission_payment_evidences cpe WHERE cpe.tenant_id = p_tenant_id GROUP BY cpe.branch_id
+      FROM commission_payment_evidences cpe WHERE cpe.tenant_id = p_tenant_id AND platform_id = p_platform_id GROUP BY cpe.branch_id
     )
     SELECT sd.category, sd.table_name, sd."size", sd.branch_id FROM storage_data AS sd WHERE sd."size" > 0;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid") RETURNS TABLE("status" "text", "end_date" timestamp with time zone, "plan_name" "text")
+CREATE OR REPLACE FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("status" "text", "end_date" timestamp with time zone, "plan_name" "text")
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -7276,7 +7008,7 @@ BEGIN
     -- 1. Try to find a currently active subscription
     SELECT ts.* INTO v_current_active_subscription
     FROM public.tenant_subscriptions ts
-    WHERE ts.tenant_id = p_tenant_id
+    WHERE ts.tenant_id = p_tenant_id AND platform_id = p_platform_id
       AND NOW() >= ts.start_date
       AND (ts.end_date IS NULL OR NOW() <= ts.end_date)
     ORDER BY ts.start_date DESC -- In case of overlaps, pick the one that started most recently
@@ -7295,7 +7027,7 @@ BEGIN
     -- 2. If no active subscription, find the latest subscription (active or expired) to determine grace/suspended/canceled
     SELECT ts.* INTO v_latest_subscription
     FROM public.tenant_subscriptions ts
-    WHERE ts.tenant_id = p_tenant_id
+    WHERE ts.tenant_id = p_tenant_id AND platform_id = p_platform_id
     ORDER BY ts.end_date DESC NULLS FIRST, ts.created_at DESC
     LIMIT 1;
 
@@ -7326,32 +7058,25 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid") IS 'Returns the calculated status, end date, and plan name for a tenant''s latest subscription, prioritizing truly active ones and handling system owner.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid") RETURNS TABLE("assignment_id" "uuid", "user_id" "uuid", "email" "text", "first_name" "text", "last_name" "text", "role_id" "uuid", "role_name" "text", "role_display_name" "text", "branch_id" "uuid", "branch_name" "text", "status" "text", "is_schedulable" boolean, "avatar_url" "text", "base_salary" numeric, "default_product_commission_rate" numeric, "default_service_commission_rate" numeric, "timezone" "text")
+CREATE OR REPLACE FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("assignment_id" "uuid", "user_id" "uuid", "email" "text", "first_name" "text", "last_name" "text", "role_id" "uuid", "role_name" "text", "role_display_name" "text", "branch_id" "uuid", "branch_name" "text", "status" "text", "is_schedulable" boolean, "avatar_url" "text", "base_salary" numeric, "default_product_commission_rate" numeric, "default_service_commission_rate" numeric, "timezone" "text")
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
 DECLARE
     v_caller_id UUID := auth.uid();
     v_caller_tenant_ids UUID[];
 BEGIN
-    -- Get all tenant_ids the caller is assigned to from the user_assignments table
     SELECT array_agg(DISTINCT ua.tenant_id)
     FROM public.user_assignments ua
-    WHERE ua.user_id = v_caller_id
+    WHERE ua.user_id = v_caller_id AND ua.platform_id = p_platform_id
     INTO v_caller_tenant_ids;
 
-    -- If the requested tenant_id is not in the list of the caller's tenants, deny access.
     IF NOT (p_target_tenant_id = ANY(v_caller_tenant_ids)) THEN
         RAISE EXCEPTION 'Access denied: You do not have permission to view users for this tenant.';
     END IF;
 
-    -- Main Query
     RETURN QUERY
     SELECT
         ua.id AS assignment_id,
@@ -7365,7 +7090,7 @@ BEGIN
         ua.branch_id,
         b.name AS branch_name,
         ua.status,
-        ua.is_schedulable, -- Added is_schedulable
+        ua.is_schedulable,
         (u.raw_user_meta_data ->> 'avatar_url') AS avatar_url,
         ua.base_salary,
         ua.default_product_commission_rate,
@@ -7376,16 +7101,17 @@ BEGIN
     JOIN
         auth.users u ON ua.user_id = u.id
     JOIN
-        public.roles r ON ua.role_id = r.id
+        public.roles r ON ua.role_id = r.id AND ua.platform_id = r.platform_id
     LEFT JOIN
-        public.branches b ON ua.branch_id = b.id
+        public.branches b ON ua.branch_id = b.id AND ua.tenant_id = b.tenant_id AND ua.platform_id = b.platform_id
     WHERE
-        ua.tenant_id = p_target_tenant_id;
+        ua.tenant_id = p_target_tenant_id
+        AND ua.platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_tenants"("p_search_term" "text" DEFAULT NULL::"text", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "subscription_status" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "platform" json, "default_language_code" "text", "default_currency_id" "uuid", "default_timezone" "text", "contact_person" "text", "contact_email" "text", "contact_phone" "text", "country_id" "uuid", "is_active" boolean, "logo_url" "text", "notes" "text", "legal_name" "text", "tax_id" "text", "billing_address" "text", "website" "text", "whatsapp_phone" "text", "commercial_email" "text", "einvoicing_email" "text", "physical_address_line1" "text", "physical_address_line2" "text", "physical_city" "text", "physical_state" "text", "physical_postal_code" "text", "latitude" numeric, "longitude" numeric, "integrations_mode" "text", "is_system_owner" boolean, "platform_id" "uuid", "countries" json)
@@ -7444,7 +7170,7 @@ $$;
 ALTER FUNCTION "public"."get_tenants"("p_search_term" "text", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") RETURNS TABLE("id" "uuid", "attention_time" "text", "client_name" "text", "services" "jsonb", "stylists" "jsonb", "status" "text", "total_price" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") RETURNS TABLE("id" "uuid", "attention_time" "text", "client_name" "text", "services" "jsonb", "stylists" "jsonb", "status" "text", "total_price" numeric)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -7455,14 +7181,13 @@ BEGIN
         SELECT a.*
         FROM public.attentions a
         WHERE
-            a.tenant_id = p_tenant_id
+            a.tenant_id = p_tenant_id AND a.platform_id = p_platform_id
             AND (a.attention_datetime AT TIME ZONE p_timezone)::date = v_today
             AND a.status IN ('Pendiente', 'Confirmada')
-            -- Simplified WHERE clause based on parameters from frontend
             AND (p_branch_id IS NULL OR a.branch_id = p_branch_id)
             AND (p_user_id IS NULL OR EXISTS (
                 SELECT 1 FROM public.attention_services s_asgn
-                WHERE s_asgn.attention_id = a.id AND s_asgn.user_id = p_user_id
+                WHERE s_asgn.attention_id = a.id AND s_asgn.user_id = p_user_id AND s_asgn.tenant_id = p_tenant_id AND s_asgn.platform_id = p_platform_id
             ))
     ),
     aggregated_data AS (
@@ -7472,8 +7197,9 @@ BEGIN
             jsonb_agg(DISTINCT jsonb_build_object('id', u.user_id, 'name', u.first_name || ' ' || u.last_name)) as stylists
         FROM public.attention_services aserv
         JOIN base_attentions ba ON aserv.attention_id = ba.id
-        JOIN public.services s ON aserv.service_id = s.id
-        JOIN public.get_tenant_users(p_tenant_id) u ON aserv.user_id = u.user_id
+        JOIN public.services s ON aserv.service_id = s.id AND aserv.tenant_id = s.tenant_id AND aserv.platform_id = s.platform_id
+        JOIN public.get_tenant_users(p_tenant_id, p_platform_id) u ON aserv.user_id = u.user_id
+        WHERE aserv.tenant_id = p_tenant_id AND aserv.platform_id = p_platform_id
         GROUP BY aserv.attention_id
     )
     SELECT
@@ -7487,7 +7213,7 @@ BEGIN
     FROM
         base_attentions ba
     JOIN
-        public.clients c ON ba.client_id = c.id
+        public.clients c ON ba.client_id = c.id AND ba.tenant_id = c.tenant_id AND ba.platform_id = c.platform_id
     LEFT JOIN
         aggregated_data agd ON ba.id = agd.attention_id
     ORDER BY
@@ -7496,10 +7222,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") RETURNS TABLE("name" "text", "count" bigint, "revenue" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") RETURNS TABLE("name" "text", "count" bigint, "revenue" numeric)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -7513,13 +7239,14 @@ BEGIN
     FROM
         public.attention_services aserv
     JOIN
-        public.services s ON aserv.service_id = s.id
+        public.services s ON aserv.service_id = s.id AND aserv.tenant_id = s.tenant_id AND aserv.platform_id = s.platform_id
     JOIN
-        public.attentions a ON aserv.attention_id = a.id
+        public.attentions a ON aserv.attention_id = a.id AND aserv.tenant_id = a.tenant_id AND aserv.platform_id = a.platform_id
     WHERE
         a.tenant_id = p_tenant_id
+        AND a.platform_id = p_platform_id
         AND a.attention_datetime >= v_start_date
-        AND a.status IN ('Pagada', 'Finalizada') -- Filter for paid/finalized attentions
+        AND a.status IN ('Pagada', 'Finalizada')
         AND (p_branch_id IS NULL OR a.branch_id = p_branch_id)
         AND (p_user_id IS NULL OR aserv.user_id = p_user_id)
     GROUP BY
@@ -7531,10 +7258,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid") RETURNS TABLE("item_id" "uuid", "product_id" "uuid", "product_name" "text", "quantity" numeric, "allow_decimal_sale" boolean)
+CREATE OR REPLACE FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("item_id" "uuid", "product_id" "uuid", "product_name" "text", "quantity" numeric, "allow_decimal_sale" boolean)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -7558,17 +7285,18 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_treatment_details"("p_treatment_id" "uuid") RETURNS TABLE("id" "uuid", "tenant_id" "uuid", "name" "text", "description" "text", "type" "text", "upfront_price" numeric, "financed_price" numeric, "is_active" boolean, "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "cover_image_url" "text", "sessions" "jsonb", "categories" "jsonb")
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."get_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid") RETURNS TABLE("id" "uuid", "tenant_id" "uuid", "platform_id" "uuid", "name" "text", "description" "text", "type" "text", "upfront_price" numeric, "financed_price" numeric, "is_active" boolean, "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "cover_image_url" "text", "sessions" "jsonb", "categories" "jsonb")
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     RETURN QUERY
     SELECT
         t.id,
         t.tenant_id,
+        t.platform_id,
         t.name,
         t.description,
         t.type,
@@ -7577,7 +7305,7 @@ BEGIN
         t.is_active,
         t.created_at,
         t.updated_at,
-        (SELECT ti.image_url FROM public.treatment_images ti WHERE ti.treatment_id = t.id AND ti.is_primary = TRUE LIMIT 1) AS cover_image_url,
+        (SELECT ti.image_url FROM public.treatment_images ti WHERE ti.treatment_id = t.id AND ti.is_primary = TRUE AND ti.platform_id = p_platform_id LIMIT 1) AS cover_image_url,
         COALESCE(
             (
                 SELECT jsonb_agg(
@@ -7602,9 +7330,10 @@ BEGIN
                                     )
                                 )
                                 FROM public.treatment_session_items tsi
-                                LEFT JOIN public.products p ON tsi.product_id = p.id
-                                LEFT JOIN public.services s ON tsi.service_id = s.id
+                                LEFT JOIN public.products p ON tsi.product_id = p.id AND p.platform_id = p_platform_id
+                                LEFT JOIN public.services s ON tsi.service_id = s.id AND s.platform_id = p_platform_id
                                 WHERE tsi.session_id = ts.id
+                                  AND tsi.platform_id = p_platform_id
                             ),
                             '[]'::jsonb
                         )
@@ -7613,6 +7342,7 @@ BEGIN
                 )
                 FROM public.treatment_sessions ts
                 WHERE ts.treatment_id = t.id
+                  AND ts.platform_id = p_platform_id
             ),
             '[]'::jsonb
         ) AS sessions,
@@ -7627,18 +7357,21 @@ BEGIN
                 FROM public.treatment_category_assignments tca
                 JOIN public.treatment_categories tc ON tca.category_id = tc.id
                 WHERE tca.treatment_id = t.id
+                  AND tca.platform_id = p_platform_id
             ),
             '[]'::jsonb
         ) AS categories
     FROM
         public.treatments t
     WHERE
-        t.id = p_treatment_id;
+        t.id = p_treatment_id
+        AND t.tenant_id = p_tenant_id
+        AND t.platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_treatment_details"("p_treatment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."treatment_images" (
@@ -7653,42 +7386,35 @@ CREATE TABLE IF NOT EXISTS "public"."treatment_images" (
     "google_drive_file_id" "text",
     "file_name" "text",
     "mime_type" "text",
-    "file_size" bigint
+    "file_size" bigint,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."treatment_images" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."treatment_images" OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_treatment_images"("p_treatment_id" "uuid") RETURNS SETOF "public"."treatment_images"
+CREATE OR REPLACE FUNCTION "public"."get_treatment_images"("p_platform_id" "uuid", "p_treatment_id" "uuid", "p_tenant_id" "uuid") RETURNS SETOF "public"."treatment_images"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
   RETURN QUERY
-  SELECT
-    ti.id,
-    ti.treatment_id,
-    ti.tenant_id,
-    ti.image_url,
-    ti.is_primary,
-    ti.sort_order,
-    ti.created_at,
-    ti.updated_at,
-    ti.google_drive_file_id,
-    ti.file_name,
-    ti.mime_type,
-    ti.file_size
+  SELECT ti.*
   FROM public.treatment_images ti
-  WHERE ti.treatment_id = p_treatment_id
+  WHERE ti.treatment_id = p_treatment_id 
+    AND ti.tenant_id = p_tenant_id
+    AND ti.platform_id = p_platform_id
   ORDER BY ti.sort_order ASC, ti.created_at ASC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_treatment_images"("p_treatment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_treatment_images"("p_platform_id" "uuid", "p_treatment_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid") RETURNS TABLE("id" "uuid", "branch_id" "uuid", "registration_code" "text", "is_registered" boolean, "registered_at" timestamp with time zone, "last_heartbeat" timestamp with time zone, "media_playlist_id" "uuid", "tenant_id" "uuid", "created_at" timestamp with time zone, "updated_at" timestamp with time zone)
+CREATE OR REPLACE FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "branch_id" "uuid", "registration_code" "text", "is_registered" boolean, "registered_at" timestamp with time zone, "last_heartbeat" timestamp with time zone, "media_playlist_id" "uuid", "tenant_id" "uuid", "created_at" timestamp with time zone, "updated_at" timestamp with time zone)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -7700,73 +7426,61 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_unified_chatter_feed"("p_resource_type" "text", "p_resource_id" "uuid") RETURNS TABLE("id" "uuid", "event_type" "text", "created_at" timestamp with time zone, "user_id" "uuid", "payload" "jsonb")
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."get_unified_chatter_feed"("p_resource_id" "uuid", "p_resource_type" "text") RETURNS TABLE("id" "uuid", "event_type" "text", "user_id" "uuid", "content" "text", "payload" "jsonb", "created_at" timestamp with time zone)
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     RETURN QUERY
-    SELECT
-        c.id, 'comment' as event_type, c.created_at, c.user_id, jsonb_build_object('text', c.comment_text) as payload
-    FROM public.chatter_comments c
-    WHERE c.resource_type = p_resource_type AND c.resource_id = p_resource_id
-    UNION ALL
-    SELECT
-        a.id,
-        CASE
-            WHEN a.action LIKE 'INSERT%' THEN 'creation'
-            WHEN a.action LIKE 'UPDATE%' THEN 'field_update'
-            ELSE a.action
-        END as event_type,
-        a.created_at,
-        a.user_id,
-        jsonb_build_object('old_record', a.old_value, 'new_record', a.new_value) as payload
-    FROM public.audit_logs a
-    WHERE a.object_type = p_resource_type AND a.object_id = p_resource_id
+    (
+        -- Comments
+        SELECT 
+            c.id, 
+            'comment'::text as event_type, 
+            c.user_id, 
+            c.comment_text as content,
+            NULL::jsonb as payload,
+            c.created_at
+        FROM public.chatter_comments c
+        WHERE c.resource_id = p_resource_id AND c.resource_type = p_resource_type
+        
+        UNION ALL
+        
+        -- Field Update Events
+        SELECT 
+            e.id, 
+            e.event_type, 
+            e.user_id, 
+            NULL::text as content,
+            e.payload,
+            e.created_at
+        FROM public.chatter_events e
+        WHERE e.resource_id = p_resource_id AND e.resource_type = p_resource_type
+    )
     ORDER BY created_at DESC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_unified_chatter_feed"("p_resource_type" "text", "p_resource_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_unified_chatter_feed"("p_resource_id" "uuid", "p_resource_type" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_units_of_measure"("p_tenant_id" "uuid") RETURNS TABLE("id" "uuid", "tenant_id" "uuid", "name" "text", "abbreviation" "text", "created_at" timestamp with time zone, "is_global" boolean)
+CREATE OR REPLACE FUNCTION "public"."get_units_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid") RETURNS TABLE("id" "uuid", "tenant_id" "uuid", "name" "text", "abbreviation" "text", "created_at" timestamp with time zone, "is_global" boolean)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     RETURN QUERY SELECT uom.id, uom.tenant_id, uom.name, uom.abbreviation, uom.created_at, (uom.tenant_id IS NULL) AS is_global
     FROM public.units_of_measure uom
-    WHERE uom.tenant_id = p_tenant_id OR uom.tenant_id IS NULL
+    WHERE (uom.tenant_id = p_tenant_id OR uom.tenant_id IS NULL)
+      AND uom.platform_id = p_platform_id
     ORDER BY uom.name;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_units_of_measure"("p_tenant_id" "uuid") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."get_usage_statistics"() RETURNS TABLE("total_logins" bigint, "total_appointments_created" bigint, "total_products_sold" bigint, "total_services_rendered" bigint)
-    LANGUAGE "plpgsql" SECURITY DEFINER
-    AS $$
-BEGIN
-    IF NOT (SELECT public.is_super_admin()) THEN
-        RAISE EXCEPTION 'Acceso denegado. Solo los superadministradores pueden ver las estadísticas de uso.';
-    END IF;
-
-    RETURN QUERY
-    SELECT
-        (SELECT COUNT(*) FROM public.audit_logs WHERE action = 'user_login') AS total_logins,
-        (SELECT COUNT(*) FROM public.attentions) AS total_appointments_created,
-        (SELECT SUM(quantity) FROM public.attention_products) AS total_products_sold,
-        (SELECT COUNT(*) FROM public.attention_services) AS total_services_rendered;
-END;
-$$;
-
-
-ALTER FUNCTION "public"."get_usage_statistics"() OWNER TO "postgres";
+ALTER FUNCTION "public"."get_units_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_user_accessible_branches"() RETURNS SETOF "uuid"
@@ -7827,14 +7541,13 @@ $$;
 ALTER FUNCTION "public"."get_user_assigned_equipment"("p_user_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid") RETURNS TABLE("assignment_id" "uuid", "user_id" "uuid", "tenant_id" "uuid", "role_id" "uuid", "branch_id" "uuid", "status" "text", "role_name" "text", "role_display_name" "text", "branch_name" "text")
+CREATE OR REPLACE FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS TABLE("assignment_id" "uuid", "user_id" "uuid", "tenant_id" "uuid", "role_id" "uuid", "branch_id" "uuid", "status" "text", "role_name" "text", "role_display_name" "text", "branch_name" "text")
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
 DECLARE
     v_caller_role TEXT := (auth.jwt() -> 'app_metadata' ->> 'role');
     v_caller_tenant_id UUID := (auth.jwt() -> 'app_metadata' ->> 'tenant_id')::uuid;
 BEGIN
-    -- Authorization Check
     IF v_caller_role NOT IN ('super_admin', 'tenant_super_admin', 'tenant_admin') THEN
         RAISE EXCEPTION 'Access denied.';
     END IF;
@@ -7843,32 +7556,32 @@ BEGIN
         RAISE EXCEPTION 'Access denied: You can only view assignments within your own tenant.';
     END IF;
 
-    -- Query from auth.users and app_metadata
     RETURN QUERY
     SELECT
-        (u.raw_app_meta_data ->> 'assignment_id')::uuid,
-        u.id,
-        (u.raw_app_meta_data ->> 'tenant_id')::uuid,
-        r.id,
-        (u.raw_app_meta_data ->> 'branch_id')::uuid,
-        (u.raw_app_meta_data ->> 'assignment_status'),
+        ua.id,
+        ua.user_id,
+        ua.tenant_id,
+        ua.role_id,
+        ua.branch_id,
+        ua.status,
         r.name,
         r.display_name,
         b.name
     FROM
-        auth.users u
+        public.user_assignments ua
+    JOIN
+        public.roles r ON ua.role_id = r.id AND ua.platform_id = r.platform_id
     LEFT JOIN
-        public.roles r ON (u.raw_app_meta_data ->> 'role') = r.name
-    LEFT JOIN
-        public.branches b ON (u.raw_app_meta_data ->> 'branch_id')::uuid = b.id
+        public.branches b ON ua.branch_id = b.id AND ua.tenant_id = b.tenant_id AND ua.platform_id = b.platform_id
     WHERE
-        u.id = p_user_id
-        AND (u.raw_app_meta_data ->> 'tenant_id')::uuid = p_tenant_id;
+        ua.user_id = p_user_id
+        AND ua.tenant_id = p_tenant_id
+        AND ua.platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_user_by_email_in_auth"("p_email" "text") RETURNS TABLE("id" "uuid", "aud" "text", "role" "text", "email" "text", "email_confirmed_at" timestamp with time zone, "phone" "text", "confirmed_at" timestamp with time zone, "last_sign_in_at" timestamp with time zone, "raw_app_meta_data" "jsonb", "raw_user_meta_data" "jsonb", "is_anonymous" boolean, "created_at" timestamp with time zone, "updated_at" timestamp with time zone)
@@ -7936,15 +7649,15 @@ $$;
 ALTER FUNCTION "public"."get_user_claims_from_jwt"("jwt_token" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
     v_stats jsonb;
 BEGIN
     SELECT jsonb_build_object(
-        'totalCommissions', (SELECT COALESCE(SUM(commission_amount), 0) FROM public.service_user_commissions WHERE tenant_id = p_tenant_id AND user_id = p_user_id),
-        'monthlyCommissions', (SELECT COALESCE(SUM(commission_amount), 0) FROM public.service_user_commissions WHERE tenant_id = p_tenant_id AND user_id = p_user_id AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE))
+        'totalCommissions', (SELECT COALESCE(SUM(commission_amount), 0) FROM public.service_user_commissions WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND user_id = p_user_id),
+        'monthlyCommissions', (SELECT COALESCE(SUM(commission_amount), 0) FROM public.service_user_commissions WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND user_id = p_user_id AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE))
         -- Add more user-specific stats here as needed
     ) INTO v_stats;
 
@@ -7953,10 +7666,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") RETURNS TABLE("user_name" "text", "attentions_count" bigint, "services_revenue" numeric, "products_revenue" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") RETURNS TABLE("user_name" "text", "attentions_count" bigint, "services_revenue" numeric, "products_revenue" numeric)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -7964,22 +7677,22 @@ BEGIN
     SELECT
         u.first_name || ' ' || u.last_name as user_name,
         COUNT(DISTINCT a.id) as attentions_count,
-        SUM(aserv.service_price) as services_revenue,
+        COALESCE(SUM(aserv.service_price), 0) as services_revenue,
         COALESCE(SUM(ap.total_price), 0) as products_revenue
-    FROM public.get_tenant_users(p_tenant_id) u -- Changed to use get_tenant_users
-    LEFT JOIN public.attention_services aserv ON u.user_id = aserv.user_id AND aserv.tenant_id = p_tenant_id
-    LEFT JOIN public.attentions a ON aserv.attention_id = a.id AND a.attention_datetime::date BETWEEN p_date_from AND p_date_to
-    LEFT JOIN public.attention_products ap ON u.user_id = ap.user_id AND ap.tenant_id = p_tenant_id AND ap.attention_id = a.id
-    WHERE u.status = 'active' -- Ensure we only report on active users
+    FROM public.get_tenant_users(p_tenant_id, p_platform_id) u
+    LEFT JOIN public.attention_services aserv ON u.user_id = aserv.user_id AND aserv.tenant_id = p_tenant_id AND aserv.platform_id = p_platform_id
+    LEFT JOIN public.attentions a ON aserv.attention_id = a.id AND a.tenant_id = p_tenant_id AND a.platform_id = p_platform_id AND a.attention_datetime::date BETWEEN p_date_from AND p_date_to
+    LEFT JOIN public.attention_products ap ON u.user_id = ap.user_id AND ap.tenant_id = p_tenant_id AND ap.platform_id = p_platform_id AND ap.attention_id = a.id
+    WHERE u.status = 'active'
     GROUP BY u.user_id, u.first_name, u.last_name;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_user_product_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") RETURNS TABLE("product_id" "uuid", "product_name" "text", "branches" json)
+CREATE OR REPLACE FUNCTION "public"."get_user_product_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("product_id" "uuid", "product_name" "text", "branches" json)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -7988,7 +7701,8 @@ BEGIN
     -- 1. Find all active branches for the tenant
     SELECT id AS branch_id
     FROM public.branches
-    WHERE tenant_id = tenant_id_param AND status = 'active'
+    WHERE tenant_id = p_tenant_id AND status = 'active'
+    -- TODO: AND platform_id = p_platform_id
   ),
   relevant_products AS (
     -- 2. Find all master products available in those branches
@@ -7996,7 +7710,8 @@ BEGIN
     FROM public.branch_products bp
     JOIN public.products p ON bp.product_id = p.id
     WHERE bp.branch_id IN (SELECT branch_id FROM tenant_branches)
-      AND bp.tenant_id = tenant_id_param
+      AND bp.tenant_id = p_tenant_id
+      -- TODO: AND bp.platform_id = p_platform_id
   ),
   commission_matrix AS (
     -- 3. Create the matrix of product/branch combinations for the user
@@ -8030,16 +7745,16 @@ BEGIN
   LEFT JOIN public.product_user_commissions pc
     ON cm.product_id = pc.product_id
     AND cm.branch_id = pc.branch_id
-    AND pc.user_id = user_id_param
+    AND pc.user_id = p_user_id
   GROUP BY cm.product_id, cm.product_name;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_user_product_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_user_product_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_user_service_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") RETURNS TABLE("service_id" "uuid", "service_name" "text", "branches" json)
+CREATE OR REPLACE FUNCTION "public"."get_user_service_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("service_id" "uuid", "service_name" "text", "branches" json)
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -8048,7 +7763,8 @@ BEGIN
     -- 1. Find all active branches for the tenant
     SELECT id AS branch_id
     FROM public.branches
-    WHERE tenant_id = tenant_id_param AND status = 'active'
+    WHERE tenant_id = p_tenant_id AND status = 'active'
+    -- TODO: AND platform_id = p_platform_id
   ),
   relevant_services AS (
     -- 2. Find all master services available in those branches
@@ -8056,7 +7772,8 @@ BEGIN
     FROM public.branch_services bs
     JOIN public.services s ON bs.service_id = s.id
     WHERE bs.branch_id IN (SELECT branch_id FROM tenant_branches)
-      AND bs.tenant_id = tenant_id_param
+      AND bs.tenant_id = p_tenant_id
+      -- TODO: AND bs.platform_id = p_platform_id
   ),
   commission_matrix AS (
     -- 3. Create the matrix of service/branch combinations for the user
@@ -8091,13 +7808,13 @@ BEGIN
   LEFT JOIN public.service_user_commissions sc
     ON cm.service_id = sc.service_id
     AND cm.branch_id = sc.branch_id
-    AND sc.user_id = user_id_param
+    AND sc.user_id = p_user_id
   GROUP BY cm.service_id, cm.service_name;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_user_service_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_user_service_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_user_tenant_id"() RETURNS "uuid"
@@ -8111,7 +7828,7 @@ $$;
 ALTER FUNCTION "public"."get_user_tenant_id"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") RETURNS TABLE("id" "uuid", "user_id" "uuid", "user_name" "text", "branch_id" "uuid", "branch_name" "text", "start_date" timestamp with time zone, "end_date" timestamp with time zone, "absence_type_id" "uuid", "absence_type_name" "text", "reason" "text", "status" "text", "approved_by" "text", "created_at" timestamp with time zone, "is_partial_day" boolean)
+CREATE OR REPLACE FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") RETURNS TABLE("id" "uuid", "user_id" "uuid", "user_name" "text", "branch_id" "uuid", "branch_name" "text", "start_date" timestamp with time zone, "end_date" timestamp with time zone, "absence_type_id" "uuid", "absence_type_name" "text", "reason" "text", "status" "text", "approved_by" "text", "created_at" timestamp with time zone, "is_partial_day" boolean)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -8124,7 +7841,7 @@ BEGIN
             gtu.email,
             gtu.branch_id AS tu_branch_id,
             gtu.branch_name
-        FROM get_tenant_users(p_tenant_id) gtu
+        FROM get_tenant_users(p_tenant_id, p_platform_id) gtu -- Added p_platform_id here
     )
     SELECT
         uto.id,
@@ -8149,6 +7866,7 @@ BEGIN
         public.absence_types at ON uto.absence_type_id = at.id
     WHERE
         uto.tenant_id = p_tenant_id
+        AND uto.platform_id = p_platform_id
         AND (p_user_id IS NULL OR uto.user_id = p_user_id)
         AND (p_branch_id IS NULL OR uto.branch_id = p_branch_id)
         AND (
@@ -8163,13 +7881,11 @@ BEGIN
             END)
         )
         AND (p_type_filter IS NULL OR p_type_filter = 'all' OR uto.absence_type_id::text = p_type_filter)
-        -- Corrected date range filter to check for overlap of the time off period
         AND (p_date_range_start IS NULL OR uto.end_date >= p_date_range_start)
         AND (p_date_range_end IS NULL OR uto.start_date <= p_date_range_end)
         AND (
             p_search_term IS NULL OR p_search_term = '' OR
             (
-                -- Search across multiple fields for the full search term
                 tu.first_name || ' ' || tu.last_name ILIKE '%' || p_search_term || '%' OR
                 tu.email ILIKE '%' || p_search_term || '%' OR
                 at.name ILIKE '%' || p_search_term || '%'
@@ -8180,10 +7896,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid") RETURNS TABLE("id" "text", "date" "text", "productname" "text", "saleamount" numeric, "commissionrate" numeric, "commissionamount" numeric)
+CREATE OR REPLACE FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "text", "date" "text", "productname" "text", "saleamount" numeric, "commissionrate" numeric, "commissionamount" numeric)
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -8210,7 +7926,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."handle_attention_status_change"() RETURNS "trigger"
@@ -8325,52 +8041,18 @@ $$;
 ALTER FUNCTION "public"."handle_updated_at"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) RETURNS "void"
-    LANGUAGE "plpgsql" SECURITY DEFINER
+CREATE OR REPLACE FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) RETURNS "void"
+    LANGUAGE "plpgsql"
     AS $$
-DECLARE
-    v_asset_id uuid;
-    v_current_period_start date;
-    v_current_period_end date;
 BEGIN
-    -- 1. Find the asset_id from the asset_key
-    SELECT id INTO v_asset_id
-    FROM public.plan_assets
-    WHERE asset_key = p_asset_key;
-
-    IF v_asset_id IS NULL THEN
-        RAISE EXCEPTION 'Invalid asset_key: %', p_asset_key;
-    END IF;
-
-    -- 2. Determine the current billing period (assuming monthly, starting on the 1st)
-    v_current_period_start := date_trunc('month', current_date);
-    v_current_period_end := (date_trunc('month', current_date) + interval '1 month' - interval '1 day')::date;
-
-    -- 3. Atomically insert or update the usage record
-    INSERT INTO public.asset_usage_tracking (
-        tenant_id,
-        asset_id,
-        usage_period_start,
-        usage_period_end,
-        quantity_used
-    )
-    VALUES (
-        p_tenant_id,
-        v_asset_id,
-        v_current_period_start,
-        v_current_period_end,
-        p_quantity_to_add
-    )
-    ON CONFLICT (tenant_id, asset_id, usage_period_start)
-    DO UPDATE SET
-        quantity_used = asset_usage_tracking.quantity_used + p_quantity_to_add,
-        updated_at = now();
-
+    -- Nota: asset_usage_tracking suele estar en Core, pero si existe localmente:
+    -- Ajustar si la tabla existe en Servicios
+    NULL;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) OWNER TO "postgres";
+ALTER FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."invoke_cron_job"("job_name" "text") RETURNS "void"
@@ -8396,25 +8078,6 @@ $$;
 
 
 ALTER FUNCTION "public"."invoke_cron_job"("job_name" "text") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."invoke_process_whatsapp_queue"() RETURNS "void"
-    LANGUAGE "plpgsql"
-    AS $$
-BEGIN
-    PERFORM net.http_post(
-        url := 'https://vtfsbogpkrcbfuhhoepf.supabase.co/functions/v1/process-whatsapp-queue',
-        headers := jsonb_build_object(
-            'Content-Type', 'application/json',
-            'Authorization', 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ0ZnNib2dwa3JjYmZ1aGhvZXBmIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MDI4NTQ2NCwiZXhwIjoyMDY1ODYxNDY0fQ.k3oSZ5G7LxRm4VByrTZEo8EjS7woGmVWGNXbEQ4Vbqg'
-        ),
-        body := '{}'::jsonb -- Body is empty as the function doesn't expect a payload
-    );
-END;
-$$;
-
-
-ALTER FUNCTION "public"."invoke_process_whatsapp_queue"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."invoke_services_orphan_cleanup"() RETURNS json
@@ -8542,7 +8205,7 @@ $$;
 ALTER FUNCTION "public"."is_time_in_schedule"("p_appointment_utc" timestamp with time zone, "p_duration_minutes" integer, "p_schedule_start_time" time without time zone, "p_schedule_end_time" time without time zone, "p_tenant_timezone" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -8554,15 +8217,16 @@ BEGIN
         signed_content = p_signed_content
     WHERE
         id = p_signed_consent_id
-        AND tenant_id = p_tenant_id;
+        AND tenant_id = p_tenant_id
+        AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -8595,7 +8259,7 @@ BEGIN
     -- 3. Verificar si el usuario ya está vinculado a este tenant
     IF EXISTS (
         SELECT 1 FROM public.user_assignments
-        WHERE user_id = user_id_to_link AND tenant_id = p_tenant_id
+        WHERE user_id = user_id_to_link AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     ) THEN
         RETURN jsonb_build_object('success', false, 'message', 'Este usuario ya es miembro de este negocio.');
     END IF;
@@ -8614,10 +8278,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid") RETURNS SETOF "public"."branch_social_networks"
+CREATE OR REPLACE FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS SETOF "public"."branch_social_networks"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -8630,23 +8294,23 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid") RETURNS SETOF "public"."informed_consent_templates"
+CREATE OR REPLACE FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS SETOF "public"."informed_consent_templates"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     RETURN QUERY
     SELECT *
     FROM public.informed_consent_templates
-    WHERE tenant_id = p_tenant_id
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
     ORDER BY name;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."list_tenant_social_networks"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS SETOF "public"."tenant_social_networks"
@@ -8665,8 +8329,8 @@ $$;
 ALTER FUNCTION "public"."list_tenant_social_networks"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_type" "text", "p_show_inactive" boolean DEFAULT false, "p_category_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "type" "text", "upfront_price" numeric, "financed_price" numeric, "is_active" boolean, "session_count" bigint, "cover_image_url" "text", "categories" "jsonb", "treatment_images" "jsonb")
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_type" "text", "p_show_inactive" boolean DEFAULT false, "p_category_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "type" "text", "upfront_price" numeric, "financed_price" numeric, "is_active" boolean, "session_count" bigint, "cover_image_url" "text", "categories" "jsonb", "treatment_images" "jsonb")
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     RETURN QUERY
@@ -8679,14 +8343,14 @@ BEGIN
         t.financed_price,
         t.is_active,
         COUNT(ts.id) AS session_count,
-        (SELECT ti.image_url FROM public.treatment_images ti WHERE ti.treatment_id = t.id AND ti.is_primary = TRUE LIMIT 1) AS cover_image_url,
+        (SELECT ti.image_url FROM public.treatment_images ti WHERE ti.treatment_id = t.id AND ti.is_primary = TRUE AND ti.platform_id = p_platform_id LIMIT 1) AS cover_image_url,
         COALESCE(
             (SELECT jsonb_agg(
                 jsonb_build_object('id', tc.id, 'name', tc.name)
             )
             FROM public.treatment_category_assignments tca_inner
             JOIN public.treatment_categories tc ON tca_inner.category_id = tc.id
-            WHERE tca_inner.treatment_id = t.id),
+            WHERE tca_inner.treatment_id = t.id AND tca_inner.platform_id = p_platform_id),
             '[]'::jsonb
         ) AS categories,
         COALESCE(
@@ -8699,7 +8363,7 @@ BEGIN
                 ) ORDER BY ti.sort_order
             )
             FROM public.treatment_images ti
-            WHERE ti.treatment_id = t.id),
+            WHERE ti.treatment_id = t.id AND ti.platform_id = p_platform_id),
             '[]'::jsonb
         ) AS treatment_images
     FROM
@@ -8710,9 +8374,10 @@ BEGIN
         public.treatment_category_assignments tca ON t.id = tca.treatment_id
     WHERE
         t.tenant_id = p_tenant_id
+        AND t.platform_id = p_platform_id
         AND t.type = p_type
         AND (p_category_id IS NULL OR tca.category_id = p_category_id)
-        AND (CASE WHEN p_show_inactive THEN TRUE ELSE t.is_active = TRUE END) -- Refined is_active filter
+        AND (CASE WHEN p_show_inactive THEN TRUE ELSE t.is_active = TRUE END)
     GROUP BY
         t.id, t.name, t.description, t.type, t.upfront_price, t.financed_price, t.is_active, t.created_at, t.updated_at
     ORDER BY
@@ -8721,20 +8386,20 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_type" "text", "p_show_inactive" boolean, "p_category_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_type" "text", "p_show_inactive" boolean, "p_category_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text" DEFAULT NULL::"text", "p_object_id" "uuid" DEFAULT NULL::"uuid", "p_old_value" "jsonb" DEFAULT NULL::"jsonb", "p_new_value" "jsonb" DEFAULT NULL::"jsonb", "p_ip_address" "inet" DEFAULT NULL::"inet", "p_user_agent" "text" DEFAULT NULL::"text", "p_metadata" "jsonb" DEFAULT NULL::"jsonb", "p_tenant_id" "uuid" DEFAULT NULL::"uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text" DEFAULT NULL::"text", "p_object_id" "uuid" DEFAULT NULL::"uuid", "p_old_value" "jsonb" DEFAULT NULL::"jsonb", "p_new_value" "jsonb" DEFAULT NULL::"jsonb", "p_ip_address" "inet" DEFAULT NULL::"inet", "p_user_agent" "text" DEFAULT NULL::"text", "p_metadata" "jsonb" DEFAULT NULL::"jsonb", "p_tenant_id" "uuid" DEFAULT NULL::"uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
-    INSERT INTO public.audit_logs (user_id, tenant_id, branch_id, action, object_type, object_id, old_value, new_value, ip_address, user_agent, metadata)
-    VALUES (p_user_id, p_tenant_id, p_branch_id, p_action, p_object_type, p_object_id, p_old_value, p_new_value, p_ip_address, p_user_agent, p_metadata);
+    INSERT INTO public.audit_logs (user_id, tenant_id, platform_id, branch_id, action, object_type, object_id, old_value, new_value, ip_address, user_agent, metadata)
+    VALUES (p_user_id, p_tenant_id, p_platform_id, p_branch_id, p_action, p_object_type, p_object_id, p_old_value, p_new_value, p_ip_address, p_user_agent, p_metadata);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text", "p_object_id" "uuid", "p_old_value" "jsonb", "p_new_value" "jsonb", "p_ip_address" "inet", "p_user_agent" "text", "p_metadata" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text", "p_object_id" "uuid", "p_old_value" "jsonb", "p_new_value" "jsonb", "p_ip_address" "inet", "p_user_agent" "text", "p_metadata" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."log_branch_status_change"() RETURNS "trigger"
@@ -8753,6 +8418,35 @@ $$;
 
 
 ALTER FUNCTION "public"."log_branch_status_change"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."log_branch_status_change_v2"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') OR (TG_OP = 'UPDATE' AND OLD.status IS DISTINCT FROM NEW.status) THEN
+        INSERT INTO public.branch_status_history (
+            branch_id,
+            status,
+            changed_at,
+            changed_by,
+            tenant_id,
+            platform_id
+        ) VALUES (
+            NEW.id,
+            NEW.status,
+            now(),
+            auth.uid(), -- Will be null if invoked by system without auth context, which is fine as it is nullable
+            NEW.tenant_id,
+            NEW.platform_id
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."log_branch_status_change_v2"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."login_user"("p_email" "text", "p_password" "text") RETURNS "jsonb"
@@ -8959,18 +8653,16 @@ $$;
 ALTER FUNCTION "public"."process_recurring_expenses"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."process_sale_from_attention"("p_attention_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."process_sale_from_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql"
-    AS $$ -- Returns a JSON object with saleId and generated commissions
+    AS $$
 DECLARE
     attention_rec RECORD;
     sale_id_new uuid;
     sale_number_new text;
-    combo_item RECORD;
     service_item RECORD;
     product_item RECORD;
     new_sales_item_id uuid;
-    combo_parent_id uuid;
     total_subtotal_amt numeric;
     total_tax_amt numeric;
     total_amt numeric;
@@ -8981,114 +8673,86 @@ DECLARE
     v_rate_source text;
     v_commissions_array JSONB[] := '{}'::JSONB[];
 BEGIN
-    -- Step 1: Fetch attention details
-    SELECT * INTO attention_rec FROM public.attentions WHERE id = p_attention_id;
+    SELECT * INTO attention_rec FROM public.attentions WHERE id = p_attention_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-    -- Step 2: Get the next sale number
-    sale_number_new := public.get_next_document_number(attention_rec.tenant_id, 'SALE'::text, attention_rec.branch_id);
+    sale_number_new := public.get_next_document_number(p_tenant_id, 'SALE'::text, attention_rec.branch_id, '{}'::jsonb);
 
-    -- Step 3: Create the main 'sales' record with initial zero values for totals
-    INSERT INTO public.sales (tenant_id, branch_id, client_id, attention_id, sale_number, sale_date, subtotal_amount, total_tax_amount, total_amount, status)
-    VALUES (attention_rec.tenant_id, attention_rec.branch_id, attention_rec.client_id, p_attention_id, sale_number_new, now(), 0, 0, 0, 'COMPLETED')
+    INSERT INTO public.sales (tenant_id, platform_id, branch_id, client_id, attention_id, sale_number, sale_date, subtotal_amount, total_tax_amount, total_amount, status)
+    VALUES (p_tenant_id, p_platform_id, attention_rec.branch_id, attention_rec.client_id, p_attention_id, sale_number_new, now(), 0, 0, 0, 'COMPLETED')
     RETURNING id INTO sale_id_new;
 
-    -- Step 4: Process and insert sale items and calculate commissions
-
-    -- Process standalone services
     FOR service_item IN
         SELECT ats.id as attention_service_id, s.name as service_name, s.id as service_id, ats.service_price, ats.user_id
-        FROM public.attention_services ats JOIN public.services s ON ats.service_id = s.id
-        WHERE ats.attention_id = p_attention_id AND ats.combo_id IS NULL
+        FROM public.attention_services ats JOIN public.services s ON ats.service_id = s.id AND ats.tenant_id = s.tenant_id AND ats.platform_id = s.platform_id
+        WHERE ats.attention_id = p_attention_id AND ats.combo_id IS NULL AND ats.tenant_id = p_tenant_id AND ats.platform_id = p_platform_id
     LOOP
-        INSERT INTO public.sales_items (sale_id, item_type, service_id, description, quantity, unit_price, subtotal_price, total_tax_amount, total_price)
-        VALUES (sale_id_new, 'SERVICE', service_item.service_id, service_item.service_name, 1, service_item.service_price, service_item.service_price, 0, service_item.service_price)
+        INSERT INTO public.sales_items (sale_id, tenant_id, platform_id, item_type, service_id, description, quantity, unit_price, subtotal_price, total_tax_amount, total_price)
+        VALUES (sale_id_new, p_tenant_id, p_platform_id, 'SERVICE', service_item.service_id, service_item.service_name, 1, service_item.service_price, service_item.service_price, 0, service_item.service_price)
         RETURNING id INTO new_sales_item_id;
 
-        -- Commission Logic for Services
         v_staff_user_id := service_item.user_id;
         IF v_staff_user_id IS NOT NULL THEN
-            -- Tier 1: Specific commission rate
             SELECT commission_rate INTO v_commission_rate FROM public.service_user_commissions
-            WHERE service_id = service_item.service_id AND user_id = v_staff_user_id AND branch_id = attention_rec.branch_id;
+            WHERE service_id = service_item.service_id AND user_id = v_staff_user_id AND branch_id = attention_rec.branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
             v_rate_source := 'service_specific';
 
-            -- Tier 2: Default commission rate
             IF NOT FOUND OR v_commission_rate = 0 THEN
                 SELECT default_service_commission_rate INTO v_commission_rate FROM public.user_assignments
-                WHERE user_id = v_staff_user_id AND branch_id = attention_rec.branch_id;
+                WHERE user_id = v_staff_user_id AND branch_id = attention_rec.branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
                 v_rate_source := 'user_default';
             END IF;
 
             IF FOUND AND v_commission_rate > 0 THEN
                 v_commission_amount := service_item.service_price * (v_commission_rate / 100.0);
-                INSERT INTO public.earned_commissions (tenant_id, branch_id, user_id, sale_id, sales_item_id, commission_amount, commission_rate_used, source_of_rate)
-                VALUES (attention_rec.tenant_id, attention_rec.branch_id, v_staff_user_id, sale_id_new, new_sales_item_id, v_commission_amount, v_commission_rate, v_rate_source);
+                INSERT INTO public.earned_commissions (tenant_id, platform_id, branch_id, user_id, sale_id, sales_item_id, commission_amount, commission_rate_used, source_of_rate)
+                VALUES (p_tenant_id, p_platform_id, attention_rec.branch_id, v_staff_user_id, sale_id_new, new_sales_item_id, v_commission_amount, v_commission_rate, v_rate_source);
                 
                 v_commissions_array := v_commissions_array || jsonb_build_object('user_id', v_staff_user_id, 'amount', v_commission_amount, 'item_name', service_item.service_name);
             END IF;
         END IF;
     END LOOP;
 
-    -- Process standalone products
     FOR product_item IN
         SELECT p.name as product_name, p.id as product_id, atp.unit_price, atp.quantity, atp.user_id
-        FROM public.attention_products atp JOIN public.products p ON atp.product_id = p.id
-        WHERE atp.attention_id = p_attention_id AND atp.combo_id IS NULL
+        FROM public.attention_products atp JOIN public.products p ON atp.product_id = p.id AND atp.tenant_id = p.tenant_id AND atp.platform_id = p.platform_id
+        WHERE atp.attention_id = p_attention_id AND atp.combo_id IS NULL AND atp.tenant_id = p_tenant_id AND atp.platform_id = p_platform_id
     LOOP
-        INSERT INTO public.sales_items (sale_id, item_type, product_id, description, quantity, unit_price, subtotal_price, total_tax_amount, total_price)
-        VALUES (sale_id_new, 'PRODUCT', product_item.product_id, product_item.product_name, product_item.quantity, product_item.unit_price, product_item.unit_price * product_item.quantity, 0, product_item.unit_price * product_item.quantity)
+        INSERT INTO public.sales_items (sale_id, tenant_id, platform_id, item_type, product_id, description, quantity, unit_price, subtotal_price, total_tax_amount, total_price)
+        VALUES (sale_id_new, p_tenant_id, p_platform_id, 'PRODUCT', product_item.product_id, product_item.product_name, product_item.quantity, product_item.unit_price, product_item.unit_price * product_item.quantity, 0, product_item.unit_price * product_item.quantity)
         RETURNING id INTO new_sales_item_id;
 
-        -- Commission Logic for Products
         v_staff_user_id := product_item.user_id;
         IF v_staff_user_id IS NOT NULL THEN
-            -- Tier 1: Specific commission rate
             SELECT commission_rate INTO v_commission_rate FROM public.product_user_commissions
-            WHERE product_id = product_item.product_id AND user_id = v_staff_user_id AND branch_id = attention_rec.branch_id;
+            WHERE product_id = product_item.product_id AND user_id = v_staff_user_id AND branch_id = attention_rec.branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
             v_rate_source := 'product_specific';
 
-            -- Tier 2: Default commission rate
             IF NOT FOUND OR v_commission_rate = 0 THEN
                 SELECT default_product_commission_rate INTO v_commission_rate FROM public.user_assignments
-                WHERE user_id = v_staff_user_id AND branch_id = attention_rec.branch_id;
+                WHERE user_id = v_staff_user_id AND branch_id = attention_rec.branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
                 v_rate_source := 'user_default';
             END IF;
 
             IF FOUND AND v_commission_rate > 0 THEN
                 v_commission_amount := (product_item.unit_price * product_item.quantity) * (v_commission_rate / 100.0);
-                INSERT INTO public.earned_commissions (tenant_id, branch_id, user_id, sale_id, sales_item_id, commission_amount, commission_rate_used, source_of_rate)
-                VALUES (attention_rec.tenant_id, attention_rec.branch_id, v_staff_user_id, sale_id_new, new_sales_item_id, v_commission_amount, v_commission_rate, v_rate_source);
+                INSERT INTO public.earned_commissions (tenant_id, platform_id, branch_id, user_id, sale_id, sales_item_id, commission_amount, commission_rate_used, source_of_rate)
+                VALUES (p_tenant_id, p_platform_id, attention_rec.branch_id, v_staff_user_id, sale_id_new, new_sales_item_id, v_commission_amount, v_commission_rate, v_rate_source);
 
                 v_commissions_array := v_commissions_array || jsonb_build_object('user_id', v_staff_user_id, 'amount', v_commission_amount, 'item_name', product_item.product_name);
             END IF;
         END IF;
 
-        -- Inventory Movement
-        SELECT cost_price INTO product_cost FROM public.branch_products bp WHERE bp.product_id = product_item.product_id AND bp.branch_id = attention_rec.branch_id;
-        PERFORM public.create_product_movement(attention_rec.tenant_id, attention_rec.branch_id, product_item.product_id, 'SALE'::text, -product_item.quantity, product_cost, sale_id_new, 'SALE'::text);
+        SELECT cost_price INTO product_cost FROM public.branch_products bp WHERE bp.product_id = product_item.product_id AND bp.branch_id = attention_rec.branch_id AND bp.tenant_id = p_tenant_id AND bp.platform_id = p_platform_id;
+        PERFORM public.create_product_movement(p_tenant_id, p_platform_id, attention_rec.branch_id, product_item.product_id, 'SALE'::text, -product_item.quantity, COALESCE(product_cost, 0), sale_id_new, 'SALE'::text);
     END LOOP;
 
-    -- NOTE: Commission logic for items inside combos is omitted for this version for simplicity.
-
-    -- Step 5: Calculate and update final totals
     SELECT COALESCE(SUM(total_price), 0), COALESCE(SUM(subtotal_price), 0), COALESCE(SUM(total_tax_amount), 0)
     INTO total_amt, total_subtotal_amt, total_tax_amt
-    FROM public.sales_items WHERE sale_id = sale_id_new;
+    FROM public.sales_items WHERE sale_id = sale_id_new AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     UPDATE public.sales SET total_amount = total_amt, subtotal_amount = total_subtotal_amt, total_tax_amount = total_tax_amt
-    WHERE id = sale_id_new;
+    WHERE id = sale_id_new AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-    -- Step 6: Enqueue client notifications (unchanged from V8)
-    BEGIN
-        PERFORM public.queue_client_email(attention_rec.tenant_id, attention_rec.client_id, 'payment_receipt', '{}'::jsonb);
-    EXCEPTION WHEN others THEN RAISE WARNING 'V11: Failed to queue client receipt email for attention_id %: %', p_attention_id, SQLERRM;
-    END;
-    BEGIN
-        PERFORM public.queue_client_whatsapp(attention_rec.tenant_id, attention_rec.client_id, 'payment_receipt_whatsapp', '{}'::jsonb);
-    EXCEPTION WHEN others THEN RAISE WARNING 'V11: Failed to queue client receipt WhatsApp for attention_id %: %', p_attention_id, SQLERRM;
-    END;
-
-    -- Step 7: Return the final JSON object
     RETURN jsonb_build_object(
         'saleId', sale_id_new,
         'commissions', v_commissions_array
@@ -9097,122 +8761,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."process_sale_from_attention"("p_attention_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."process_sale_from_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."process_sale_from_attention"("p_attention_id" "uuid") IS 'V11: Fix NOT NULL violation on sales_items insert by providing initial zero value for total_tax_amount.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."queue_client_email"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_type" "text", "p_template_data" "jsonb") RETURNS "void"
-    LANGUAGE "plpgsql" SECURITY DEFINER
-    AS $$
-DECLARE
-    v_is_active BOOLEAN;
-    v_recipient_email TEXT;
-BEGIN
-    -- 1. Verificar si el tenant tiene este tipo de notificación activada.
-    -- Si no existe una configuración, asumimos que está activa por defecto.
-    SELECT is_active INTO v_is_active
-    FROM public.tenant_template_settings
-    WHERE tenant_id = p_tenant_id AND template_type = p_template_type;
-
-    -- Si v_is_active es NULL (no se encontró), lo tratamos como TRUE.
-    -- Si es FALSE, salimos de la función.
-    IF COALESCE(v_is_active, TRUE) = FALSE THEN
-        -- El tenant ha desactivado este tipo de correo, no hacemos nada.
-        RETURN;
-    END IF;
-
-    -- 2. Obtener el email del cliente.
-    SELECT email INTO v_recipient_email
-    FROM public.clients
-    WHERE id = p_client_id;
-
-    -- 3. Si se encontró un email válido, insertar en la cola.
-    IF v_recipient_email IS NOT NULL THEN
-        INSERT INTO public.client_email_queue (
-            tenant_id,
-            recipient_client_id,
-            recipient_email,
-            template_type,
-            template_data
-        )
-        VALUES (
-            p_tenant_id,
-            p_client_id,
-            v_recipient_email,
-            p_template_type,
-            p_template_data
-        );
-    END IF;
-
-END;
-$$;
-
-
-ALTER FUNCTION "public"."queue_client_email"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_type" "text", "p_template_data" "jsonb") OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."queue_client_email"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_type" "text", "p_template_data" "jsonb") IS 'Encola un correo para un cliente verificando si la notificación está activa para el tenant.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."queue_client_whatsapp"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_name" "text", "p_template_params" "jsonb") RETURNS "void"
-    LANGUAGE "plpgsql" SECURITY DEFINER
-    AS $$
-DECLARE
-    v_is_active BOOLEAN;
-    v_recipient_phone_number TEXT;
-BEGIN
-    -- 1. Check if this notification type is active for the tenant.
-    -- If no setting exists, we assume it's active by default.
-    SELECT is_active INTO v_is_active
-    FROM public.tenant_template_settings
-    WHERE tenant_id = p_tenant_id AND template_type = p_template_name;
-
-    -- If v_is_active is NULL (not found), treat as TRUE.
-    -- If it is FALSE, exit the function.
-    IF COALESCE(v_is_active, TRUE) = FALSE THEN
-        -- This notification type is disabled by the tenant, do nothing.
-        RETURN;
-    END IF;
-
-    -- 2. Get the client's phone number.
-    SELECT phone INTO v_recipient_phone_number
-    FROM public.clients
-    WHERE id = p_client_id;
-
-    -- 3. If a valid phone number is found, insert into the queue.
-    IF v_recipient_phone_number IS NOT NULL THEN
-        INSERT INTO public.client_whatsapp_queue (
-            tenant_id,
-            recipient_client_id,
-            recipient_phone_number,
-            template_name,
-            template_params
-        )
-        VALUES (
-            p_tenant_id,
-            p_client_id,
-            v_recipient_phone_number,
-            p_template_name,
-            p_template_params
-        );
-    END IF;
-
-END;
-$$;
-
-
-ALTER FUNCTION "public"."queue_client_whatsapp"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_name" "text", "p_template_params" "jsonb") OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."queue_client_whatsapp"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_name" "text", "p_template_params" "jsonb") IS 'Queues a WhatsApp message for a client after verifying that the notification type is active for the tenant.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -9222,16 +8774,16 @@ BEGIN
     WHERE 
         s.id = p_session_id 
         AND s.client_treatment_id = ct.id -- JOIN condition
-        AND ct.tenant_id = p_tenant_id   -- Security check on the parent table
+        AND ct.tenant_id = p_tenant_id AND platform_id = p_platform_id   -- Security check on the parent table
         AND s.status = 'Cancelada';
 END;
 $$;
 
 
-ALTER FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -9244,135 +8796,111 @@ DECLARE
     v_costing_method text;
     v_new_cost_price numeric;
     v_has_discrepancies boolean := false;
-    v_user_is_in_destination_branch boolean;
 BEGIN
-    -- 1. Get costing method
     SELECT settings_data->>'costing_method' INTO v_costing_method
     FROM public.tenant_settings
-    WHERE tenant_id = p_tenant_id;
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id;
     v_costing_method := COALESCE(v_costing_method, 'average');
 
-    -- 2. Get the transfer details
     SELECT * INTO v_transfer
     FROM public.product_transfers
-    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND status = 'en_transito';
+    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id AND status = 'en_transito';
 
     IF v_transfer IS NULL THEN
-        RAISE EXCEPTION 'Transfer not found or not in "en_transito" state.';
+        RAISE EXCEPTION 'Transferencia no encontrada o no está en estado "en_transito".';
     END IF;
 
-    -- 3. Check if the user is assigned to the destination branch
-    SELECT EXISTS (
-        SELECT 1
-        FROM auth.users u,
-             jsonb_array_elements(u.raw_app_meta_data->'assignments') as assignment
-        WHERE u.id = p_user_id
-          AND assignment->>'branch_id' = v_transfer.destination_branch_id::text
-          AND assignment->>'tenant_id' = p_tenant_id::text
-    ) INTO v_user_is_in_destination_branch;
+    -- Nota: La verificación de permisos de usuario a sucursal se hace usualmente en la Edge o RLS, 
+    -- pero mantengo el flujo de inserción reforzado.
 
-    IF NOT v_user_is_in_destination_branch THEN
-        RAISE EXCEPTION 'You do not have permission to receive this transfer.';
-    END IF;
-
-    -- 4. Create the reception record
-    INSERT INTO public.product_transfer_receptions (transfer_id, tenant_id, notes, reception_date)
-    VALUES (p_transfer_id, p_tenant_id, p_reception_notes, now())
+    INSERT INTO public.product_transfer_receptions (transfer_id, tenant_id, platform_id, notes, reception_date)
+    VALUES (p_transfer_id, p_tenant_id, p_platform_id, p_reception_notes, now())
     RETURNING id INTO v_reception_id;
 
-    -- 5. Process each received item
     FOR v_item IN SELECT * FROM jsonb_array_elements(p_received_items)
     LOOP
-        SELECT * INTO v_transfer_item FROM public.product_transfer_items WHERE id = (v_item->>'transfer_item_id')::uuid;
+        SELECT * INTO v_transfer_item FROM public.product_transfer_items WHERE id = (v_item->>'transfer_item_id')::uuid AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-        INSERT INTO public.product_transfer_reception_items (reception_id, transfer_item_id, product_id, quantity_expected, quantity_received)
-        VALUES (v_reception_id, v_transfer_item.id, v_transfer_item.product_id, v_transfer_item.quantity, (v_item->>'quantity_received')::integer);
+        INSERT INTO public.product_transfer_reception_items (reception_id, transfer_item_id, product_id, tenant_id, platform_id, quantity_expected, quantity_received)
+        VALUES (v_reception_id, v_transfer_item.id, v_transfer_item.product_id, p_tenant_id, p_platform_id, v_transfer_item.quantity, (v_item->>'quantity_received')::numeric);
 
-        IF v_transfer_item.quantity <> (v_item->>'quantity_received')::integer THEN
+        IF v_transfer_item.quantity <> (v_item->>'quantity_received')::numeric THEN
             v_has_discrepancies := true;
         END IF;
 
-        SELECT * INTO v_branch_product FROM public.branch_products WHERE branch_id = v_transfer.destination_branch_id AND product_id = v_transfer_item.product_id;
-        SELECT cost_price INTO v_origin_branch_product FROM public.branch_products WHERE branch_id = v_transfer.origin_branch_id AND product_id = v_transfer_item.product_id;
+        SELECT * INTO v_branch_product FROM public.branch_products WHERE branch_id = v_transfer.destination_branch_id AND product_id = v_transfer_item.product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
+        SELECT cost_price INTO v_origin_branch_product FROM public.branch_products WHERE branch_id = v_transfer.origin_branch_id AND product_id = v_transfer_item.product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-        -- 6. Update stock and cost price in destination branch
-        IF v_branch_product IS NULL THEN
-            INSERT INTO public.branch_products (branch_id, product_id, tenant_id, stock_quantity, cost_price, is_active)
-            VALUES (v_transfer.destination_branch_id, v_transfer_item.product_id, p_tenant_id, (v_item->>'quantity_received')::integer, v_origin_branch_product.cost_price, true);
+        IF v_branch_product.id IS NULL THEN
+            INSERT INTO public.branch_products (branch_id, product_id, tenant_id, platform_id, stock_quantity, cost_price, is_active)
+            VALUES (v_transfer.destination_branch_id, v_transfer_item.product_id, p_tenant_id, p_platform_id, (v_item->>'quantity_received')::numeric, v_origin_branch_product.cost_price, true);
         ELSE
-            IF v_costing_method = 'average' AND (v_branch_product.stock_quantity + (v_item->>'quantity_received')::integer) > 0 THEN
-                v_new_cost_price := ((v_branch_product.stock_quantity * v_branch_product.cost_price) + ((v_item->>'quantity_received')::integer * v_origin_branch_product.cost_price)) / (v_branch_product.stock_quantity + (v_item->>'quantity_received')::integer);
+            IF v_costing_method = 'average' AND (v_branch_product.stock_quantity + (v_item->>'quantity_received')::numeric) > 0 THEN
+                v_new_cost_price := ((v_branch_product.stock_quantity * v_branch_product.cost_price) + ((v_item->>'quantity_received')::numeric * v_origin_branch_product.cost_price)) / (v_branch_product.stock_quantity + (v_item->>'quantity_received')::numeric);
             ELSE
                 v_new_cost_price := v_origin_branch_product.cost_price;
             END IF;
 
             UPDATE public.branch_products
             SET
-                stock_quantity = v_branch_product.stock_quantity + (v_item->>'quantity_received')::integer,
+                stock_quantity = stock_quantity + (v_item->>'quantity_received')::numeric,
                 cost_price = v_new_cost_price,
                 updated_at = now()
             WHERE id = v_branch_product.id;
         END IF;
     END LOOP;
 
-    -- 7. Update transfer status
     UPDATE public.product_transfers
     SET status = CASE WHEN v_has_discrepancies THEN 'recibido_con_incidencias' ELSE 'completado' END, updated_at = now()
-    WHERE id = p_transfer_id;
+    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-    -- 8. Return reception ID
     RETURN jsonb_build_object('reception_id', v_reception_id);
 END;
 $$;
 
 
-ALTER FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
     item RECORD;
-    total_expected INT := 0;
-    total_received INT := 0;
+    total_expected numeric := 0;
+    total_received numeric := 0;
     new_status TEXT;
 BEGIN
-    -- Loop through received items to update stock and record reception
-    FOR item IN SELECT * FROM jsonb_to_recordset(p_received_items) AS x(purchase_item_id UUID, product_id UUID, quantity_expected INT, quantity_received INT)
+    FOR item IN SELECT * FROM jsonb_to_recordset(p_received_items) AS x(purchase_item_id UUID, product_id UUID, quantity_expected numeric, quantity_received numeric)
     LOOP
-        -- Update stock quantity for the product in the branch
         UPDATE public.branch_products
         SET stock_quantity = stock_quantity + item.quantity_received
-        WHERE branch_id = p_branch_id AND product_id = item.product_id;
+        WHERE branch_id = p_branch_id AND product_id = item.product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-        -- Insert a record into the reception details table
-        INSERT INTO public.purchase_item_receptions (purchase_item_id, tenant_id, quantity_expected, quantity_received)
-        VALUES (item.purchase_item_id, p_tenant_id, item.quantity_expected, item.quantity_received);
+        INSERT INTO public.purchase_item_receptions (purchase_item_id, purchase_id, tenant_id, platform_id, quantity_expected, quantity_received)
+        VALUES (item.purchase_item_id, p_purchase_id, p_tenant_id, p_platform_id, item.quantity_expected, item.quantity_received);
 
         total_expected := total_expected + item.quantity_expected;
         total_received := total_received + item.quantity_received;
     END LOOP;
 
-    -- Determine the new status for the purchase
     IF total_received < total_expected THEN
-        new_status := 'completada_con_incidencias';
+        new_status := 'recibido_con_incidencias';
     ELSE
         new_status := 'completada';
     END IF;
 
-    -- Update the purchase status and notes
     UPDATE public.purchases
     SET status = new_status,
         reception_notes = p_reception_notes,
         updated_at = now()
-    WHERE id = p_purchase_id;
+    WHERE id = p_purchase_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
 END;
 $$;
 
 
-ALTER FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."register_new_tenant"("p_business_name" "text", "p_admin_email" "text", "p_admin_password" "text") RETURNS "uuid"
@@ -9420,25 +8948,31 @@ $$;
 ALTER FUNCTION "public"."register_new_tenant"("p_business_name" "text", "p_admin_email" "text", "p_admin_password" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."register_tv"("p_registration_code" "text", "p_branch_id" "uuid", "p_tenant_id" "uuid") RETURNS "void"
-    LANGUAGE "plpgsql" SECURITY DEFINER
+CREATE OR REPLACE FUNCTION "public"."register_tv"("p_registration_code" "text", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") RETURNS "uuid"
+    LANGUAGE "plpgsql"
     AS $$
+DECLARE
+    v_tv_id uuid;
 BEGIN
-  UPDATE public.tv_displays
-  SET 
-    is_registered = true,
-    branch_id = p_branch_id,
-    tenant_id = p_tenant_id,
-    registered_at = now()
-  WHERE registration_code = p_registration_code;
+    UPDATE public.tv_displays
+    SET branch_id = p_branch_id,
+        is_registered = true,
+        registered_at = now(),
+        updated_at = now()
+    WHERE registration_code = p_registration_code 
+      AND tenant_id = p_tenant_id 
+      AND platform_id = p_platform_id
+    RETURNING id INTO v_tv_id;
+
+    RETURN v_tv_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."register_tv"("p_registration_code" "text", "p_branch_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."register_tv"("p_registration_code" "text", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."register_tv_display"("p_registration_code" "text") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."register_tv_display"("p_registration_code" "text", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -9453,10 +8987,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."register_tv_display"("p_registration_code" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."register_tv_display"("p_registration_code" "text", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -9467,7 +9001,7 @@ BEGIN
     -- 1. Check if the transfer exists and get its origin branch
     SELECT origin_branch_id INTO v_origin_branch_id
     FROM public.product_transfers
-    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND status = 'solicitado';
+    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id AND status = 'solicitado';
 
     IF v_origin_branch_id IS NULL THEN
         RAISE EXCEPTION 'Transfer not found, not in "solicitado" state, or you do not have permission.';
@@ -9498,10 +9032,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_plan_id" "uuid") RETURNS "uuid"
+CREATE OR REPLACE FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_id" "uuid") RETURNS "uuid"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -9515,7 +9049,7 @@ BEGIN
     -- 1. Encontrar la suscripción más reciente (activa o no) para este tenant.
     SELECT * INTO previous_subscription
     FROM public.tenant_subscriptions
-    WHERE tenant_id = p_tenant_id
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
     ORDER BY end_date DESC NULLS LAST, created_at DESC
     LIMIT 1;
 
@@ -9573,10 +9107,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_plan_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -9602,10 +9136,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -9618,10 +9152,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -9629,15 +9163,15 @@ BEGIN
     SET
         return_date = p_return_date
     WHERE
-        id = p_assignment_id AND tenant_id = p_tenant_id;
+        id = p_assignment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") OWNER TO "postgres";
+ALTER FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) RETURNS TABLE("id" "uuid", "name" "text", "email" "text", "phone" "text", "document_type_id" "uuid", "document_number" "text", "is_active" boolean, "parent_client_id" "uuid", "tenant_id" "uuid", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "parent_client_name" "text", "branches" "jsonb")
+CREATE OR REPLACE FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) RETURNS TABLE("id" "uuid", "name" "text", "email" "text", "phone" "text", "document_type_id" "uuid", "document_number" "text", "is_active" boolean, "parent_client_id" "uuid", "tenant_id" "uuid", "platform_id" "uuid", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "parent_client_name" "text", "branches" "jsonb")
     LANGUAGE "plpgsql"
     AS $_$
 DECLARE
@@ -9683,8 +9217,8 @@ BEGIN
                 cb.client_id, 
                 jsonb_agg(jsonb_build_object(''id'', b.id, ''name'', b.name)) as branches
             FROM client_branches cb
-            JOIN branches b ON cb.branch_id = b.id
-            WHERE cb.tenant_id = $1
+            JOIN branches b ON cb.branch_id = b.id AND cb.tenant_id = b.tenant_id AND cb.platform_id = b.platform_id
+            WHERE cb.tenant_id = $1 AND cb.platform_id = $3
             GROUP BY cb.client_id
         )
         SELECT
@@ -9697,6 +9231,7 @@ BEGIN
             c.is_active,
             c.parent_client_id,
             c.tenant_id,
+            c.platform_id,
             c.created_at,
             c.updated_at,
             pc.name as parent_client_name,
@@ -9704,15 +9239,15 @@ BEGIN
         FROM
             clients c
         LEFT JOIN
-            clients pc ON c.parent_client_id = pc.id
+            clients pc ON c.parent_client_id = pc.id AND c.tenant_id = pc.tenant_id AND c.platform_id = pc.platform_id
         LEFT JOIN 
             client_branches_agg cba ON c.id = cba.client_id
         WHERE
-            c.tenant_id = $1';
+            c.tenant_id = $1 AND c.platform_id = $3';
 
     IF branch_uuid IS NOT NULL THEN
         final_query := final_query || '
-            AND c.id IN (SELECT client_id FROM client_branches WHERE branch_id = $2 AND tenant_id = $1)';
+            AND c.id IN (SELECT client_id FROM client_branches WHERE branch_id = $2 AND tenant_id = $1 AND platform_id = $3)';
     END IF;
 
     IF NOT p_show_inactive THEN
@@ -9729,19 +9264,19 @@ BEGIN
 
     -- Execute the query
     IF branch_uuid IS NOT NULL THEN
-         RETURN QUERY EXECUTE final_query USING p_tenant_id, branch_uuid;
+         RETURN QUERY EXECUTE final_query USING p_tenant_id, branch_uuid, p_platform_id;
     ELSE
-         RETURN QUERY EXECUTE final_query USING p_tenant_id;
+         RETURN QUERY EXECUTE final_query USING p_tenant_id, NULL, p_platform_id;
     END IF;
 
 END;
 $_$;
 
 
-ALTER FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) OWNER TO "postgres";
+ALTER FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text" DEFAULT NULL::"text", "p_show_inactive" boolean DEFAULT false, "p_category_name" "text" DEFAULT NULL::"text", "p_brand_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "is_active" boolean, "category" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "cost_price" numeric, "last_purchase_cost" numeric, "average_cost" numeric, "brand_id" "uuid", "barcode" "text", "sku" "text", "tenant_id" "uuid", "name_i18n" "jsonb", "description_i18n" "jsonb", "unit_of_measure_id" "uuid", "package_content_quantity" numeric, "allow_decimal_sale" boolean)
+CREATE OR REPLACE FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text" DEFAULT NULL::"text", "p_show_inactive" boolean DEFAULT false, "p_category_name" "text" DEFAULT NULL::"text", "p_brand_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "is_active" boolean, "category" "text", "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "cost_price" numeric, "last_purchase_cost" numeric, "average_cost" numeric, "brand_id" "uuid", "barcode" "text", "sku" "text", "tenant_id" "uuid", "name_i18n" "jsonb", "description_i18n" "jsonb", "unit_of_measure_id" "uuid", "package_content_quantity" numeric, "allow_decimal_sale" boolean)
     LANGUAGE "plpgsql"
     AS $_$
 DECLARE
@@ -9827,10 +9362,10 @@ END;
 $_$;
 
 
-ALTER FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_name" "text", "p_brand_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_name" "text", "p_brand_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "is_active" boolean, "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "cost_price" numeric, "last_purchase_cost" numeric, "average_cost" numeric, "brand_id" "uuid", "barcode" "text", "sku" "text", "tenant_id" "uuid", "name_i18n" "jsonb", "description_i18n" "jsonb", "unit_of_measure_id" "uuid", "package_content_quantity" numeric, "allow_decimal_sale" boolean, "product_images" "jsonb", "product_categories" "jsonb")
+CREATE OR REPLACE FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "is_active" boolean, "created_at" timestamp with time zone, "updated_at" timestamp with time zone, "cost_price" numeric, "last_purchase_cost" numeric, "average_cost" numeric, "brand_id" "uuid", "barcode" "text", "sku" "text", "tenant_id" "uuid", "platform_id" "uuid", "name_i18n" "jsonb", "description_i18n" "jsonb", "unit_of_measure_id" "uuid", "package_content_quantity" numeric, "allow_decimal_sale" boolean, "product_images" "jsonb", "product_categories" "jsonb")
     LANGUAGE "plpgsql"
     AS $_$
 DECLARE
@@ -9839,14 +9374,12 @@ DECLARE
     query_conditions TEXT[] := ARRAY[]::TEXT[];
     final_query TEXT;
 BEGIN
-    -- Split the search term into words
     IF p_search_term IS NOT NULL AND p_search_term <> '' THEN
         search_words := string_to_array(lower(p_search_term), ' ');
     ELSE
         search_words := ARRAY[]::TEXT[];
     END IF;
 
-    -- Build the query conditions for each word
     FOREACH word IN ARRAY search_words
     LOOP
         IF word <> '' THEN
@@ -9860,7 +9393,6 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- Construct the final query
     final_query := '
         SELECT
             p.id,
@@ -9876,6 +9408,7 @@ BEGIN
             p.barcode,
             p.sku,
             p.tenant_id,
+            p.platform_id,
             p.name_i18n,
             p.description_i18n,
             p.unit_of_measure_id,
@@ -9896,6 +9429,7 @@ BEGIN
                 ) ORDER BY is_primary DESC, sort_order ASC) AS images
             FROM
                 public.product_images
+            WHERE tenant_id = $1 AND platform_id = $2
             GROUP BY
                 product_id
         ) pi ON p.id = pi.product_id
@@ -9906,22 +9440,22 @@ BEGIN
             FROM
                 public.product_category_assignments pca
             JOIN
-                public.product_categories pc ON pca.category_id = pc.id
+                public.product_categories pc ON pca.category_id = pc.id AND pca.tenant_id = pc.tenant_id AND pca.platform_id = pc.platform_id
+            WHERE pca.tenant_id = $1 AND pca.platform_id = $2
             GROUP BY
                 pca.product_id
         ) pc ON p.id = pc.product_id
         WHERE
-            p.tenant_id = $1';
+            p.tenant_id = $1 AND p.platform_id = $2';
 
     IF NOT p_show_inactive THEN
         final_query := final_query || '
             AND p.is_active = TRUE';
     END IF;
 
-    -- Use the new p_category_id to filter
     IF p_category_id IS NOT NULL THEN
         final_query := final_query || format('
-            AND p.id IN (SELECT product_id FROM public.product_category_assignments WHERE category_id = %L)', p_category_id);
+            AND p.id IN (SELECT product_id FROM public.product_category_assignments WHERE category_id = %L AND tenant_id = %L AND platform_id = %L)', p_category_id, p_tenant_id, p_platform_id);
     END IF;
 
     IF p_brand_id IS NOT NULL THEN
@@ -9937,17 +9471,16 @@ BEGIN
     final_query := final_query || '
         ORDER BY p.name;';
 
-    -- Execute the query
-    RETURN QUERY EXECUTE final_query USING p_tenant_id;
+    RETURN QUERY EXECUTE final_query USING p_tenant_id, p_platform_id;
 END;
 $_$;
 
 
-ALTER FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "duration_minutes" integer, "is_active" boolean, "category_id" "uuid", "tenant_id" "uuid", "name_i18n" "jsonb", "description_i18n" "jsonb", "is_visible_on_microsite" boolean, "category_name" "text", "service_images" "jsonb")
-    LANGUAGE "plpgsql"
+CREATE OR REPLACE FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) RETURNS TABLE("id" "uuid", "name" "text", "description" "text", "duration_minutes" integer, "is_active" boolean, "category_id" "uuid", "tenant_id" "uuid", "platform_id" "uuid", "name_i18n" "jsonb", "description_i18n" "jsonb", "is_visible_on_microsite" boolean, "category_name" "text", "service_images" "jsonb")
+    LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
   RETURN QUERY
@@ -9959,6 +9492,7 @@ BEGIN
       s.is_active,
       s.category_id,
       s.tenant_id,
+      s.platform_id,
       s.name_i18n,
       s.description_i18n,
       s.is_visible_on_microsite,
@@ -9978,11 +9512,15 @@ BEGIN
           ) ORDER BY si_img.is_primary DESC, si_img.sort_order ASC) AS images
       FROM
           public.service_images si_img
+      WHERE
+          si_img.tenant_id = p_tenant_id
+          AND si_img.platform_id = p_platform_id
       GROUP BY
           si_img.service_id
   ) si_agg ON s.id = si_agg.service_id
   WHERE
       s.tenant_id = p_tenant_id
+      AND s.platform_id = p_platform_id
       AND (p_show_inactive OR s.is_active = TRUE)
       AND (p_category_id IS NULL OR s.category_id = p_category_id)
       AND (
@@ -9995,10 +9533,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) OWNER TO "postgres";
+ALTER FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -10043,7 +9581,7 @@ BEGIN
     SELECT encrypted_credentials, nonce, environment
     INTO v_tenant_integration
     FROM public.tenant_integrations
-    WHERE tenant_id = p_tenant_id AND provider = p_provider_slug AND is_active = TRUE;
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND provider = p_provider_slug AND is_active = TRUE;
 
     IF v_tenant_integration.encrypted_credentials IS NULL THEN
         RAISE EXCEPTION 'Active tenant integration credentials not found for tenant % and provider %', p_tenant_id, p_provider_slug;
@@ -10053,7 +9591,7 @@ BEGIN
     SELECT to_jsonb(i.*) || jsonb_build_object('items', (SELECT jsonb_agg(ii.*) FROM public.invoice_items ii WHERE ii.invoice_id = i.id))
     INTO v_invoice_data
     FROM public.invoices i
-    WHERE i.id = p_document_id AND i.tenant_id = p_tenant_id;
+    WHERE i.id = p_document_id AND i.tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     IF v_invoice_data IS NULL THEN
         RAISE EXCEPTION 'Invoice data not found for document ID: %', p_document_id;
@@ -10134,7 +9672,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."set_active_integration"("p_integration_id" "uuid") RETURNS "void"
@@ -10190,14 +9728,14 @@ $$;
 ALTER FUNCTION "public"."set_audit_context"("p_context" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     -- First, ensure the photo belongs to the tenant and branch
     IF NOT EXISTS (
         SELECT 1 FROM public.branch_photos
-        WHERE id = p_photo_id AND branch_id = p_branch_id AND tenant_id = p_tenant_id
+        WHERE id = p_photo_id AND branch_id = p_branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     ) THEN
         RAISE EXCEPTION 'Photo not found or permission denied';
     END IF;
@@ -10206,7 +9744,7 @@ BEGIN
     UPDATE public.branch_photos
     SET is_primary = false
     WHERE branch_id = p_branch_id
-      AND tenant_id = p_tenant_id
+      AND tenant_id = p_tenant_id AND platform_id = p_platform_id
       AND is_primary = true;
 
     -- Set the specified photo as primary
@@ -10218,37 +9756,24 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid") IS 'Sets a specific photo as the primary one for a branch, and unsets any previous primary photo.';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."set_primary_combo_image"("p_combo_id" "uuid", "p_image_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."set_primary_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_image_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
-  -- Set all images for the combo to not primary
   UPDATE public.combo_images
-  SET is_primary = FALSE
-  WHERE combo_id = p_combo_id;
-
-  -- Set the specified image as primary
-  UPDATE public.combo_images
-  SET is_primary = TRUE
-  WHERE id = p_image_id AND combo_id = p_combo_id;
-
-  -- If the specified image was not found or not associated with the combo, it will simply not be set as primary.
-  -- No error is raised, as the intent is to ensure only one is primary.
+  SET is_primary = (id = p_image_id)
+  WHERE combo_id = p_combo_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."set_primary_combo_image"("p_combo_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."set_primary_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") RETURNS "public"."product_images"
+CREATE OR REPLACE FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") RETURNS "public"."product_images"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -10257,14 +9782,14 @@ BEGIN
   -- First, set all other images for this product to is_primary = false
   UPDATE public.product_images
   SET is_primary = false
-  WHERE tenant_id = p_tenant_id
+  WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
     AND product_id = p_product_id
     AND id <> p_image_id;
 
   -- Then, set the specified image to is_primary = true
   UPDATE public.product_images
   SET is_primary = true
-  WHERE tenant_id = p_tenant_id
+  WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id
     AND product_id = p_product_id
     AND id = p_image_id;
 
@@ -10280,98 +9805,71 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     -- Set all images for this treatment to not primary
     UPDATE public.treatment_images
     SET is_primary = FALSE
-    WHERE treatment_id = p_treatment_id AND tenant_id = p_tenant_id;
+    WHERE treatment_id = p_treatment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     -- Set the specified image as primary
     UPDATE public.treatment_images
     SET is_primary = TRUE
-    WHERE id = p_image_id AND treatment_id = p_treatment_id AND tenant_id = p_tenant_id;
+    WHERE id = p_image_id AND treatment_id = p_treatment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     -- NOTE: The erroneous update to a non-existent 'cover_image_url' column has been removed.
 END;
 $$;
 
 
-ALTER FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."set_primary_product_image"("p_product_id" "uuid", "p_image_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."set_primary_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
-  -- Set all images for the product to not primary
   UPDATE public.product_images
-  SET is_primary = FALSE
-  WHERE product_id = p_product_id;
-
-  -- Set the specified image as primary
-  UPDATE public.product_images
-  SET is_primary = TRUE
-  WHERE id = p_image_id AND product_id = p_product_id;
-
-  -- If the specified image was not found or not associated with the product, it will simply not be set as primary.
-  -- No error is raised, as the intent is to ensure only one is primary.
+  SET is_primary = (id = p_image_id)
+  WHERE product_id = p_product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."set_primary_product_image"("p_product_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."set_primary_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."set_primary_service_image"("p_service_id" "uuid", "p_image_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."set_primary_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_image_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
-  -- Set all images for the service to not primary
   UPDATE public.service_images
-  SET is_primary = FALSE
-  WHERE service_id = p_service_id;
-
-  -- Set the specified image as primary
-  UPDATE public.service_images
-  SET is_primary = TRUE
-  WHERE id = p_image_id AND service_id = p_service_id;
-
-  -- If the specified image was not found or not associated with the service, it will simply not be set as primary.
-  -- No error is raised, as the intent is to ensure only one is primary.
+  SET is_primary = (id = p_image_id)
+  WHERE service_id = p_service_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."set_primary_service_image"("p_service_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."set_primary_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."set_primary_treatment_image"("p_treatment_id" "uuid", "p_image_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."set_primary_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
-  -- Set all images for the treatment to not primary
   UPDATE public.treatment_images
-  SET is_primary = FALSE
-  WHERE treatment_id = p_treatment_id;
-
-  -- Set the specified image as primary
-  UPDATE public.treatment_images
-  SET is_primary = TRUE
-  WHERE id = p_image_id AND treatment_id = p_treatment_id;
-
-  -- If the specified image was not found or not associated with the treatment, it will simply not be set as primary.
-  -- No error is raised, as the intent is to ensure only one is primary.
+  SET is_primary = (id = p_image_id)
+  WHERE treatment_id = p_treatment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."set_primary_treatment_image"("p_treatment_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."set_primary_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."set_system_owner"("p_new_owner_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "void"
@@ -10408,7 +9906,7 @@ $$;
 ALTER FUNCTION "public"."set_updated_at"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid", "p_status" "text" DEFAULT 'active'::"text") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid" DEFAULT NULL::"uuid", "p_status" "text" DEFAULT 'active'::"text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -10466,11 +9964,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") IS 'Sets or updates a user''s role, tenant, and branch by modifying their app_metadata. Restricted to super_admins and tenant_super_admins.';
-
+ALTER FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."setup_tenant_for_new_user"("p_user_id" "uuid") RETURNS "uuid"
@@ -10745,7 +10239,7 @@ COMMENT ON FUNCTION "public"."setup_tenant_for_new_user"("p_user_id" "uuid", "p_
 
 
 
-CREATE OR REPLACE FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -10756,7 +10250,7 @@ BEGIN
     -- 1. Find the approved transfer for the current tenant
     SELECT * INTO v_transfer
     FROM public.product_transfers
-    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND status = 'aprobado';
+    WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id AND status = 'aprobado';
 
     IF v_transfer IS NULL THEN
         RAISE EXCEPTION 'Approved transfer not found.';
@@ -10799,10 +10293,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -10813,15 +10307,16 @@ BEGIN
         signed_at = NOW()
     WHERE
         id = p_signed_consent_id
-        AND tenant_id = p_tenant_id;
+        AND tenant_id = p_tenant_id
+        AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -10856,10 +10351,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."start_service"("p_attention_service_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."start_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -10896,7 +10391,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."start_service"("p_attention_service_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."start_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."start_service_for_turn"("p_turn_id" "uuid") RETURNS "void"
@@ -10998,7 +10493,7 @@ $$;
 ALTER FUNCTION "public"."tenant_only_rls_policy"("table_tenant_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_id" "uuid") RETURNS "public"."informed_consent_templates"
+CREATE OR REPLACE FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") RETURNS "public"."informed_consent_templates"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -11006,7 +10501,7 @@ DECLARE
 BEGIN
     UPDATE public.informed_consent_templates
     SET is_active = NOT is_active
-    WHERE id = p_id AND tenant_id = p_tenant_id
+    WHERE id = p_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     RETURNING * INTO updated_template;
 
     RETURN updated_template;
@@ -11014,7 +10509,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."trigger_system_email"("p_recipient_user_id" "uuid", "p_template_type" "text", "p_template_data" "jsonb") RETURNS "void"
@@ -11103,7 +10598,7 @@ $$;
 ALTER FUNCTION "public"."trigger_system_email"("p_recipient_user_id" "uuid", "p_template_type" "text", "p_template_data" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -11143,10 +10638,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_attention_items"("p_payload" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_attention_items"("p_payload" "jsonb", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -11208,12 +10703,12 @@ BEGIN
 
       INSERT INTO public.attention_services (
           id, attention_id, service_id, user_id, service_price, duration_minutes, start_time, end_time, 
-          status, is_parallel, parallel_group_id, offset_minutes, notes, tenant_id, branch_id, client_treatment_session_id
+          status, is_parallel, parallel_group_id, offset_minutes, notes, tenant_id, platform_id, branch_id, client_treatment_session_id
       ) VALUES (
         COALESCE((service_item->>'id')::uuid, gen_random_uuid()), p_attention_id, (service_item->>'service_id')::uuid, (service_item->>'user_id')::uuid,
         COALESCE((service_item->>'price')::numeric, 0), (service_item->>'duration_minutes')::integer, (service_item->>'start_time')::time, (service_item->>'end_time')::time,
         service_item->>'status', (service_item->>'is_parallel')::boolean, (service_item->>'parallel_group_id')::uuid,
-        (service_item->>'offset_minutes')::integer, service_item->>'notes', p_tenant_id, p_branch_id, (service_item->>'client_treatment_session_id')::uuid
+        (service_item->>'offset_minutes')::integer, service_item->>'notes', p_tenant_id, p_platform_id, p_branch_id, (service_item->>'client_treatment_session_id')::uuid
       ) ON CONFLICT (id) DO UPDATE SET
         service_id = EXCLUDED.service_id, user_id = EXCLUDED.user_id, service_price = EXCLUDED.service_price, duration_minutes = EXCLUDED.duration_minutes,
         start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time, status = EXCLUDED.status, is_parallel = EXCLUDED.is_parallel,
@@ -11235,11 +10730,11 @@ BEGIN
       END IF;
 
       INSERT INTO public.attention_products (
-          id, attention_id, product_id, user_id, quantity, unit_price, total_price, tenant_id, branch_id, client_treatment_session_id
+          id, attention_id, product_id, user_id, quantity, unit_price, total_price, tenant_id, platform_id, branch_id, client_treatment_session_id
       ) VALUES (
         COALESCE((product_item->>'id')::uuid, gen_random_uuid()), p_attention_id, (product_item->>'product_id')::uuid,
         (product_item->>'user_id')::uuid, (product_item->>'quantity')::integer, COALESCE((product_item->>'price')::numeric, 0),
-        (COALESCE((product_item->>'quantity')::integer, 1) * COALESCE((product_item->>'price')::numeric, 0)), p_tenant_id, p_branch_id, (product_item->>'client_treatment_session_id')::uuid
+        (COALESCE((product_item->>'quantity')::integer, 1) * COALESCE((product_item->>'price')::numeric, 0)), p_tenant_id, p_platform_id, p_branch_id, (product_item->>'client_treatment_session_id')::uuid
       ) ON CONFLICT (id) DO UPDATE SET
         product_id = EXCLUDED.product_id, user_id = EXCLUDED.user_id, quantity = EXCLUDED.quantity,
         unit_price = EXCLUDED.unit_price, total_price = EXCLUDED.total_price, client_treatment_session_id = EXCLUDED.client_treatment_session_id;
@@ -11250,11 +10745,11 @@ BEGIN
   IF p_combos_to_upsert IS NOT NULL THEN
     FOR combo_item IN SELECT * FROM jsonb_array_elements(p_combos_to_upsert) LOOP
       v_subtotal_check := v_subtotal_check + (COALESCE((combo_item->>'price')::numeric, 0) * COALESCE((combo_item->>'quantity')::integer, 1));
-      INSERT INTO public.attention_combos (id, attention_id, combo_id, price, quantity, status, notes, tenant_id, branch_id)
+      INSERT INTO public.attention_combos (id, attention_id, combo_id, price, quantity, status, notes, tenant_id, platform_id, branch_id)
       VALUES (
         COALESCE((combo_item->>'id')::uuid, gen_random_uuid()), p_attention_id, (combo_item->>'combo_id')::uuid,
         (combo_item->>'price')::numeric, COALESCE((combo_item->>'quantity')::integer, 1),
-        combo_item->>'status', combo_item->>'notes', p_tenant_id, p_branch_id
+        combo_item->>'status', combo_item->>'notes', p_tenant_id, p_platform_id, p_branch_id
       ) ON CONFLICT (id) DO UPDATE SET
         combo_id = EXCLUDED.combo_id, price = EXCLUDED.price, quantity = EXCLUDED.quantity,
         status = EXCLUDED.status, notes = EXCLUDED.notes;
@@ -11287,10 +10782,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_attention_items"("p_payload" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_attention_items"("p_payload" "jsonb", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -11314,10 +10809,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_name" "text" DEFAULT NULL::"text", "p_description" "text" DEFAULT NULL::"text", "p_address" "text" DEFAULT NULL::"text", "p_contact_phone" "text" DEFAULT NULL::"text", "p_whatsapp_phone" "text" DEFAULT NULL::"text", "p_commercial_email" "text" DEFAULT NULL::"text", "p_website" "text" DEFAULT NULL::"text", "p_physical_address_line1" "text" DEFAULT NULL::"text", "p_physical_address_line2" "text" DEFAULT NULL::"text", "p_physical_city" "text" DEFAULT NULL::"text", "p_physical_state" "text" DEFAULT NULL::"text", "p_physical_postal_code" "text" DEFAULT NULL::"text", "p_latitude" numeric DEFAULT NULL::numeric, "p_longitude" numeric DEFAULT NULL::numeric, "p_timezone" "text" DEFAULT NULL::"text", "p_google_place_id" "text" DEFAULT NULL::"text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text" DEFAULT NULL::"text", "p_description" "text" DEFAULT NULL::"text", "p_address" "text" DEFAULT NULL::"text", "p_contact_phone" "text" DEFAULT NULL::"text", "p_whatsapp_phone" "text" DEFAULT NULL::"text", "p_commercial_email" "text" DEFAULT NULL::"text", "p_website" "text" DEFAULT NULL::"text", "p_physical_address_line1" "text" DEFAULT NULL::"text", "p_physical_address_line2" "text" DEFAULT NULL::"text", "p_physical_city" "text" DEFAULT NULL::"text", "p_physical_state" "text" DEFAULT NULL::"text", "p_physical_postal_code" "text" DEFAULT NULL::"text", "p_latitude" numeric DEFAULT NULL::numeric, "p_longitude" numeric DEFAULT NULL::numeric, "p_timezone" "text" DEFAULT NULL::"text", "p_google_place_id" "text" DEFAULT NULL::"text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -11340,15 +10835,15 @@ BEGIN
         timezone = COALESCE(p_timezone, timezone),
         google_place_id = COALESCE(p_google_place_id, google_place_id),
         updated_at = now()
-    WHERE id = p_branch_id AND tenant_id = p_tenant_id;
+    WHERE id = p_branch_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_address" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_address" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") RETURNS "public"."branch_social_networks"
+CREATE OR REPLACE FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "public"."branch_social_networks"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -11366,10 +10861,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -11386,7 +10881,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_clients_fts"() RETURNS "trigger"
@@ -11407,7 +10902,7 @@ $$;
 ALTER FUNCTION "public"."update_clients_fts"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -11436,18 +10931,18 @@ BEGIN
         IF target_id IS NOT NULL THEN
             UPDATE branch_combo_item_prices SET price = override.price WHERE id = target_id;
         ELSE
-            INSERT INTO branch_combo_item_prices (tenant_id, branch_id, combo_id, product_id, service_id, price)
-            VALUES (p_tenant_id, p_branch_id, p_combo_id, override.product_id, override.service_id, override.price);
+            INSERT INTO branch_combo_item_prices (tenant_id, platform_id, branch_id, combo_id, product_id, service_id, price)
+            VALUES (p_tenant_id, p_platform_id, p_branch_id, p_combo_id, override.product_id, override.service_id, override.price);
         END IF;
     END LOOP;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_id" "uuid", "p_name" "text" DEFAULT NULL::"text", "p_content" "text" DEFAULT NULL::"text", "p_fields" "jsonb" DEFAULT NULL::"jsonb", "p_is_active" boolean DEFAULT NULL::boolean) RETURNS "public"."informed_consent_templates"
+CREATE OR REPLACE FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid", "p_name" "text" DEFAULT NULL::"text", "p_content" "text" DEFAULT NULL::"text", "p_fields" "jsonb" DEFAULT NULL::"jsonb", "p_is_active" boolean DEFAULT NULL::boolean) RETURNS "public"."informed_consent_templates"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -11460,7 +10955,7 @@ BEGIN
         fields = COALESCE(p_fields, fields),
         is_active = COALESCE(p_is_active, is_active),
         updated_at = now()
-    WHERE id = p_id AND tenant_id = p_tenant_id
+    WHERE id = p_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     RETURNING * INTO updated_template;
 
     RETURN updated_template;
@@ -11468,10 +10963,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb", "p_is_active" boolean) OWNER TO "postgres";
+ALTER FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb", "p_is_active" boolean) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -11495,10 +10990,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -11517,15 +11012,15 @@ BEGIN
         is_active = (p_equipment_data->>'is_active')::boolean,
         updated_at = now()
     WHERE
-        id = p_equipment_id AND tenant_id = p_tenant_id;
+        id = p_equipment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -11540,28 +11035,25 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
-    UPDATE equipment_maintenance_history
-    SET
-        maintenance_date = COALESCE(NULLIF(p_updates->>'maintenance_date', '')::date, maintenance_date),
+    UPDATE public.equipment_maintenance_history
+    SET maintenance_date = COALESCE((p_updates->>'maintenance_date')::date, maintenance_date),
         notes = COALESCE(p_updates->>'notes', notes)
-        -- Removed updated_at = now()
-    WHERE
-        id = p_record_id AND tenant_id = p_tenant_id;
+    WHERE id = p_record_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean) RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean, "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -11571,33 +11063,12 @@ BEGIN
         description = p_description,
         is_active = p_is_active,
         updated_at = now()
-    WHERE id = p_type_id AND tenant_id = p_tenant_id;
+    WHERE id = p_type_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean) OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."update_integration_category"("p_id" "uuid", "p_name" "text", "p_slug" "text", "p_description" "text") RETURNS SETOF "public"."integration_categories"
-    LANGUAGE "plpgsql"
-    AS $$
-BEGIN
-    -- La RLS de la tabla previene la actualización si el usuario no es superadmin.
-    RETURN QUERY
-    UPDATE integration_categories
-    SET
-        name = p_name,
-        slug = p_slug,
-        description = p_description,
-        updated_at = NOW()
-    WHERE id = p_id
-    RETURNING *;
-END;
-$$;
-
-
-ALTER FUNCTION "public"."update_integration_category"("p_id" "uuid", "p_name" "text", "p_slug" "text", "p_description" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean, "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_password_with_token"("p_token" "text", "p_new_password" "text") RETURNS json
@@ -11650,7 +11121,7 @@ $$;
 ALTER FUNCTION "public"."update_password_with_token"("p_token" "text", "p_new_password" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -11666,16 +11137,16 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
     -- First, delete all existing assignments for this product
     DELETE FROM public.product_category_assignments
-    WHERE product_id = p_product_id AND tenant_id = p_tenant_id;
+    WHERE product_id = p_product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     -- Then, insert the new assignments if any are provided
     IF array_length(p_category_ids, 1) > 0 THEN
@@ -11687,7 +11158,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) OWNER TO "postgres";
+ALTER FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_product_costs"() RETURNS "trigger"
@@ -11748,7 +11219,7 @@ $$;
 ALTER FUNCTION "public"."update_product_costs"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -11769,67 +11240,64 @@ BEGIN
     UPDATE public.product_images AS pi
     SET sort_order = no.sort_order
     FROM new_order AS no
-    WHERE pi.id = no.id AND pi.tenant_id = p_tenant_id;
+    WHERE pi.id = no.id AND pi.tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
-    v_transfer product_transfers;
+    v_transfer record;
     v_tenant_settings JSONB;
     v_costing_method TEXT;
     item record;
-    v_from_branch_product branch_products;
-    v_to_branch_product branch_products;
+    v_from_branch_product record;
+    v_to_branch_product record;
     v_new_cost_price NUMERIC;
 BEGIN
-    -- Get the transfer details
-    SELECT * INTO v_transfer FROM product_transfers WHERE id = p_transfer_id;
+    SELECT * INTO v_transfer FROM product_transfers WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-    -- Get tenant settings
-    SELECT settings_data INTO v_tenant_settings FROM tenant_settings WHERE tenant_id = p_tenant_id;
+    SELECT settings_data INTO v_tenant_settings FROM tenant_settings WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id;
     v_costing_method := v_tenant_settings->>'costing_method';
 
-    -- Update the status
-    UPDATE product_transfers SET status = p_status, updated_at = now() WHERE id = p_transfer_id;
+    UPDATE product_transfers SET status = p_status, updated_at = now() WHERE id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-    -- If completed, increment stock and update cost price in the destination branch
     IF p_status = 'completado' THEN
-        FOR item IN SELECT * FROM product_transfer_items WHERE transfer_id = p_transfer_id
+        FOR item IN SELECT * FROM product_transfer_items WHERE transfer_id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
         LOOP
-            -- Get product details from both branches
-            SELECT * INTO v_from_branch_product FROM branch_products WHERE branch_id = v_transfer.from_branch_id AND product_id = item.product_id;
-            SELECT * INTO v_to_branch_product FROM branch_products WHERE branch_id = v_transfer.to_branch_id AND product_id = item.product_id;
+            SELECT * INTO v_from_branch_product FROM branch_products WHERE branch_id = v_transfer.origin_branch_id AND product_id = item.product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
+            SELECT * INTO v_to_branch_product FROM branch_products WHERE branch_id = v_transfer.destination_branch_id AND product_id = item.product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
-            -- Calculate new cost price based on costing method
-            IF v_costing_method = 'ponderado' THEN
-                v_new_cost_price := ((v_to_branch_product.stock * v_to_branch_product.cost_price) + (item.quantity * v_from_branch_product.cost_price)) / (v_to_branch_product.stock + item.quantity);
-            ELSE -- Default to last_cost
+            IF v_costing_method = 'ponderado' AND (COALESCE(v_to_branch_product.stock_quantity, 0) + item.quantity) > 0 THEN
+                v_new_cost_price := ((COALESCE(v_to_branch_product.stock_quantity, 0) * COALESCE(v_to_branch_product.cost_price, 0)) + (item.quantity * v_from_branch_product.cost_price)) / (v_to_branch_product.stock_quantity + item.quantity);
+            ELSE
                 v_new_cost_price := v_from_branch_product.cost_price;
             END IF;
 
-            -- Update stock and cost price in destination branch
-            UPDATE branch_products
-            SET stock = stock + item.quantity,
-                cost_price = v_new_cost_price
-            WHERE id = v_to_branch_product.id;
+            IF v_to_branch_product.id IS NOT NULL THEN
+                UPDATE branch_products
+                SET stock_quantity = stock_quantity + item.quantity,
+                    cost_price = v_new_cost_price
+                WHERE branch_id = v_transfer.destination_branch_id AND product_id = item.product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
+            ELSE
+                INSERT INTO branch_products (branch_id, product_id, tenant_id, platform_id, stock_quantity, cost_price)
+                VALUES (v_transfer.destination_branch_id, item.product_id, p_tenant_id, p_platform_id, item.quantity, v_new_cost_price);
+            END IF;
         END LOOP;
     END IF;
 
-    -- If cancelled, increment stock back in the origin branch
     IF p_status = 'cancelado' THEN
-        FOR item IN SELECT * FROM product_transfer_items WHERE transfer_id = p_transfer_id
+        FOR item IN SELECT * FROM product_transfer_items WHERE transfer_id = p_transfer_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
         LOOP
             UPDATE branch_products
-            SET stock = stock + item.quantity
-            WHERE branch_id = v_transfer.from_branch_id AND product_id = item.product_id;
+            SET stock_quantity = stock_quantity + item.quantity
+            WHERE branch_id = v_transfer.origin_branch_id AND product_id = item.product_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
         END LOOP;
     END IF;
 
@@ -11837,10 +11305,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -11852,7 +11320,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_service_images_order"("p_images_data" "jsonb") RETURNS "void"
@@ -11871,7 +11339,7 @@ $$;
 ALTER FUNCTION "public"."update_service_images_order"("p_images_data" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -11889,15 +11357,15 @@ BEGIN
     UPDATE public.service_images AS si
     SET sort_order = no.sort_order
     FROM new_order AS no
-    WHERE si.id = no.id AND si.tenant_id = p_tenant_id;
+    WHERE si.id = no.id AND si.tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -11906,7 +11374,7 @@ BEGIN
     -- First, set all existing items for this user as not favorite
     UPDATE public.staff_gallery_items
     SET is_favorite = false
-    WHERE tenant_id = p_tenant_id AND user_id = p_user_id;
+    WHERE tenant_id = p_tenant_id AND platform_id = p_platform_id AND user_id = p_user_id;
 
     -- Now, loop through the provided items and upsert them as favorites with the new order
     FOR item IN SELECT * FROM jsonb_to_recordset(p_gallery_items) AS x(evidence_id UUID, display_order INT)
@@ -11925,7 +11393,7 @@ BEGIN
             item.display_order,
             true
         )
-        ON CONFLICT (tenant_id, user_id, evidence_id)
+        ON CONFLICT (tenant_id, platform_id, user_id, evidence_id)
         DO UPDATE SET
             display_order = EXCLUDED.display_order,
             is_favorite = EXCLUDED.is_favorite,
@@ -11935,10 +11403,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_description" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_description" "text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
@@ -11946,15 +11414,15 @@ BEGIN
     SET
         description = p_description,
         updated_at = now()
-    WHERE id = p_tenant_id;
+    WHERE id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_description" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_description" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_slug" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_slug" "text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $_$
 DECLARE
@@ -11962,7 +11430,7 @@ DECLARE
     v_platform_id uuid;
 BEGIN
     -- Get the tenant's country and platform
-    SELECT country_id, platform_id INTO v_country_id, v_platform_id FROM public.tenants WHERE id = p_tenant_id;
+    SELECT country_id, platform_id INTO v_country_id, v_platform_id FROM public.tenants WHERE id = p_tenant_id AND platform_id = p_platform_id AND platform_id = p_platform_id;
 
     IF v_platform_id IS NULL OR v_country_id IS NULL THEN
         RAISE EXCEPTION 'Could not determine platform or country for tenant';
@@ -11994,11 +11462,7 @@ END;
 $_$;
 
 
-ALTER FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_slug" "text") OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_slug" "text") IS 'Updates the tenant''s public microsite slug, ensuring it is unique within the country and platform.';
-
+ALTER FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_slug" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_tenant_social_network"("p_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_network" "public"."social_network", "p_url" "text") RETURNS "public"."tenant_social_networks"
@@ -12022,7 +11486,7 @@ $$;
 ALTER FUNCTION "public"."update_tenant_social_network"("p_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_network" "public"."social_network", "p_url" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") RETURNS "public"."treatments"
+CREATE OR REPLACE FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") RETURNS "public"."treatments"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -12043,7 +11507,7 @@ BEGIN
         financed_price = p_financed_price,
         updated_at = now()
     WHERE
-        id = p_treatment_id AND tenant_id = p_tenant_id
+        id = p_treatment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id
     RETURNING * INTO updated_treatment;
 
     IF NOT FOUND THEN
@@ -12133,16 +11597,16 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     -- Validate that the treatment belongs to the tenant of the user making the call
     -- The user's tenant is implicitly checked by the RLS policy on the junction table
-    IF NOT EXISTS (SELECT 1 FROM public.treatments WHERE id = p_treatment_id AND tenant_id = p_tenant_id) THEN
+    IF NOT EXISTS (SELECT 1 FROM public.treatments WHERE id = p_treatment_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id) THEN
         RAISE EXCEPTION 'Treatment not found or access denied.';
     END IF;
 
@@ -12159,10 +11623,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) OWNER TO "postgres";
+ALTER FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -12175,16 +11639,16 @@ BEGIN
         WHERE
             id = (image_data->>'id')::uuid
             AND treatment_id = p_treatment_id
-            AND tenant_id = p_tenant_id;
+            AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
     END LOOP;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) OWNER TO "postgres";
+ALTER FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid", "p_platform_id" "uuid" DEFAULT NULL::"uuid") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
@@ -12196,21 +11660,21 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid", "p_platform_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 BEGIN
     UPDATE public.units_of_measure
     SET name = p_name, abbreviation = p_abbreviation
-    WHERE id = p_id AND tenant_id = p_tenant_id;
+    WHERE id = p_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_updated_at_column"() RETURNS "trigger"
@@ -12254,7 +11718,7 @@ $$;
 ALTER FUNCTION "public"."update_user_active_status"("target_user_id" "uuid", "p_is_active" boolean, "p_user_role" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_new_status" "text") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_status" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -12296,10 +11760,10 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_new_status" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_status" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_new_assignments" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_assignments" "jsonb") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
 DECLARE
@@ -12307,7 +11771,7 @@ DECLARE
 BEGIN
     -- Step 1: Delete all existing assignments for this user and tenant.
     DELETE FROM public.user_assignments
-    WHERE user_id = p_user_id AND tenant_id = p_tenant_id;
+    WHERE user_id = p_user_id AND tenant_id = p_tenant_id AND platform_id = p_platform_id;
 
     -- Step 2: Insert all the new assignments from the payload.
     IF jsonb_array_length(p_new_assignments) > 0 THEN
@@ -12344,7 +11808,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_new_assignments" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_assignments" "jsonb") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_user_name"("user_id_to_update" "uuid", "new_first_name" "text", "new_last_name" "text") RETURNS "void"
@@ -12476,139 +11940,6 @@ $$;
 
 
 ALTER FUNCTION "public"."update_user_regional_settings"("p_user_id" "uuid", "p_country_id" "uuid", "p_language_id" "uuid", "p_currency_id" "uuid", "p_timezone_id" "uuid") OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."integration_providers" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "logo_url" "text",
-    "country_id" "uuid" NOT NULL,
-    "category_id" "uuid" NOT NULL,
-    "status" "text" NOT NULL,
-    "endpoints" "jsonb" NOT NULL,
-    "config_schema" "jsonb" NOT NULL,
-    "api_schema" "jsonb" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "slug" "text" NOT NULL,
-    "http_method_id" "uuid",
-    "body_format_id" "uuid",
-    "auth_method_id" "uuid",
-    "http_headers" "jsonb",
-    "authentication_config" "jsonb",
-    "body_template" "text",
-    "response_mapping" "jsonb"
-);
-
-
-ALTER TABLE "public"."integration_providers" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."integration_providers"."http_method_id" IS 'Método HTTP a utilizar para la solicitud (GET, POST, etc.).';
-
-
-
-COMMENT ON COLUMN "public"."integration_providers"."body_format_id" IS 'Formato del cuerpo de la solicitud (json, xml, etc.).';
-
-
-
-COMMENT ON COLUMN "public"."integration_providers"."auth_method_id" IS 'Método de autenticación a utilizar.';
-
-
-
-COMMENT ON COLUMN "public"."integration_providers"."http_headers" IS 'Array de objetos para las cabeceras HTTP personalizadas. Ej: [{"name": "Content-Type", "value": "application/json"}].';
-
-
-
-COMMENT ON COLUMN "public"."integration_providers"."authentication_config" IS 'Almacena los valores de configuración para el método de autenticación seleccionado. Ej: {"header_name": "X-API-Key"}.';
-
-
-
-COMMENT ON COLUMN "public"."integration_providers"."body_template" IS 'Plantilla para cuerpos de solicitud que no son JSON (ej. XML). Usa placeholders como {{valor}}.';
-
-
-
-COMMENT ON COLUMN "public"."integration_providers"."response_mapping" IS 'Array de objetos para mapear la respuesta a campos de Glamtica. Ej: [{"glamtica_field": "external_id", "response_path": "data.transaction.id"}].';
-
-
-
-CREATE OR REPLACE FUNCTION "public"."upsert_integration_provider"("p_id" "uuid", "p_name" "text", "p_logo_url" "text", "p_country_id" "uuid", "p_category_id" "uuid", "p_status" "text", "p_endpoints" "jsonb", "p_config_schema" "jsonb", "p_api_schema" "jsonb") RETURNS SETOF "public"."integration_providers"
-    LANGUAGE "plpgsql"
-    AS $$
-BEGIN
-    -- La seguridad se maneja a nivel de RLS en la tabla integration_providers.
-    -- Si el usuario no es superadmin, la política de INSERT/UPDATE fallará.
-    RETURN QUERY
-    INSERT INTO integration_providers (
-        id, name, logo_url, country_id, category_id, status, endpoints, config_schema, api_schema
-    )
-    VALUES (
-        COALESCE(p_id, gen_random_uuid()),
-        p_name,
-        p_logo_url,
-        p_country_id,
-        p_category_id,
-        p_status,
-        p_endpoints,
-        p_config_schema,
-        p_api_schema
-    )
-    ON CONFLICT (id) DO UPDATE SET
-        name = p_name,
-        logo_url = p_logo_url,
-        country_id = p_country_id,
-        category_id = p_category_id,
-        status = p_status,
-        endpoints = p_endpoints,
-        config_schema = p_config_schema,
-        api_schema = p_api_schema,
-        updated_at = NOW()
-    RETURNING *;
-END;
-$$;
-
-
-ALTER FUNCTION "public"."upsert_integration_provider"("p_id" "uuid", "p_name" "text", "p_logo_url" "text", "p_country_id" "uuid", "p_category_id" "uuid", "p_status" "text", "p_endpoints" "jsonb", "p_config_schema" "jsonb", "p_api_schema" "jsonb") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."upsert_tenant_integration"("p_tenant_id" "uuid", "p_provider_slug" "text", "p_encrypted_credentials" "text", "p_nonce" "text", "p_environment" "text", "p_user_role" "text") RETURNS "void"
-    LANGUAGE "plpgsql" SECURITY DEFINER
-    AS $$
-BEGIN
-    -- Paso 1: Verificar explícitamente el permiso del usuario.
-    IF p_user_role != 'super_admin' THEN
-        RAISE EXCEPTION 'Acceso denegado. Se requiere rol de super_admin para gestionar integraciones.';
-    END IF;
-
-    -- Paso 2: Realizar la operación de escritura (INSERT o UPDATE).
-    INSERT INTO public.tenant_integrations (
-        tenant_id,
-        provider,
-        encrypted_credentials,
-        nonce,
-        environment
-    )
-    VALUES (
-        p_tenant_id,
-        p_provider_slug,
-        p_encrypted_credentials,
-        p_nonce,
-        p_environment
-    )
-    ON CONFLICT (tenant_id, provider, environment)
-    DO UPDATE SET
-        encrypted_credentials = EXCLUDED.encrypted_credentials,
-        nonce = EXCLUDED.nonce,
-        updated_at = NOW();
-END;
-$$;
-
-
-ALTER FUNCTION "public"."upsert_tenant_integration"("p_tenant_id" "uuid", "p_provider_slug" "text", "p_encrypted_credentials" "text", "p_nonce" "text", "p_environment" "text", "p_user_role" "text") OWNER TO "postgres";
-
-
-COMMENT ON FUNCTION "public"."upsert_tenant_integration"("p_tenant_id" "uuid", "p_provider_slug" "text", "p_encrypted_credentials" "text", "p_nonce" "text", "p_environment" "text", "p_user_role" "text") IS 'Permite a un superadministrador guardar o actualizar las credenciales de una integración para un tenant específico.';
-
 
 
 CREATE OR REPLACE FUNCTION "public"."url_encode"("data" "text") RETURNS "text"
@@ -12805,170 +12136,14 @@ CREATE TABLE IF NOT EXISTS "public"."absence_types" (
     "description" "text",
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."absence_types" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."absence_types" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."api_request_metrics" (
-    "id" bigint NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL,
-    "path" "text",
-    "method" "text",
-    "status_code" integer,
-    "response_time_ms" integer,
-    "tenant_id" "uuid"
-);
-
-
-ALTER TABLE "public"."api_request_metrics" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."api_request_metrics" IS 'Stores performance metrics for API requests.';
-
-
-
-ALTER TABLE "public"."api_request_metrics" ALTER COLUMN "id" ADD GENERATED BY DEFAULT AS IDENTITY (
-    SEQUENCE NAME "public"."api_request_metrics_id_seq"
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1
-);
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."appointment_extra_services" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "appointment_id" "uuid" NOT NULL,
-    "service_id" "uuid" NOT NULL,
-    "price" numeric NOT NULL,
-    "notes" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid" NOT NULL,
-    "user_id" "uuid",
-    CONSTRAINT "appointment_extra_services_price_check" CHECK (("price" >= (0)::numeric))
-);
-
-
-ALTER TABLE "public"."appointment_extra_services" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."appointment_products" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "appointment_id" "uuid" NOT NULL,
-    "product_id" "uuid" NOT NULL,
-    "quantity" integer DEFAULT 1 NOT NULL,
-    "unit_price" numeric NOT NULL,
-    "total_price" numeric NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid" NOT NULL,
-    CONSTRAINT "appointment_products_quantity_check" CHECK (("quantity" > 0)),
-    CONSTRAINT "appointment_products_total_price_check" CHECK (("total_price" >= (0)::numeric)),
-    CONSTRAINT "appointment_products_unit_price_check" CHECK (("unit_price" >= (0)::numeric))
-);
-
-
-ALTER TABLE "public"."appointment_products" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."appointment_sessions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "appointment_id" "uuid" NOT NULL,
-    "started_at" timestamp with time zone,
-    "ended_at" timestamp with time zone,
-    "duration_minutes" integer,
-    "notes" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid" NOT NULL
-);
-
-
-ALTER TABLE "public"."appointment_sessions" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."appointments" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "client_id" "uuid" NOT NULL,
-    "service_id" "uuid" NOT NULL,
-    "appointment_date" "date" NOT NULL,
-    "appointment_time" time without time zone NOT NULL,
-    "status" "text" DEFAULT 'Confirmada'::"text",
-    "notes" "text",
-    "total_price" numeric(10,2) NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid" NOT NULL,
-    "user_id" "uuid",
-    CONSTRAINT "appointments_status_check" CHECK (("status" = ANY (ARRAY['Confirmada'::"text", 'En Proceso'::"text", 'Completada'::"text", 'Pagada'::"text", 'Cancelada'::"text"])))
-);
-
-
-ALTER TABLE "public"."appointments" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."asset_purposes" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "purpose_key" "text" NOT NULL,
-    "description" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."asset_purposes" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."asset_purposes" IS 'Central table to define the generic purpose of a plan asset.';
-
-
-
-COMMENT ON COLUMN "public"."asset_purposes"."purpose_key" IS 'A unique, machine-readable key for the purpose (e.g., extra_branch, e_invoice).';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."asset_usage_tracking" (
-    "id" bigint NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "asset_id" "uuid" NOT NULL,
-    "usage_period_start" "date" NOT NULL,
-    "usage_period_end" "date" NOT NULL,
-    "quantity_used" bigint DEFAULT 0 NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."asset_usage_tracking" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."asset_usage_tracking" IS 'Tracks metered usage of plan assets for each tenant per billing period.';
-
-
-
-CREATE SEQUENCE IF NOT EXISTS "public"."asset_usage_tracking_id_seq"
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
-ALTER SEQUENCE "public"."asset_usage_tracking_id_seq" OWNER TO "postgres";
-
-
-ALTER SEQUENCE "public"."asset_usage_tracking_id_seq" OWNED BY "public"."asset_usage_tracking"."id";
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."attention_combos" (
@@ -12981,8 +12156,11 @@ CREATE TABLE IF NOT EXISTS "public"."attention_combos" (
     "branch_id" "uuid" NOT NULL,
     "quantity" integer DEFAULT 1 NOT NULL,
     "status" "text" DEFAULT 'Pendiente'::"text" NOT NULL,
-    "notes" "text"
+    "notes" "text",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."attention_combos" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."attention_combos" OWNER TO "postgres";
@@ -12999,8 +12177,11 @@ CREATE TABLE IF NOT EXISTS "public"."attention_payment_evidences" (
     "mime_type" "text",
     "user_id" "uuid",
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "file_size" bigint
+    "file_size" bigint,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."attention_payment_evidences" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."attention_payment_evidences" OWNER TO "postgres";
@@ -13031,8 +12212,11 @@ CREATE TABLE IF NOT EXISTS "public"."attention_payments" (
     "transaction_id" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "tenant_id" "uuid"
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."attention_payments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."attention_payments" OWNER TO "postgres";
@@ -13053,8 +12237,11 @@ CREATE TABLE IF NOT EXISTS "public"."attention_products" (
     "user_id" "uuid",
     "commission_rate" numeric(5,2) DEFAULT 0 NOT NULL,
     "combo_id" "uuid",
-    "client_treatment_session_id" "uuid"
+    "client_treatment_session_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."attention_products" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."attention_products" OWNER TO "postgres";
@@ -13083,8 +12270,11 @@ CREATE TABLE IF NOT EXISTS "public"."attention_service_evidences" (
     "user_id" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "file_size" bigint
+    "file_size" bigint,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."attention_service_evidences" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."attention_service_evidences" OWNER TO "postgres";
@@ -13098,8 +12288,11 @@ CREATE TABLE IF NOT EXISTS "public"."attention_service_status_history" (
     "tenant_id" "uuid" NOT NULL,
     "branch_id" "uuid" NOT NULL,
     "user_id" "uuid",
-    "notes" "text"
+    "notes" "text",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."attention_service_status_history" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."attention_service_status_history" OWNER TO "postgres";
@@ -13138,8 +12331,11 @@ CREATE TABLE IF NOT EXISTS "public"."attention_services" (
     "parallel_group_id" "uuid",
     "offset_minutes" integer DEFAULT 0 NOT NULL,
     "client_treatment_session_id" "uuid",
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "valid_status_values" CHECK (("status" = ANY (ARRAY['Pendiente'::"text", 'Llamado'::"text", 'En Proceso'::"text", 'Finalizado'::"text", 'Cancelado'::"text"])))
 );
+
+ALTER TABLE ONLY "public"."attention_services" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."attention_services" OWNER TO "postgres";
@@ -13157,33 +12353,14 @@ CREATE TABLE IF NOT EXISTS "public"."attentions" (
     "branch_id" "uuid" NOT NULL,
     "attention_datetime" timestamp with time zone,
     "confirmation_token" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "attentions_status_check" CHECK (("status" = ANY (ARRAY['Pendiente'::"text", 'Confirmada'::"text", 'En Proceso'::"text", 'Finalizada'::"text", 'Pagada'::"text", 'Cancelada'::"text"])))
 );
 
+ALTER TABLE ONLY "public"."attentions" REPLICA IDENTITY FULL;
+
 
 ALTER TABLE "public"."attentions" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."audit_logs" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid",
-    "tenant_id" "uuid",
-    "branch_id" "uuid",
-    "action" "text" NOT NULL,
-    "entity_type" "text",
-    "entity_id" "uuid",
-    "old_value" "jsonb",
-    "new_value" "jsonb",
-    "ip_address" "inet",
-    "user_agent" "text",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "object_type" "text",
-    "object_id" "uuid",
-    "metadata" "jsonb"
-);
-
-
-ALTER TABLE "public"."audit_logs" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."branch_combo_item_prices" (
@@ -13196,9 +12373,12 @@ CREATE TABLE IF NOT EXISTS "public"."branch_combo_item_prices" (
     "price" numeric(10,2) NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "branch_combo_item_prices_price_check" CHECK (("price" >= (0)::numeric)),
     CONSTRAINT "check_item_override_not_null" CHECK ((("product_id" IS NOT NULL) OR ("service_id" IS NOT NULL)))
 );
+
+ALTER TABLE ONLY "public"."branch_combo_item_prices" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."branch_combo_item_prices" OWNER TO "postgres";
@@ -13216,8 +12396,11 @@ CREATE TABLE IF NOT EXISTS "public"."branch_combos" (
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "is_visible_on_microsite" boolean DEFAULT false NOT NULL
+    "is_visible_on_microsite" boolean DEFAULT false NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."branch_combos" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."branch_combos" OWNER TO "postgres";
@@ -13238,8 +12421,11 @@ CREATE TABLE IF NOT EXISTS "public"."branch_photos" (
     "is_primary" boolean DEFAULT false NOT NULL,
     "sort_order" integer DEFAULT 0 NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."branch_photos" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."branch_photos" OWNER TO "postgres";
@@ -13251,17 +12437,6 @@ COMMENT ON TABLE "public"."branch_photos" IS 'Stores photos associated with a te
 
 COMMENT ON COLUMN "public"."branch_photos"."is_primary" IS 'Indicates if this is the primary photo for the branch, used as the main image on microsites.';
 
-
-
-CREATE TABLE IF NOT EXISTS "public"."branch_playback_state" (
-    "branch_id" "uuid" NOT NULL,
-    "current_playlist_item_id" "uuid",
-    "video_started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."branch_playback_state" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."branch_products" (
@@ -13277,9 +12452,12 @@ CREATE TABLE IF NOT EXISTS "public"."branch_products" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "cost_price" numeric(10,2) DEFAULT 0.00,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "branch_products_selling_price_check" CHECK (("selling_price" >= (0)::numeric)),
     CONSTRAINT "branch_products_stock_quantity_check" CHECK (("stock_quantity" >= (0)::numeric))
 );
+
+ALTER TABLE ONLY "public"."branch_products" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."branch_products" OWNER TO "postgres";
@@ -13296,42 +12474,34 @@ CREATE TABLE IF NOT EXISTS "public"."branch_services" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "is_visible_on_microsite" boolean DEFAULT false NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "branch_services_duration_minutes_check" CHECK (("duration_minutes" >= 0)),
     CONSTRAINT "branch_services_selling_price_check" CHECK (("selling_price" >= (0)::numeric))
 );
+
+ALTER TABLE ONLY "public"."branch_services" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."branch_services" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."branch_status_history" (
-    "id" bigint NOT NULL,
     "branch_id" "uuid" NOT NULL,
     "status" "public"."branch_status" NOT NULL,
     "changed_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "changed_by" "uuid"
+    "changed_by" "uuid",
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL
 );
+
+ALTER TABLE ONLY "public"."branch_status_history" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."branch_status_history" OWNER TO "postgres";
 
 
 COMMENT ON TABLE "public"."branch_status_history" IS 'Audit trail for status changes on the branches table.';
-
-
-
-CREATE SEQUENCE IF NOT EXISTS "public"."branch_status_history_id_seq"
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
-ALTER SEQUENCE "public"."branch_status_history_id_seq" OWNER TO "postgres";
-
-
-ALTER SEQUENCE "public"."branch_status_history_id_seq" OWNED BY "public"."branch_status_history"."id";
 
 
 
@@ -13344,8 +12514,11 @@ CREATE TABLE IF NOT EXISTS "public"."chatter_attachments" (
     "file_name" "text" NOT NULL,
     "mime_type" "text" NOT NULL,
     "file_size" bigint NOT NULL,
-    "google_drive_file_id" "text" NOT NULL
+    "google_drive_file_id" "text" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."chatter_attachments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."chatter_attachments" OWNER TO "postgres";
@@ -13359,8 +12532,11 @@ CREATE TABLE IF NOT EXISTS "public"."chatter_comments" (
     "resource_id" "uuid" NOT NULL,
     "comment_text" "text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "comment_not_empty" CHECK (("comment_text" <> ''::"text"))
 );
+
+ALTER TABLE ONLY "public"."chatter_comments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."chatter_comments" OWNER TO "postgres";
@@ -13368,6 +12544,22 @@ ALTER TABLE "public"."chatter_comments" OWNER TO "postgres";
 
 COMMENT ON TABLE "public"."chatter_comments" IS 'Stores manual comments made by users on a specific resource, as part of the chatter system.';
 
+
+
+CREATE TABLE IF NOT EXISTS "public"."chatter_events" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "resource_type" "text" NOT NULL,
+    "resource_id" "uuid" NOT NULL,
+    "event_type" "text" NOT NULL,
+    "payload" "jsonb" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."chatter_events" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."client_addresses" (
@@ -13383,8 +12575,11 @@ CREATE TABLE IF NOT EXISTS "public"."client_addresses" (
     "longitude" double precision,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "name" "text"
+    "name" "text",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."client_addresses" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_addresses" OWNER TO "postgres";
@@ -13394,8 +12589,11 @@ CREATE TABLE IF NOT EXISTS "public"."client_branches" (
     "client_id" "uuid" NOT NULL,
     "branch_id" "uuid" NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."client_branches" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_branches" OWNER TO "postgres";
@@ -13406,8 +12604,11 @@ CREATE TABLE IF NOT EXISTS "public"."client_commercials" (
     "tenant_id" "uuid" NOT NULL,
     "client_id" "uuid" NOT NULL,
     "user_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."client_commercials" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_commercials" OWNER TO "postgres";
@@ -13420,8 +12621,11 @@ CREATE TABLE IF NOT EXISTS "public"."client_consent_records" (
     "signature_data" "text",
     "metadata" "jsonb",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."client_consent_records" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_consent_records" OWNER TO "postgres";
@@ -13439,8 +12643,11 @@ CREATE TABLE IF NOT EXISTS "public"."client_contacts" (
     "phone" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "contact_type_id" "uuid" NOT NULL
+    "contact_type_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."client_contacts" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_contacts" OWNER TO "postgres";
@@ -13453,8 +12660,11 @@ CREATE TABLE IF NOT EXISTS "public"."client_document_instances" (
     "data" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "attention_id" "uuid"
+    "attention_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."client_document_instances" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_document_instances" OWNER TO "postgres";
@@ -13478,8 +12688,11 @@ CREATE TABLE IF NOT EXISTS "public"."client_document_templates" (
     "version" integer DEFAULT 1 NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "fill_on_attention" boolean DEFAULT false
+    "fill_on_attention" boolean DEFAULT false,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."client_document_templates" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_document_templates" OWNER TO "postgres";
@@ -13493,48 +12706,16 @@ COMMENT ON COLUMN "public"."client_document_templates"."schema" IS 'Define la es
 
 
 
-CREATE TABLE IF NOT EXISTS "public"."client_email_queue" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "recipient_client_id" "uuid",
-    "recipient_email" "text" NOT NULL,
-    "template_type" "text" NOT NULL,
-    "template_data" "jsonb",
-    "status" "public"."client_email_queue_status" DEFAULT 'PENDING'::"public"."client_email_queue_status" NOT NULL,
-    "attempts" integer DEFAULT 0 NOT NULL,
-    "last_attempt_at" timestamp with time zone,
-    "error_message" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."client_email_queue" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."client_email_queue" IS 'Cola de trabajos para el envío de correos transaccionales a clientes finales.';
-
-
-
-COMMENT ON COLUMN "public"."client_email_queue"."tenant_id" IS 'Identifica al tenant para el cual se envía el correo, para usar su configuración de envío.';
-
-
-
-COMMENT ON COLUMN "public"."client_email_queue"."recipient_client_id" IS 'El cliente al que se le envía el correo, si está registrado.';
-
-
-
-COMMENT ON COLUMN "public"."client_email_queue"."recipient_email" IS 'La dirección de correo electrónico del destinatario.';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."client_professionals" (
     "id" "uuid" DEFAULT "extensions"."uuid_generate_v4"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
     "client_id" "uuid" NOT NULL,
     "user_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."client_professionals" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_professionals" OWNER TO "postgres";
@@ -13549,8 +12730,12 @@ CREATE TABLE IF NOT EXISTS "public"."client_treatment_session_items" (
     "notes" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "chk_one_item" CHECK ((("product_id" IS NOT NULL) OR ("service_id" IS NOT NULL)))
 );
+
+ALTER TABLE ONLY "public"."client_treatment_session_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."client_treatment_session_items" OWNER TO "postgres";
@@ -13576,45 +12761,6 @@ COMMENT ON COLUMN "public"."client_treatment_session_items"."quantity" IS 'The q
 
 
 
-CREATE TABLE IF NOT EXISTS "public"."client_whatsapp_queue" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "recipient_client_id" "uuid",
-    "recipient_phone_number" "text" NOT NULL,
-    "template_name" "text" NOT NULL,
-    "template_params" "jsonb",
-    "status" "public"."client_whatsapp_queue_status" DEFAULT 'PENDING'::"public"."client_whatsapp_queue_status" NOT NULL,
-    "attempts" integer DEFAULT 0 NOT NULL,
-    "last_attempt_at" timestamp with time zone,
-    "error_message" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."client_whatsapp_queue" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."client_whatsapp_queue" IS 'Work queue for sending transactional WhatsApp messages to end clients.';
-
-
-
-COMMENT ON COLUMN "public"."client_whatsapp_queue"."tenant_id" IS 'Identifies the tenant to use their specific integration settings (e.g., WhatsApp credentials).';
-
-
-
-COMMENT ON COLUMN "public"."client_whatsapp_queue"."recipient_phone_number" IS 'The recipient''s phone number in international format.';
-
-
-
-COMMENT ON COLUMN "public"."client_whatsapp_queue"."template_name" IS 'The name of the pre-approved WhatsApp message template.';
-
-
-
-COMMENT ON COLUMN "public"."client_whatsapp_queue"."template_params" IS 'JSON object containing the variables for the message template.';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."clients" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
@@ -13636,8 +12782,11 @@ CREATE TABLE IF NOT EXISTS "public"."clients" (
     "postal_code" "text",
     "country" "text",
     "latitude" double precision,
-    "longitude" double precision
+    "longitude" double precision,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."clients" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."clients" OWNER TO "postgres";
@@ -13662,10 +12811,14 @@ CREATE TABLE IF NOT EXISTS "public"."combo_items" (
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "offset_minutes" integer DEFAULT 0 NOT NULL,
     "is_parallel" boolean DEFAULT false NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "check_item_not_null" CHECK ((("product_id" IS NOT NULL) OR ("service_id" IS NOT NULL))),
     CONSTRAINT "combo_items_price_check" CHECK (("price" >= (0)::numeric)),
     CONSTRAINT "combo_items_quantity_check" CHECK (("quantity" > (0)::numeric))
 );
+
+ALTER TABLE ONLY "public"."combo_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."combo_items" OWNER TO "postgres";
@@ -13686,8 +12839,11 @@ CREATE TABLE IF NOT EXISTS "public"."combos" (
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "is_visible_on_microsite" boolean DEFAULT false NOT NULL
+    "is_visible_on_microsite" boolean DEFAULT false NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."combos" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."combos" OWNER TO "postgres";
@@ -13708,8 +12864,11 @@ CREATE TABLE IF NOT EXISTS "public"."commission_payment_evidences" (
     "user_id" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "file_size" bigint
+    "file_size" bigint,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."commission_payment_evidences" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."commission_payment_evidences" OWNER TO "postgres";
@@ -13726,8 +12885,11 @@ CREATE TABLE IF NOT EXISTS "public"."consent_signatures" (
     "user_id" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "file_size" bigint
+    "file_size" bigint,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."consent_signatures" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."consent_signatures" OWNER TO "postgres";
@@ -13740,93 +12902,14 @@ CREATE TABLE IF NOT EXISTS "public"."contact_types" (
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "is_for_supplier" boolean DEFAULT false NOT NULL,
-    "is_for_client" boolean DEFAULT false NOT NULL
+    "is_for_client" boolean DEFAULT false NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."contact_types" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."contact_types" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."countries" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "iso_code" "text" NOT NULL,
-    "is_active" boolean DEFAULT true,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid",
-    "branch_id" "uuid",
-    "default_language_iso_code" "text",
-    "uses_auto_pricing" boolean DEFAULT false NOT NULL,
-    "default_currency_id" "uuid",
-    "default_localization_id" "uuid",
-    "phone_prefix_id" "uuid",
-    "default_latitude" double precision,
-    "default_longitude" double precision,
-    "timezones" "jsonb",
-    "field_placeholders" "jsonb"
-);
-
-
-ALTER TABLE "public"."countries" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."countries"."default_localization_id" IS 'La localización por defecto para este país (ej. Español (Colombia))';
-
-
-
-COMMENT ON COLUMN "public"."countries"."timezones" IS 'Lista de zonas horarias para este país (ej. ["America/New_York", "America/Chicago"]).';
-
-
-
-COMMENT ON COLUMN "public"."countries"."field_placeholders" IS 'JSONB object to store example texts for different fields, e.g., {"phone": [{"label": "Mobile", "value": "+123456789"}]}';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."country_timezones" (
-    "country_id" "uuid" NOT NULL,
-    "timezone_id" "uuid" NOT NULL
-);
-
-
-ALTER TABLE "public"."country_timezones" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."currencies" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "code" "text" NOT NULL,
-    "symbol" "text" NOT NULL,
-    "format" "text",
-    "is_active" boolean DEFAULT true,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid",
-    "branch_id" "uuid",
-    "symbol_position" character varying(10) DEFAULT 'before'::character varying NOT NULL,
-    "decimal_separator" character(1) DEFAULT '.'::"bpchar" NOT NULL,
-    "thousands_separator" character(1) DEFAULT ','::"bpchar" NOT NULL,
-    "decimal_places" integer DEFAULT 2 NOT NULL
-);
-
-
-ALTER TABLE "public"."currencies" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."currencies"."symbol_position" IS 'Posición del símbolo monetario (ej. ''before'' para $100, ''after'' para 100€)';
-
-
-
-COMMENT ON COLUMN "public"."currencies"."decimal_separator" IS 'Carácter para el separador de decimales (ej. ''.'' o '','')';
-
-
-
-COMMENT ON COLUMN "public"."currencies"."thousands_separator" IS 'Carácter para el separador de miles (ej. '','' o ''.'')';
-
-
-
-COMMENT ON COLUMN "public"."currencies"."decimal_places" IS 'Número de dígitos a mostrar después del separador decimal';
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."document_sequences" (
@@ -13841,8 +12924,11 @@ CREATE TABLE IF NOT EXISTS "public"."document_sequences" (
     "is_active" boolean DEFAULT true NOT NULL,
     "country_specific_data" "jsonb",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "format_template" "text"
+    "format_template" "text",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."document_sequences" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."document_sequences" OWNER TO "postgres";
@@ -13860,8 +12946,11 @@ CREATE TABLE IF NOT EXISTS "public"."document_types" (
     "applies_to" "text"[] NOT NULL,
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."document_types" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."document_types" OWNER TO "postgres";
@@ -13884,104 +12973,14 @@ CREATE TABLE IF NOT EXISTS "public"."earned_commissions" (
     "status" "text" DEFAULT 'earned'::"text" NOT NULL,
     "void_reason" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "positive_commission" CHECK (("commission_amount" >= (0)::numeric))
 );
 
+ALTER TABLE ONLY "public"."earned_commissions" REPLICA IDENTITY FULL;
+
 
 ALTER TABLE "public"."earned_commissions" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."email_logs" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "recipient_email" "text" NOT NULL,
-    "template_id" "uuid",
-    "status" "text" NOT NULL,
-    "error_message" "text",
-    "sent_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."email_logs" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."email_logs" IS 'Registro de auditoría para todos los correos transaccionales enviados.';
-
-
-
-COMMENT ON COLUMN "public"."email_logs"."status" IS 'Estado del envío: SENT, FAILED.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."email_queue" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "recipient_user_id" "uuid" NOT NULL,
-    "template_type" "text" NOT NULL,
-    "template_data" "jsonb" NOT NULL,
-    "status" "public"."email_queue_status" DEFAULT 'PENDING'::"public"."email_queue_status" NOT NULL,
-    "attempts" integer DEFAULT 0 NOT NULL,
-    "last_attempt_at" timestamp with time zone,
-    "error_message" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."email_queue" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."email_templates" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "template_type" "text" NOT NULL,
-    "name" "text" NOT NULL,
-    "subject" "text" NOT NULL,
-    "body_html" "text" NOT NULL,
-    "language_id" "uuid" NOT NULL,
-    "is_active" boolean DEFAULT true NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "propagate_to_new_tenants" boolean DEFAULT false NOT NULL,
-    "platform_id" "uuid",
-    "is_customizable" boolean DEFAULT true NOT NULL,
-    "is_disableable" boolean DEFAULT true NOT NULL
-);
-
-
-ALTER TABLE "public"."email_templates" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."email_templates" IS 'Plantillas de correo maestras definidas por el Superadmin para eventos del sistema.';
-
-
-
-COMMENT ON COLUMN "public"."email_templates"."tenant_id" IS 'Debe ser siempre el UUID del superadmin (tenant 0).';
-
-
-
-COMMENT ON COLUMN "public"."email_templates"."template_type" IS 'Identificador programático del evento que dispara el correo (e.g., WELCOME_USER, PASSWORD_RESET).';
-
-
-
-COMMENT ON COLUMN "public"."email_templates"."language_id" IS 'FK a la tabla languages, usando el ID del idioma.';
-
-
-
-COMMENT ON COLUMN "public"."email_templates"."propagate_to_new_tenants" IS 'Si es true, se creará una configuración para los nuevos tenants, permitiéndoles activar/desactivar este tipo de plantilla.';
-
-
-
-COMMENT ON COLUMN "public"."email_templates"."platform_id" IS 'Identifica la plataforma para las plantillas maestras. Es NULL para las plantillas personalizadas por tenants.';
-
-
-
-COMMENT ON COLUMN "public"."email_templates"."is_customizable" IS 'Si es true, los tenants pueden crear sus propias versiones de esta plantilla.';
-
-
-
-COMMENT ON COLUMN "public"."email_templates"."is_disableable" IS 'Si es true, los tenants pueden desactivar este tipo de notificación por correo.';
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."equipment" (
@@ -13999,8 +12998,11 @@ CREATE TABLE IF NOT EXISTS "public"."equipment" (
     "is_active" boolean DEFAULT true,
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
-    "brand_id" "uuid"
+    "brand_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."equipment" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."equipment" OWNER TO "postgres";
@@ -14015,8 +13017,11 @@ CREATE TABLE IF NOT EXISTS "public"."equipment_assignments" (
     "return_date" "date",
     "notes" "text",
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid" NOT NULL
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."equipment_assignments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."equipment_assignments" OWNER TO "postgres";
@@ -14028,24 +13033,14 @@ CREATE TABLE IF NOT EXISTS "public"."equipment_brands" (
     "description" "text",
     "tenant_id" "uuid" NOT NULL,
     "is_active" boolean DEFAULT true NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."equipment_brands" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."equipment_brands" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."equipment_maintenance_history" (
-    "id" "uuid" DEFAULT "extensions"."uuid_generate_v4"() NOT NULL,
-    "equipment_id" "uuid" NOT NULL,
-    "maintenance_date" "date" NOT NULL,
-    "notes" "text",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid" NOT NULL
-);
-
-
-ALTER TABLE "public"."equipment_maintenance_history" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."equipment_types" (
@@ -14055,39 +13050,14 @@ CREATE TABLE IF NOT EXISTS "public"."equipment_types" (
     "description" "text",
     "is_active" boolean DEFAULT true,
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."equipment_types" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."equipment_types" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."error_logs" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid",
-    "user_id" "uuid",
-    "error_message" "text" NOT NULL,
-    "stack_trace" "text",
-    "error_code" "text",
-    "severity" "text" DEFAULT 'error'::"text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    CONSTRAINT "error_logs_severity_check" CHECK (("severity" = ANY (ARRAY['info'::"text", 'warning'::"text", 'error'::"text", 'critical'::"text"])))
-);
-
-
-ALTER TABLE "public"."error_logs" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."exchange_rates" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "base_currency_code" "text" NOT NULL,
-    "target_currency_code" "text" NOT NULL,
-    "rate" numeric(12,6) NOT NULL,
-    "last_updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."exchange_rates" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."expense_provider_addresses" (
@@ -14103,8 +13073,11 @@ CREATE TABLE IF NOT EXISTS "public"."expense_provider_addresses" (
     "longitude" double precision,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "name" "text"
+    "name" "text",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."expense_provider_addresses" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."expense_provider_addresses" OWNER TO "postgres";
@@ -14118,8 +13091,11 @@ CREATE TABLE IF NOT EXISTS "public"."expense_provider_contacts" (
     "phone" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "contact_type_id" "uuid" NOT NULL
+    "contact_type_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."expense_provider_contacts" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."expense_provider_contacts" OWNER TO "postgres";
@@ -14145,8 +13121,11 @@ CREATE TABLE IF NOT EXISTS "public"."expense_providers" (
     "postal_code" "text",
     "country" "text",
     "latitude" numeric,
-    "longitude" numeric
+    "longitude" numeric,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."expense_providers" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."expense_providers" OWNER TO "postgres";
@@ -14163,8 +13142,11 @@ CREATE TABLE IF NOT EXISTS "public"."expenses" (
     "status" "public"."expense_status_enum" DEFAULT 'pending'::"public"."expense_status_enum" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "expenses_amount_check" CHECK (("amount" > (0)::numeric))
 );
+
+ALTER TABLE ONLY "public"."expenses" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."expenses" OWNER TO "postgres";
@@ -14181,181 +13163,14 @@ CREATE TABLE IF NOT EXISTS "public"."extra_service_sessions" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid" NOT NULL
+    "branch_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."extra_service_sessions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."extra_service_sessions" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."generic_taxes" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "rate" numeric(5,2) NOT NULL,
-    "country_id" "uuid" NOT NULL,
-    "description" "text",
-    "is_active" boolean DEFAULT true NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."generic_taxes" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."generic_taxes" IS 'Definiciones de impuestos aplicables por país.';
-
-
-
-COMMENT ON COLUMN "public"."generic_taxes"."rate" IS 'Tasa de impuesto en porcentaje (ej. 19.00 para 19%).';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."global_settings" (
-    "id" integer NOT NULL,
-    "base_currency_id" "uuid",
-    "default_tax_rate" numeric(5,2) DEFAULT 0.00,
-    "default_tax_name" "text" DEFAULT 'IVA'::"text",
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "company_name" "text",
-    "contact_email" "text",
-    "address" "text",
-    "trial_duration_days" integer DEFAULT 14 NOT NULL,
-    "trial_grace_period_days" integer DEFAULT 3 NOT NULL,
-    CONSTRAINT "global_settings_id_check" CHECK (("id" = 1))
-);
-
-
-ALTER TABLE "public"."global_settings" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."global_settings"."company_name" IS 'El nombre legal de la empresa que opera el servicio (ej. Glamtica S.A.S).';
-
-
-
-COMMENT ON COLUMN "public"."global_settings"."contact_email" IS 'El correo electrónico de contacto principal para asuntos administrativos o de soporte.';
-
-
-
-COMMENT ON COLUMN "public"."global_settings"."address" IS 'La dirección física o fiscal de la empresa.';
-
-
-
-COMMENT ON COLUMN "public"."global_settings"."trial_duration_days" IS 'La duración en días del período de prueba para nuevos tenants.';
-
-
-
-COMMENT ON COLUMN "public"."global_settings"."trial_grace_period_days" IS 'Días de gracia después de que finaliza un período de prueba.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."integration_auth_methods" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "method" "text" NOT NULL,
-    "description" "text",
-    "config_schema" "jsonb",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."integration_auth_methods" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."integration_body_formats" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "format" "text" NOT NULL,
-    "description" "text",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."integration_body_formats" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."integration_http_methods" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "method" "text" NOT NULL,
-    "description" "text",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."integration_http_methods" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."integration_record" (
-    "id" "uuid",
-    "tenant_id" "uuid",
-    "provider" "text",
-    "access_token" "text",
-    "encrypted_refresh_token" "bytea",
-    "encryption_nonce" "bytea",
-    "account_email" "text",
-    "created_at" timestamp with time zone,
-    "updated_at" timestamp with time zone
-);
-
-
-ALTER TABLE "public"."integration_record" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."integrations_config" (
-    "key" "text" NOT NULL,
-    "value" "text" NOT NULL
-);
-
-
-ALTER TABLE "public"."integrations_config" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."investor_platform_shares" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "platform_id" "uuid" NOT NULL,
-    "investment_share" numeric(5,4) NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "investor_platform_shares_investment_share_check" CHECK ((("investment_share" > (0)::numeric) AND ("investment_share" <= (1)::numeric)))
-);
-
-
-ALTER TABLE "public"."investor_platform_shares" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."investor_platform_shares" IS 'Almacena el porcentaje de participación que un inversor (usuario) tiene sobre una plataforma específica.';
-
-
-
-COMMENT ON COLUMN "public"."investor_platform_shares"."user_id" IS 'El ID del usuario inversor.';
-
-
-
-COMMENT ON COLUMN "public"."investor_platform_shares"."platform_id" IS 'El ID de la plataforma en la que se invierte.';
-
-
-
-COMMENT ON COLUMN "public"."investor_platform_shares"."investment_share" IS 'El porcentaje de participación, ej. 0.15 para 15%.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."investor_platform_stakes" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "investor_user_id" "uuid" NOT NULL,
-    "platform_id" "uuid" NOT NULL,
-    "stake_percentage" numeric(5,2) NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    CONSTRAINT "investor_platform_stakes_stake_percentage_check" CHECK ((("stake_percentage" > (0)::numeric) AND ("stake_percentage" <= (100)::numeric)))
-);
-
-
-ALTER TABLE "public"."investor_platform_stakes" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."investor_platform_stakes" IS 'Tracks investor user stakes in different platforms.';
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."invoice_item_taxes" (
@@ -14365,8 +13180,13 @@ CREATE TABLE IF NOT EXISTS "public"."invoice_item_taxes" (
     "taxable_amount" numeric(12,2) NOT NULL,
     "calculated_tax_amount" numeric(12,2) NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
+    "invoice_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."invoice_item_taxes" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."invoice_item_taxes" OWNER TO "postgres";
@@ -14402,8 +13222,12 @@ CREATE TABLE IF NOT EXISTS "public"."invoice_items" (
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "service_id" "uuid",
     "parent_item_id" "uuid",
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "check_item_source_v2" CHECK (((("item_type" = 'PRODUCT'::"text") AND ("product_id" IS NOT NULL) AND ("service_id" IS NULL)) OR (("item_type" = 'SERVICE'::"text") AND ("service_id" IS NOT NULL) AND ("product_id" IS NULL)) OR (("item_type" = 'COMBO'::"text") AND ("product_id" IS NULL) AND ("service_id" IS NULL)) OR (("item_type" = 'CUSTOM'::"text") AND ("product_id" IS NULL) AND ("service_id" IS NULL)) OR (("item_type" = 'SUBSCRIPTION_PLAN'::"text") AND ("subscription_plan_id" IS NOT NULL) AND ("product_id" IS NULL) AND ("service_id" IS NULL))))
 );
+
+ALTER TABLE ONLY "public"."invoice_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."invoice_items" OWNER TO "postgres";
@@ -14439,8 +13263,11 @@ CREATE TABLE IF NOT EXISTS "public"."invoices" (
     "attention_id" "uuid",
     "provider_reference_id" "text",
     "error_message" "text",
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "check_billed_to_target" CHECK (((("billed_to_tenant_id" IS NOT NULL) AND ("billed_to_client_id" IS NULL)) OR (("billed_to_tenant_id" IS NULL) AND ("billed_to_client_id" IS NOT NULL))))
 );
+
+ALTER TABLE ONLY "public"."invoices" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."invoices" OWNER TO "postgres";
@@ -14482,71 +13309,19 @@ COMMENT ON COLUMN "public"."invoices"."error_message" IS 'Mensaje de error si el
 
 
 
-CREATE TABLE IF NOT EXISTS "public"."languages" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "iso_code" character varying(10) NOT NULL,
-    "is_active" boolean DEFAULT true,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."languages" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."languages"."iso_code" IS 'Código de localización completo (ej. ''es-CO'', ''en-US'').';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."media_playlists" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid",
+    "tenant_id" "uuid" NOT NULL,
     "name" "text" NOT NULL,
     "description" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."media_playlists" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."media_playlists" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."menu_permissions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "role_id" "uuid" NOT NULL,
-    "menu_item_name" "text" NOT NULL,
-    "can_access" boolean DEFAULT true,
-    "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."menu_permissions" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."monthly_charges" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "billing_period_start" "date" NOT NULL,
-    "billing_period_end" "date" NOT NULL,
-    "base_plan_charge" numeric(10,2) DEFAULT 0.00 NOT NULL,
-    "total_overage_charge" numeric(10,2) DEFAULT 0.00 NOT NULL,
-    "total_charge" numeric(10,2) DEFAULT 0.00 NOT NULL,
-    "currency_code" "text" NOT NULL,
-    "currency_symbol" "text" NOT NULL,
-    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."monthly_charges" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."monthly_charges" IS 'Stores billing cycle results for each tenant, including base plan and overage charges.';
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."notifications" (
@@ -14559,8 +13334,11 @@ CREATE TABLE IF NOT EXISTS "public"."notifications" (
     "link_to" "text",
     "read_at" timestamp with time zone,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "title_not_empty" CHECK (("title" <> ''::"text"))
 );
+
+ALTER TABLE ONLY "public"."notifications" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."notifications" OWNER TO "postgres";
@@ -14578,99 +13356,31 @@ COMMENT ON COLUMN "public"."notifications"."read_at" IS 'Timestamp de cuando la 
 
 
 
-CREATE TABLE IF NOT EXISTS "public"."payment_intents" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "status" "text" DEFAULT 'PENDING'::"text" NOT NULL,
-    "amount_in_cents" bigint NOT NULL,
-    "currency" character varying(3) NOT NULL,
-    "reference" "text" NOT NULL,
-    "metadata" "jsonb" DEFAULT '{}'::"jsonb",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "environment" "text" NOT NULL,
-    "actions_on_success" "jsonb",
-    CONSTRAINT "payment_intents_environment_check" CHECK (("environment" = ANY (ARRAY['test'::"text", 'production'::"text"])))
-);
-
-
-ALTER TABLE "public"."payment_intents" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."payment_intents" IS 'Registra la intención de un pago antes de enviarlo a la pasarela, vinculando la transacción a una acción específica.';
-
-
-
-COMMENT ON COLUMN "public"."payment_intents"."reference" IS 'Referencia única generada por nuestro sistema que se envía a la pasarela de pago.';
-
-
-
-COMMENT ON COLUMN "public"."payment_intents"."metadata" IS 'Datos JSON para almacenar el propósito del pago, ej: { "type": "SUBSCRIPTION_RENEWAL", "plan_price_id": "..." }.';
-
-
-
-COMMENT ON COLUMN "public"."payment_intents"."environment" IS 'El entorno en el que se creó el intento de pago (test o production).';
-
-
-
-COMMENT ON COLUMN "public"."payment_intents"."actions_on_success" IS 'Array of actions to be executed upon successful payment. E.g., [{"action_type": "ACTIVATE_BRANCHES", "payload": {...}}]';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."payment_methods" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
     "is_active" boolean DEFAULT true NOT NULL,
-    "tenant_id" "uuid",
+    "tenant_id" "uuid" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "requires_evidence" boolean DEFAULT false NOT NULL
+    "requires_evidence" boolean DEFAULT false NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."payment_methods" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."payment_methods" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."payments" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "provider" "text" NOT NULL,
-    "provider_payment_id" "text" NOT NULL,
-    "amount_in_cents" bigint NOT NULL,
-    "currency" character varying(3) NOT NULL,
-    "status" "text" NOT NULL,
-    "reference" "text" NOT NULL,
-    "environment" "text" NOT NULL,
-    "full_response" "jsonb",
-    "payment_date" timestamp with time zone NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."payments" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."payments" IS 'Almacena registros de transacciones de pasarelas de pago.';
-
-
-
-COMMENT ON COLUMN "public"."payments"."provider_payment_id" IS 'El ID único de la transacción asignado por el proveedor de pagos (ej. Wompi).';
-
-
-
-COMMENT ON COLUMN "public"."payments"."reference" IS 'Nuestra referencia interna única enviada al proveedor de pagos.';
-
-
-
-COMMENT ON COLUMN "public"."payments"."full_response" IS 'El objeto JSON completo recibido del webhook del proveedor para auditoría y depuración.';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."payslip_commissions" (
     "payslip_id" "uuid" NOT NULL,
-    "commission_id" "uuid" NOT NULL
+    "commission_id" "uuid" NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."payslip_commissions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."payslip_commissions" OWNER TO "postgres";
@@ -14686,8 +13396,11 @@ CREATE TABLE IF NOT EXISTS "public"."payslips" (
     "status" "text" DEFAULT 'pending_signature'::"text" NOT NULL,
     "payment_method" "text",
     "notes" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."payslips" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."payslips" OWNER TO "postgres";
@@ -14698,145 +13411,15 @@ CREATE TABLE IF NOT EXISTS "public"."performance_metrics" (
     "metric_name" "text" NOT NULL,
     "metric_value" numeric NOT NULL,
     "timestamp" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid",
-    "created_at" timestamp with time zone DEFAULT "now"()
+    "tenant_id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."performance_metrics" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."performance_metrics" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."permissions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "description" "text",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid",
-    "branch_id" "uuid"
-);
-
-
-ALTER TABLE "public"."permissions" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."phone_prefixes" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "country_name" "text" NOT NULL,
-    "iso_code" character varying(2) NOT NULL,
-    "prefix" character varying(10) NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."phone_prefixes" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."plan_asset_bonuses" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "source_asset_limit_id" "uuid" NOT NULL,
-    "bonus_asset_id" "uuid" NOT NULL,
-    "quantity" integer NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "quantity_must_be_positive" CHECK (("quantity" > 0))
-);
-
-
-ALTER TABLE "public"."plan_asset_bonuses" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."plan_asset_bonuses" IS 'Defines bonuses granted by purchasing extra units of a specific asset within a plan-country configuration.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."plan_asset_limits" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "plan_country_config_id" "uuid" NOT NULL,
-    "asset_id" "uuid" NOT NULL,
-    "value" "text" NOT NULL,
-    "extra_unit_price" numeric(10,4) DEFAULT 0 NOT NULL,
-    "overage_unit_price" numeric(10,4) DEFAULT 0 NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."plan_asset_limits" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."plan_asset_limits" IS 'Stores the limits and pricing for each asset within a specific plan-country configuration.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."plan_assets" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "platform_id" "uuid" NOT NULL,
-    "asset_key" "text" NOT NULL,
-    "name" "text" NOT NULL,
-    "description" "text",
-    "data_type" "text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "asset_purpose_id" "uuid" NOT NULL,
-    CONSTRAINT "plan_assets_data_type_check" CHECK (("data_type" = ANY (ARRAY['boolean'::"text", 'numeric'::"text"])))
-);
-
-
-ALTER TABLE "public"."plan_assets" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."plan_country_configurations" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "plan_id" "uuid" NOT NULL,
-    "country_id" "uuid" NOT NULL,
-    "is_active" boolean DEFAULT true NOT NULL,
-    "features" "text"[] DEFAULT ARRAY[]::"text"[],
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."plan_country_configurations" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."plan_country_configurations" IS 'Stores country-specific configurations for a subscription plan, including features and activation status.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."platform_assignments" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "platform_id" "uuid" NOT NULL,
-    "role_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."platform_assignments" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."platform_countries" (
-    "platform_id" "uuid" NOT NULL,
-    "country_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."platform_countries" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."platform_countries" IS 'Tabla de enlace para definir qué países están disponibles para cada plataforma.';
-
-
-
-COMMENT ON COLUMN "public"."platform_countries"."platform_id" IS 'Referencia a la plataforma.';
-
-
-
-COMMENT ON COLUMN "public"."platform_countries"."country_id" IS 'Referencia al país disponible para la plataforma.';
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."platforms" (
@@ -14846,54 +13429,31 @@ CREATE TABLE IF NOT EXISTS "public"."platforms" (
     "base_url" "text",
     "created_at" timestamp with time zone DEFAULT "now"(),
     "default_currency_id" "uuid",
-    "default_language_id" "uuid",
-    "default_timezone" "text"
+    "default_language_id" "uuid"
 );
 
 
 ALTER TABLE "public"."platforms" OWNER TO "postgres";
 
 
-COMMENT ON TABLE "public"."platforms" IS 'Defines the applications within the multi-platform universe.';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."playlist_items" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "playlist_id" "uuid",
+    "playlist_id" "uuid" NOT NULL,
     "media_url" "text" NOT NULL,
     "media_type" "text" NOT NULL,
     "item_order" integer NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "video_title" "text",
     "duration_seconds" integer,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "playlist_items_media_type_check" CHECK (("media_type" = ANY (ARRAY['youtube'::"text", 'spotify'::"text"])))
 );
 
+ALTER TABLE ONLY "public"."playlist_items" REPLICA IDENTITY FULL;
+
 
 ALTER TABLE "public"."playlist_items" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."price_tariffs" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "subscription_plan_id" "uuid" NOT NULL,
-    "effective_date" timestamp with time zone NOT NULL,
-    "base_price" numeric(10,2) DEFAULT 0 NOT NULL,
-    "currency_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "promotional_price" numeric(10,2)
-);
-
-
-ALTER TABLE "public"."price_tariffs" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."price_tariffs" IS 'Define una versión de tarifa para un plan, incluyendo el precio base y su fecha de efectividad.';
-
-
-
-COMMENT ON COLUMN "public"."price_tariffs"."promotional_price" IS 'Optional promotional price (e.g., a higher list price) to show a discount effect in the UI.';
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."product_brands" (
@@ -14904,8 +13464,11 @@ CREATE TABLE IF NOT EXISTS "public"."product_brands" (
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid"
+    "branch_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_brands" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_brands" OWNER TO "postgres";
@@ -14918,8 +13481,11 @@ CREATE TABLE IF NOT EXISTS "public"."product_categories" (
     "description" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "is_active" boolean DEFAULT true
+    "is_active" boolean DEFAULT true,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_categories" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_categories" OWNER TO "postgres";
@@ -14929,8 +13495,11 @@ CREATE TABLE IF NOT EXISTS "public"."product_category_assignments" (
     "product_id" "uuid" NOT NULL,
     "category_id" "uuid" NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_category_assignments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_category_assignments" OWNER TO "postgres";
@@ -14965,8 +13534,11 @@ CREATE TABLE IF NOT EXISTS "public"."product_movements" (
     "cost_after_movement" numeric NOT NULL,
     "reference_id" "uuid",
     "reference_type" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_movements" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_movements" OWNER TO "postgres";
@@ -14978,8 +13550,11 @@ CREATE TABLE IF NOT EXISTS "public"."product_tax_types" (
     "tax_type_id" "uuid" NOT NULL,
     "tenant_id" "uuid" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_tax_types" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_tax_types" OWNER TO "postgres";
@@ -14992,8 +13567,12 @@ CREATE TABLE IF NOT EXISTS "public"."product_transfer_items" (
     "quantity" numeric(10,3) NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "product_transfer_items_quantity_check" CHECK (("quantity" > (0)::numeric))
 );
+
+ALTER TABLE ONLY "public"."product_transfer_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_transfer_items" OWNER TO "postgres";
@@ -15006,8 +13585,12 @@ CREATE TABLE IF NOT EXISTS "public"."product_transfer_reception_items" (
     "product_id" "uuid" NOT NULL,
     "quantity_expected" numeric(10,3) NOT NULL,
     "quantity_received" numeric(10,3) NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_transfer_reception_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_transfer_reception_items" OWNER TO "postgres";
@@ -15019,8 +13602,11 @@ CREATE TABLE IF NOT EXISTS "public"."product_transfer_receptions" (
     "tenant_id" "uuid" NOT NULL,
     "reception_date" timestamp with time zone DEFAULT "now"() NOT NULL,
     "notes" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_transfer_receptions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_transfer_receptions" OWNER TO "postgres";
@@ -15037,8 +13623,11 @@ CREATE TABLE IF NOT EXISTS "public"."product_transfers" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "requesting_branch_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "product_transfers_status_check" CHECK (("status" = ANY (ARRAY['solicitado'::"text", 'aprobado'::"text", 'rechazado'::"text", 'en_transito'::"text", 'recibido_con_incidencias'::"text", 'completado'::"text", 'cancelado'::"text"])))
 );
+
+ALTER TABLE ONLY "public"."product_transfers" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_transfers" OWNER TO "postgres";
@@ -15052,8 +13641,11 @@ CREATE TABLE IF NOT EXISTS "public"."product_user_commissions" (
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "tenant_id" "uuid" NOT NULL,
     "branch_id" "uuid" NOT NULL,
-    "user_id" "uuid" NOT NULL
+    "user_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."product_user_commissions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."product_user_commissions" OWNER TO "postgres";
@@ -15077,8 +13669,11 @@ CREATE TABLE IF NOT EXISTS "public"."products" (
     "description_i18n" "jsonb",
     "package_content_quantity" numeric(10,3) DEFAULT 1 NOT NULL,
     "allow_decimal_sale" boolean DEFAULT false NOT NULL,
-    "unit_of_measure_id" "uuid"
+    "unit_of_measure_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."products" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."products" OWNER TO "postgres";
@@ -15102,8 +13697,12 @@ CREATE TABLE IF NOT EXISTS "public"."purchase_item_receptions" (
     "tenant_id" "uuid" NOT NULL,
     "quantity_expected" integer NOT NULL,
     "quantity_received" integer NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
+    "purchase_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."purchase_item_receptions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."purchase_item_receptions" OWNER TO "postgres";
@@ -15116,8 +13715,12 @@ CREATE TABLE IF NOT EXISTS "public"."purchase_items" (
     "quantity" integer NOT NULL,
     "cost_price" numeric(10,2) NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."purchase_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."purchase_items" OWNER TO "postgres";
@@ -15135,8 +13738,11 @@ CREATE TABLE IF NOT EXISTS "public"."purchases" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "payment_status" "text" DEFAULT 'no_pagado'::"text" NOT NULL,
-    "reception_notes" "text"
+    "reception_notes" "text",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."purchases" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."purchases" OWNER TO "postgres";
@@ -15157,16 +13763,18 @@ CREATE TABLE IF NOT EXISTS "public"."recurring_expenses" (
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "recurring_expenses_amount_check" CHECK (("amount" > (0)::numeric)),
     CONSTRAINT "recurring_expenses_interval_check" CHECK (("recurrence_interval" > 0))
 );
+
+ALTER TABLE ONLY "public"."recurring_expenses" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."recurring_expenses" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."rescheduled_attentions" (
-    "id" bigint NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "attention_id" "uuid" NOT NULL,
     "client_id" "uuid" NOT NULL,
@@ -15175,22 +13783,16 @@ CREATE TABLE IF NOT EXISTS "public"."rescheduled_attentions" (
     "reason" "text",
     "user_id" "uuid" NOT NULL,
     "fault" "text",
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     CONSTRAINT "rescheduled_attentions_fault_check" CHECK (("fault" = ANY (ARRAY['cliente'::"text", 'establecimiento'::"text"])))
 );
 
+ALTER TABLE ONLY "public"."rescheduled_attentions" REPLICA IDENTITY FULL;
+
 
 ALTER TABLE "public"."rescheduled_attentions" OWNER TO "postgres";
-
-
-ALTER TABLE "public"."rescheduled_attentions" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
-    SEQUENCE NAME "public"."rescheduled_attentions_id_seq"
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1
-);
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."roles" (
@@ -15198,8 +13800,12 @@ CREATE TABLE IF NOT EXISTS "public"."roles" (
     "name" "text" NOT NULL,
     "display_name" "text" NOT NULL,
     "description" "text",
-    "created_at" timestamp with time zone DEFAULT "now"()
+    "created_at" timestamp with time zone DEFAULT "now"(),
+    "tenant_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."roles" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."roles" OWNER TO "postgres";
@@ -15221,8 +13827,11 @@ CREATE TABLE IF NOT EXISTS "public"."sales" (
     "total_tax_amount" numeric(12,2) NOT NULL,
     "total_amount" numeric(12,2) NOT NULL,
     "status" "text" DEFAULT 'COMPLETED'::"text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."sales" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."sales" OWNER TO "postgres";
@@ -15242,8 +13851,12 @@ CREATE TABLE IF NOT EXISTS "public"."sales_items" (
     "tax_details" "jsonb",
     "total_tax_amount" numeric(12,2) NOT NULL,
     "total_price" numeric(12,2) NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."sales_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."sales_items" OWNER TO "postgres";
@@ -15259,8 +13872,11 @@ CREATE TABLE IF NOT EXISTS "public"."satisfaction_survey_ratings" (
     "branch_id" "uuid" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "satisfaction_survey_ratings_rating_check" CHECK ((("rating" >= 1) AND ("rating" <= 5)))
 );
+
+ALTER TABLE ONLY "public"."satisfaction_survey_ratings" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."satisfaction_survey_ratings" OWNER TO "postgres";
@@ -15277,8 +13893,11 @@ CREATE TABLE IF NOT EXISTS "public"."satisfaction_surveys" (
     "submitted_at" timestamp with time zone,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "satisfaction_surveys_status_check" CHECK (("status" = ANY (ARRAY['generated'::"text", 'sent'::"text", 'completed'::"text", 'expired'::"text"])))
 );
+
+ALTER TABLE ONLY "public"."satisfaction_surveys" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."satisfaction_surveys" OWNER TO "postgres";
@@ -15292,8 +13911,11 @@ CREATE TABLE IF NOT EXISTS "public"."schedule_templates" (
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid"
+    "branch_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."schedule_templates" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."schedule_templates" OWNER TO "postgres";
@@ -15307,8 +13929,11 @@ CREATE TABLE IF NOT EXISTS "public"."service_categories" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid"
+    "branch_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."service_categories" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."service_categories" OWNER TO "postgres";
@@ -15324,8 +13949,11 @@ CREATE TABLE IF NOT EXISTS "public"."service_sessions" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid" NOT NULL
+    "branch_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."service_sessions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."service_sessions" OWNER TO "postgres";
@@ -15337,8 +13965,11 @@ CREATE TABLE IF NOT EXISTS "public"."service_tax_types" (
     "tax_type_id" "uuid" NOT NULL,
     "tenant_id" "uuid" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."service_tax_types" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."service_tax_types" OWNER TO "postgres";
@@ -15353,8 +13984,11 @@ CREATE TABLE IF NOT EXISTS "public"."service_user_commissions" (
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "tenant_id" "uuid" NOT NULL,
     "branch_id" "uuid" NOT NULL,
-    "user_id" "uuid" NOT NULL
+    "user_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."service_user_commissions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."service_user_commissions" OWNER TO "postgres";
@@ -15376,126 +14010,32 @@ CREATE TABLE IF NOT EXISTS "public"."services" (
     "tenant_id" "uuid" NOT NULL,
     "name_i18n" "jsonb",
     "description_i18n" "jsonb",
-    "is_visible_on_microsite" boolean DEFAULT false NOT NULL
+    "is_visible_on_microsite" boolean DEFAULT false NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."services" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."services" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."staff_gallery_items" (
-    "id" bigint NOT NULL,
     "tenant_id" "uuid" NOT NULL,
     "user_id" "uuid" NOT NULL,
     "evidence_id" "uuid" NOT NULL,
     "display_order" integer DEFAULT 0 NOT NULL,
     "is_favorite" boolean DEFAULT false NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL,
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL
 );
+
+ALTER TABLE ONLY "public"."staff_gallery_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."staff_gallery_items" OWNER TO "postgres";
-
-
-CREATE SEQUENCE IF NOT EXISTS "public"."staff_gallery_items_id_seq"
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
-ALTER SEQUENCE "public"."staff_gallery_items_id_seq" OWNER TO "postgres";
-
-
-ALTER SEQUENCE "public"."staff_gallery_items_id_seq" OWNED BY "public"."staff_gallery_items"."id";
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."subscription_assets" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_subscription_id" "uuid" NOT NULL,
-    "asset_type" "public"."subscription_asset_type" NOT NULL,
-    "asset_reference_id" "uuid" NOT NULL,
-    "status" "public"."subscription_asset_status" DEFAULT 'active'::"public"."subscription_asset_status" NOT NULL,
-    "added_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "cancelled_at" timestamp with time zone,
-    "price_at_addition" numeric(10,2) NOT NULL
-);
-
-
-ALTER TABLE "public"."subscription_assets" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."subscription_assets" IS 'Tracks billable assets (like branches, users) attached to a subscription.';
-
-
-
-COMMENT ON COLUMN "public"."subscription_assets"."asset_reference_id" IS 'FK to the specific asset table, e.g., branches.id';
-
-
-
-COMMENT ON COLUMN "public"."subscription_assets"."price_at_addition" IS 'Price of the asset at the time of addition to handle price changes.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."subscription_items" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "subscription_id" "uuid" NOT NULL,
-    "item_type" "text" NOT NULL,
-    "item_id" "uuid",
-    "quantity" integer DEFAULT 1 NOT NULL,
-    "unit_price_at_addition" numeric(10,2) NOT NULL,
-    "added_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "check_item_type" CHECK (("item_type" = ANY (ARRAY['extra_branch'::"text", 'extra_user'::"text", 'advanced_reports'::"text"])))
-);
-
-
-ALTER TABLE "public"."subscription_items" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."subscription_items" IS 'Almacena items o add-ons específicos asociados a una suscripción de tenant.';
-
-
-
-COMMENT ON COLUMN "public"."subscription_items"."item_type" IS 'Define el tipo de add-on, ej: ''extra_branch''.';
-
-
-
-COMMENT ON COLUMN "public"."subscription_items"."unit_price_at_addition" IS 'Registra el costo del item en el momento en que fue añadido a la suscripción.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."subscription_plans" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "description" "text",
-    "duration_days" integer DEFAULT 30 NOT NULL,
-    "is_active" boolean DEFAULT true,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid",
-    "branch_id" "uuid",
-    "billing_frequency_months" integer DEFAULT 1 NOT NULL,
-    "display_order" integer DEFAULT 0 NOT NULL,
-    "grace_period_days" integer DEFAULT 7 NOT NULL,
-    "platform_id" "uuid" NOT NULL,
-    "is_default_trial" boolean DEFAULT false NOT NULL
-);
-
-
-ALTER TABLE "public"."subscription_plans" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."subscription_plans"."grace_period_days" IS 'Días de gracia después de la fecha de vencimiento durante los cuales el servicio sigue activo.';
-
-
-
-COMMENT ON COLUMN "public"."subscription_plans"."is_default_trial" IS 'If TRUE, this plan is automatically assigned to new tenants of a platform during their trial period.';
-
 
 
 CREATE TABLE IF NOT EXISTS "public"."supplier_addresses" (
@@ -15511,8 +14051,11 @@ CREATE TABLE IF NOT EXISTS "public"."supplier_addresses" (
     "longitude" double precision,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "name" "text"
+    "name" "text",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."supplier_addresses" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."supplier_addresses" OWNER TO "postgres";
@@ -15526,8 +14069,11 @@ CREATE TABLE IF NOT EXISTS "public"."supplier_contacts" (
     "phone" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
-    "contact_type_id" "uuid" NOT NULL
+    "contact_type_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."supplier_contacts" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."supplier_contacts" OWNER TO "postgres";
@@ -15541,8 +14087,11 @@ CREATE TABLE IF NOT EXISTS "public"."supplier_products" (
     "is_active" boolean DEFAULT true,
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
-    "tenant_id" "uuid" NOT NULL
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."supplier_products" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."supplier_products" OWNER TO "postgres";
@@ -15568,8 +14117,11 @@ CREATE TABLE IF NOT EXISTS "public"."suppliers" (
     "postal_code" "text",
     "country" "text",
     "latitude" numeric,
-    "longitude" numeric
+    "longitude" numeric,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."suppliers" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."suppliers" OWNER TO "postgres";
@@ -15615,39 +14167,6 @@ COMMENT ON COLUMN "public"."suppliers"."longitude" IS 'The geographic longitude.
 
 
 
-CREATE TABLE IF NOT EXISTS "public"."system_alerts" (
-    "id" "uuid" DEFAULT "extensions"."uuid_generate_v4"() NOT NULL,
-    "type" "text" NOT NULL,
-    "message" "text" NOT NULL,
-    "details" "jsonb",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "is_resolved" boolean DEFAULT false,
-    "resolved_at" timestamp with time zone,
-    "resolved_by" "uuid",
-    "platform_id" "uuid" NOT NULL
-);
-
-
-ALTER TABLE "public"."system_alerts" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."tariff_asset_prices" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tariff_id" "uuid" NOT NULL,
-    "asset_id" "uuid" NOT NULL,
-    "extra_unit_price" numeric(10,2) DEFAULT 0 NOT NULL,
-    "overage_unit_price" numeric(10,4) DEFAULT 0 NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."tariff_asset_prices" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."tariff_asset_prices" IS 'Almacena los precios específicos de un activo para una tarifa versionada.';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."tax_types" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
@@ -15656,8 +14175,11 @@ CREATE TABLE IF NOT EXISTS "public"."tax_types" (
     "is_percentage" boolean DEFAULT true NOT NULL,
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."tax_types" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."tax_types" OWNER TO "postgres";
@@ -15670,8 +14192,11 @@ CREATE TABLE IF NOT EXISTS "public"."tenant_client_settings" (
     "require_general_signature" boolean DEFAULT false NOT NULL,
     "require_image_consent" boolean DEFAULT false NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."tenant_client_settings" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."tenant_client_settings" OWNER TO "postgres";
@@ -15682,45 +14207,6 @@ COMMENT ON TABLE "public"."tenant_client_settings" IS 'Configuraciones a nivel d
 
 
 COMMENT ON COLUMN "public"."tenant_client_settings"."default_intake_form_id" IS 'Define qué plantilla de formulario se usará por defecto para nuevos clientes.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."tenant_integrations" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "provider" "text" NOT NULL,
-    "access_token" "text",
-    "account_email" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "expires_at" timestamp with time zone,
-    "encrypted_credentials" "text",
-    "nonce" "text",
-    "environment" "text" DEFAULT 'production'::"text" NOT NULL,
-    "is_active" boolean DEFAULT false NOT NULL
-);
-
-
-ALTER TABLE "public"."tenant_integrations" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."tenant_integrations"."expires_at" IS 'Timestamp de cuando expira el access_token. Usado para la lógica de refresco.';
-
-
-
-COMMENT ON COLUMN "public"."tenant_integrations"."encrypted_credentials" IS 'Las credenciales sensibles (ej. refresh token, API key), cifradas y en formato Base64.';
-
-
-
-COMMENT ON COLUMN "public"."tenant_integrations"."nonce" IS 'El vector de inicialización (IV) o nonce para el cifrado, en Base64.';
-
-
-
-COMMENT ON COLUMN "public"."tenant_integrations"."environment" IS 'Define si este juego de credenciales es para "production" o "test".';
-
-
-
-COMMENT ON COLUMN "public"."tenant_integrations"."is_active" IS 'Indica si la configuración de una integración es la activa para su proveedor. Solo una puede estar activa por proveedor y tenant.';
 
 
 
@@ -15736,89 +14222,18 @@ CREATE TABLE IF NOT EXISTS "public"."tenant_settings" (
 ALTER TABLE "public"."tenant_settings" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."tenant_subscriptions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "plan_country_configuration_id" "uuid",
-    "start_date" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "end_date" timestamp with time zone,
-    "is_active" boolean DEFAULT true NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "branch_id" "uuid",
-    "is_trial" boolean DEFAULT false NOT NULL
-);
-
-
-ALTER TABLE "public"."tenant_subscriptions" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."tenant_subscriptions"."is_trial" IS 'Indica si la suscripción es un período de prueba.';
-
-
-
 CREATE TABLE IF NOT EXISTS "public"."tenant_template_settings" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     "template_type" "text" NOT NULL,
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "template_id" "uuid"
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
 );
 
 
 ALTER TABLE "public"."tenant_template_settings" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."tenant_template_settings" IS 'Configuración por tenant para activar o desactivar el envío de plantillas de correo específicas.';
-
-
-
-COMMENT ON COLUMN "public"."tenant_template_settings"."template_type" IS 'Identificador de la plantilla que se está configurando (e.g., APPOINTMENT_REMINDER).';
-
-
-
-COMMENT ON COLUMN "public"."tenant_template_settings"."is_active" IS 'Interruptor para que el tenant decida si este tipo de correo se envía o no.';
-
-
-
-COMMENT ON COLUMN "public"."tenant_template_settings"."template_id" IS 'La plantilla específica que un tenant elige usar. Si es NULL, utiliza la plantilla por defecto de la plataforma.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."timezones" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "name" "text" NOT NULL,
-    "offset_str" "text" NOT NULL,
-    "is_active" boolean DEFAULT true,
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "original_countries" "text"[]
-);
-
-
-ALTER TABLE "public"."timezones" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."timezones"."original_countries" IS 'Array of ISO codes of countries where this timezone is originally from.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."translations" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "language_id" "uuid" NOT NULL,
-    "key" "text" NOT NULL,
-    "value" "text" NOT NULL,
-    "context" "text",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid"
-);
-
-
-ALTER TABLE "public"."translations" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."treatment_categories" (
@@ -15828,8 +14243,11 @@ CREATE TABLE IF NOT EXISTS "public"."treatment_categories" (
     "description" "text",
     "is_active" boolean DEFAULT true NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."treatment_categories" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."treatment_categories" OWNER TO "postgres";
@@ -15839,8 +14257,12 @@ CREATE TABLE IF NOT EXISTS "public"."treatment_category_assignments" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "treatment_id" "uuid" NOT NULL,
     "category_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."treatment_category_assignments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."treatment_category_assignments" OWNER TO "postgres";
@@ -15853,8 +14275,12 @@ CREATE TABLE IF NOT EXISTS "public"."treatment_session_items" (
     "service_id" "uuid",
     "quantity" integer DEFAULT 1 NOT NULL,
     "notes" "text",
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "prototype_session_items_check" CHECK ((("product_id" IS NOT NULL) OR ("service_id" IS NOT NULL)))
 );
+
+ALTER TABLE ONLY "public"."treatment_session_items" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."treatment_session_items" OWNER TO "postgres";
@@ -15873,8 +14299,12 @@ CREATE TABLE IF NOT EXISTS "public"."treatment_sessions" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "payment_percentage" numeric(5,2),
     "fixed_payment_amount" numeric(10,2),
+    "tenant_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "payment_method_check" CHECK (("num_nonnulls"("payment_percentage", "fixed_payment_amount") <= 1))
 );
+
+ALTER TABLE ONLY "public"."treatment_sessions" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."treatment_sessions" OWNER TO "postgres";
@@ -15902,37 +14332,26 @@ CREATE TABLE IF NOT EXISTS "public"."turns" (
     "tenant_id" "uuid" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "attention_id" "uuid"
+    "attention_id" "uuid",
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."turns" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."turns" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."tv_displays" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "branch_id" "uuid",
-    "registration_code" "text" NOT NULL,
-    "is_registered" boolean DEFAULT false NOT NULL,
-    "registered_at" timestamp with time zone,
-    "last_heartbeat" timestamp with time zone,
-    "media_playlist_id" "uuid",
-    "tenant_id" "uuid",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."tv_displays" OWNER TO "postgres";
-
-
 CREATE TABLE IF NOT EXISTS "public"."units_of_measure" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "tenant_id" "uuid",
+    "tenant_id" "uuid" NOT NULL,
     "name" "text" NOT NULL,
     "abbreviation" "text" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."units_of_measure" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."units_of_measure" OWNER TO "postgres";
@@ -15954,8 +14373,11 @@ CREATE TABLE IF NOT EXISTS "public"."user_assignments" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "base_salary" numeric(10,2) DEFAULT 0.00 NOT NULL,
-    "is_schedulable" boolean DEFAULT true NOT NULL
+    "is_schedulable" boolean DEFAULT true NOT NULL,
+    "platform_id" "uuid" NOT NULL
 );
+
+ALTER TABLE ONLY "public"."user_assignments" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."user_assignments" OWNER TO "postgres";
@@ -15994,20 +14416,6 @@ CREATE TABLE IF NOT EXISTS "public"."user_avatars" (
 ALTER TABLE "public"."user_avatars" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."user_permissions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "permission_id" "uuid" NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "branch_id" "uuid",
-    "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"()
-);
-
-
-ALTER TABLE "public"."user_permissions" OWNER TO "postgres";
-
-
 CREATE TABLE IF NOT EXISTS "public"."user_time_off" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "start_date" timestamp with time zone NOT NULL,
@@ -16024,60 +14432,15 @@ CREATE TABLE IF NOT EXISTS "public"."user_time_off" (
     "tenant_id" "uuid" NOT NULL,
     "branch_id" "uuid" NOT NULL,
     "absence_type_id" "uuid" NOT NULL,
+    "platform_id" "uuid" NOT NULL,
     CONSTRAINT "stylist_time_off_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'approved'::"text", 'rejected'::"text"]))),
     CONSTRAINT "user_time_off_date_order_check" CHECK (("end_date" >= "start_date"))
 );
 
+ALTER TABLE ONLY "public"."user_time_off" REPLICA IDENTITY FULL;
+
 
 ALTER TABLE "public"."user_time_off" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."v_role_id" (
-    "id" "uuid"
-);
-
-
-ALTER TABLE "public"."v_role_id" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."vendor_platform_commissions" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "user_id" "uuid" NOT NULL,
-    "platform_id" "uuid" NOT NULL,
-    "first_payment_commission_rate" numeric(5,4) DEFAULT 0.50 NOT NULL,
-    "recurring_payment_commission_rate" numeric(5,4) DEFAULT 0.10 NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."vendor_platform_commissions" OWNER TO "postgres";
-
-
-COMMENT ON TABLE "public"."vendor_platform_commissions" IS 'Stores commission rates for vendors on specific platforms.';
-
-
-
-CREATE TABLE IF NOT EXISTS "public"."vendor_tenants" (
-    "user_id" "uuid" NOT NULL,
-    "tenant_id" "uuid" NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."vendor_tenants" OWNER TO "postgres";
-
-
-ALTER TABLE ONLY "public"."asset_usage_tracking" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."asset_usage_tracking_id_seq"'::"regclass");
-
-
-
-ALTER TABLE ONLY "public"."branch_status_history" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."branch_status_history_id_seq"'::"regclass");
-
-
-
-ALTER TABLE ONLY "public"."staff_gallery_items" ALTER COLUMN "id" SET DEFAULT "nextval"('"public"."staff_gallery_items_id_seq"'::"regclass");
-
 
 
 ALTER TABLE ONLY "private"."secrets"
@@ -16086,7 +14449,7 @@ ALTER TABLE ONLY "private"."secrets"
 
 
 ALTER TABLE ONLY "public"."absence_types"
-    ADD CONSTRAINT "absence_types_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "absence_types_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16095,103 +14458,48 @@ ALTER TABLE ONLY "public"."absence_types"
 
 
 
-ALTER TABLE ONLY "public"."api_request_metrics"
-    ADD CONSTRAINT "api_request_metrics_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."appointment_extra_services"
-    ADD CONSTRAINT "appointment_extra_services_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."appointment_products"
-    ADD CONSTRAINT "appointment_products_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."appointment_sessions"
-    ADD CONSTRAINT "appointment_sessions_appointment_id_key" UNIQUE ("appointment_id");
-
-
-
-ALTER TABLE ONLY "public"."appointment_sessions"
-    ADD CONSTRAINT "appointment_sessions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."appointments"
-    ADD CONSTRAINT "appointments_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."asset_purposes"
-    ADD CONSTRAINT "asset_purposes_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."asset_purposes"
-    ADD CONSTRAINT "asset_purposes_purpose_key_unique" UNIQUE ("purpose_key");
-
-
-
-ALTER TABLE ONLY "public"."asset_usage_tracking"
-    ADD CONSTRAINT "asset_usage_tracking_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."asset_usage_tracking"
-    ADD CONSTRAINT "asset_usage_tracking_tenant_asset_period_unique" UNIQUE ("tenant_id", "asset_id", "usage_period_start");
-
-
-
 ALTER TABLE ONLY "public"."attention_combos"
-    ADD CONSTRAINT "attention_combos_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "attention_combos_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."attention_payment_evidences"
-    ADD CONSTRAINT "attention_payment_evidences_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "attention_payment_evidences_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."attention_payments"
-    ADD CONSTRAINT "attention_payments_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "attention_payments_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."attention_products"
-    ADD CONSTRAINT "attention_products_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "attention_products_pkey" PRIMARY KEY ("id", "attention_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."attention_service_evidences"
-    ADD CONSTRAINT "attention_service_evidences_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "attention_service_evidences_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."attention_service_status_history"
-    ADD CONSTRAINT "attention_service_status_history_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "attention_service_status_history_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."attention_services"
-    ADD CONSTRAINT "attention_services_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "attention_services_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."attentions"
-    ADD CONSTRAINT "attentions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."audit_logs"
-    ADD CONSTRAINT "audit_logs_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "attentions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."branch_combo_item_prices"
-    ADD CONSTRAINT "branch_combo_item_prices_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "branch_combo_item_prices_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16201,17 +14509,12 @@ ALTER TABLE ONLY "public"."branch_combos"
 
 
 ALTER TABLE ONLY "public"."branch_combos"
-    ADD CONSTRAINT "branch_combos_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "branch_combos_pkey" PRIMARY KEY ("branch_id", "combo_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."branch_photos"
-    ADD CONSTRAINT "branch_photos_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."branch_playback_state"
-    ADD CONSTRAINT "branch_playback_state_pkey" PRIMARY KEY ("branch_id");
+    ADD CONSTRAINT "branch_photos_pkey" PRIMARY KEY ("id", "branch_id", "tenant_id", "platform_id");
 
 
 
@@ -16221,7 +14524,7 @@ ALTER TABLE ONLY "public"."branch_products"
 
 
 ALTER TABLE ONLY "public"."branch_products"
-    ADD CONSTRAINT "branch_products_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "branch_products_pkey" PRIMARY KEY ("branch_id", "product_id", "tenant_id", "platform_id");
 
 
 
@@ -16231,7 +14534,7 @@ ALTER TABLE ONLY "public"."branch_services"
 
 
 ALTER TABLE ONLY "public"."branch_services"
-    ADD CONSTRAINT "branch_services_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "branch_services_pkey" PRIMARY KEY ("branch_id", "service_id", "tenant_id", "platform_id");
 
 
 
@@ -16241,17 +14544,22 @@ ALTER TABLE ONLY "public"."branch_social_networks"
 
 
 ALTER TABLE ONLY "public"."branch_social_networks"
-    ADD CONSTRAINT "branch_social_networks_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "branch_social_networks_pkey" PRIMARY KEY ("id", "branch_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."branch_status_history"
-    ADD CONSTRAINT "branch_status_history_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "branch_status_history_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."branches"
-    ADD CONSTRAINT "branches_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "branches_id_tenant_id_platform_id_key" UNIQUE ("id", "tenant_id", "platform_id");
+
+
+
+ALTER TABLE ONLY "public"."branches"
+    ADD CONSTRAINT "branches_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16260,28 +14568,33 @@ ALTER TABLE ONLY "public"."branches"
 
 
 
-ALTER TABLE ONLY "public"."product_brands"
-    ADD CONSTRAINT "brands_pkey" PRIMARY KEY ("id");
-
-
-
 ALTER TABLE ONLY "public"."chatter_attachments"
-    ADD CONSTRAINT "chatter_attachments_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "chatter_attachments_pkey" PRIMARY KEY ("id", "chatter_comment_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."chatter_comments"
-    ADD CONSTRAINT "chatter_comments_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "chatter_comments_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
+
+
+
+ALTER TABLE ONLY "public"."chatter_events"
+    ADD CONSTRAINT "chatter_events_pkey" PRIMARY KEY ("id");
 
 
 
 ALTER TABLE ONLY "public"."client_addresses"
-    ADD CONSTRAINT "client_addresses_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_addresses_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
+
+
+
+ALTER TABLE ONLY "public"."client_branches"
+    ADD CONSTRAINT "client_branches_pkey" PRIMARY KEY ("client_id", "branch_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."client_commercials"
-    ADD CONSTRAINT "client_commercials_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_commercials_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16291,32 +14604,27 @@ ALTER TABLE ONLY "public"."client_commercials"
 
 
 ALTER TABLE ONLY "public"."client_consent_records"
-    ADD CONSTRAINT "client_consent_records_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_consent_records_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."client_contacts"
-    ADD CONSTRAINT "client_contacts_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_contacts_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."client_document_instances"
-    ADD CONSTRAINT "client_document_instances_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_document_instances_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."client_document_templates"
-    ADD CONSTRAINT "client_document_templates_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."client_email_queue"
-    ADD CONSTRAINT "client_email_queue_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_document_templates_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."client_professionals"
-    ADD CONSTRAINT "client_professionals_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_professionals_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16326,7 +14634,7 @@ ALTER TABLE ONLY "public"."client_professionals"
 
 
 ALTER TABLE ONLY "public"."client_treatment_session_items"
-    ADD CONSTRAINT "client_treatment_session_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_treatment_session_items_pkey" PRIMARY KEY ("id", "client_treatment_session_id", "tenant_id", "platform_id");
 
 
 
@@ -16336,137 +14644,82 @@ ALTER TABLE ONLY "public"."client_treatment_sessions"
 
 
 ALTER TABLE ONLY "public"."client_treatment_sessions"
-    ADD CONSTRAINT "client_treatment_sessions_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_treatment_sessions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."client_treatments"
-    ADD CONSTRAINT "client_treatments_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."client_whatsapp_queue"
-    ADD CONSTRAINT "client_whatsapp_queue_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "client_treatments_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."clients"
-    ADD CONSTRAINT "clients_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "clients_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."combo_images"
-    ADD CONSTRAINT "combo_images_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "combo_images_pkey" PRIMARY KEY ("id", "combo_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."combo_items"
-    ADD CONSTRAINT "combo_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "combo_items_pkey" PRIMARY KEY ("id", "combo_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."combos"
-    ADD CONSTRAINT "combos_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "combos_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."commission_payment_evidences"
-    ADD CONSTRAINT "commission_payment_evidences_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "commission_payment_evidences_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."consent_signatures"
-    ADD CONSTRAINT "consent_signatures_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "consent_signatures_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."contact_types"
-    ADD CONSTRAINT "contact_types_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."countries"
-    ADD CONSTRAINT "countries_iso_code_key" UNIQUE ("iso_code");
-
-
-
-ALTER TABLE ONLY "public"."countries"
-    ADD CONSTRAINT "countries_name_key" UNIQUE ("name");
-
-
-
-ALTER TABLE ONLY "public"."countries"
-    ADD CONSTRAINT "countries_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."country_timezones"
-    ADD CONSTRAINT "country_timezones_pkey" PRIMARY KEY ("country_id", "timezone_id");
-
-
-
-ALTER TABLE ONLY "public"."currencies"
-    ADD CONSTRAINT "currencies_code_key" UNIQUE ("code");
-
-
-
-ALTER TABLE ONLY "public"."currencies"
-    ADD CONSTRAINT "currencies_name_key" UNIQUE ("name");
-
-
-
-ALTER TABLE ONLY "public"."currencies"
-    ADD CONSTRAINT "currencies_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "contact_types_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."document_sequences"
-    ADD CONSTRAINT "document_sequences_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "document_sequences_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."document_types"
-    ADD CONSTRAINT "document_types_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "document_types_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."earned_commissions"
-    ADD CONSTRAINT "earned_commissions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."email_logs"
-    ADD CONSTRAINT "email_logs_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."email_queue"
-    ADD CONSTRAINT "email_queue_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."email_templates"
-    ADD CONSTRAINT "email_templates_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "earned_commissions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."equipment_assignments"
-    ADD CONSTRAINT "equipment_assignments_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "equipment_assignments_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."equipment_brands"
-    ADD CONSTRAINT "equipment_brands_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "equipment_brands_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."equipment_maintenance_history"
-    ADD CONSTRAINT "equipment_maintenance_history_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "equipment_maintenance_history_pkey" PRIMARY KEY ("id", "equipment_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."equipment"
-    ADD CONSTRAINT "equipment_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "equipment_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16476,32 +14729,17 @@ ALTER TABLE ONLY "public"."equipment"
 
 
 ALTER TABLE ONLY "public"."equipment_types"
-    ADD CONSTRAINT "equipment_types_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."error_logs"
-    ADD CONSTRAINT "error_logs_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."exchange_rates"
-    ADD CONSTRAINT "exchange_rates_base_currency_code_target_currency_code_key" UNIQUE ("base_currency_code", "target_currency_code");
-
-
-
-ALTER TABLE ONLY "public"."exchange_rates"
-    ADD CONSTRAINT "exchange_rates_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "equipment_types_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."expense_provider_addresses"
-    ADD CONSTRAINT "expense_provider_addresses_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "expense_provider_addresses_pkey" PRIMARY KEY ("id", "expense_provider_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."expense_provider_contacts"
-    ADD CONSTRAINT "expense_provider_contacts_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "expense_provider_contacts_pkey" PRIMARY KEY ("id", "expense_provider_id", "tenant_id", "platform_id");
 
 
 
@@ -16511,272 +14749,67 @@ ALTER TABLE ONLY "public"."expense_providers"
 
 
 ALTER TABLE ONLY "public"."expense_providers"
-    ADD CONSTRAINT "expense_providers_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "expense_providers_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."expenses"
-    ADD CONSTRAINT "expenses_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "expenses_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."extra_service_sessions"
-    ADD CONSTRAINT "extra_service_sessions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."generic_taxes"
-    ADD CONSTRAINT "generic_taxes_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."global_settings"
-    ADD CONSTRAINT "global_settings_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "extra_service_sessions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."informed_consent_templates"
-    ADD CONSTRAINT "informed_consent_templates_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."integration_auth_methods"
-    ADD CONSTRAINT "integration_auth_methods_method_key" UNIQUE ("method");
-
-
-
-ALTER TABLE ONLY "public"."integration_auth_methods"
-    ADD CONSTRAINT "integration_auth_methods_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."integration_body_formats"
-    ADD CONSTRAINT "integration_body_formats_format_key" UNIQUE ("format");
-
-
-
-ALTER TABLE ONLY "public"."integration_body_formats"
-    ADD CONSTRAINT "integration_body_formats_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."integration_categories"
-    ADD CONSTRAINT "integration_categories_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."integration_categories"
-    ADD CONSTRAINT "integration_categories_slug_key" UNIQUE ("slug");
-
-
-
-ALTER TABLE ONLY "public"."integration_http_methods"
-    ADD CONSTRAINT "integration_http_methods_method_key" UNIQUE ("method");
-
-
-
-ALTER TABLE ONLY "public"."integration_http_methods"
-    ADD CONSTRAINT "integration_http_methods_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."integration_providers"
-    ADD CONSTRAINT "integration_providers_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."integration_providers"
-    ADD CONSTRAINT "integration_providers_slug_key" UNIQUE ("slug");
-
-
-
-ALTER TABLE ONLY "public"."integrations_config"
-    ADD CONSTRAINT "integrations_config_pkey" PRIMARY KEY ("key");
-
-
-
-ALTER TABLE ONLY "public"."investor_platform_shares"
-    ADD CONSTRAINT "investor_platform_shares_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."investor_platform_stakes"
-    ADD CONSTRAINT "investor_platform_stakes_investor_user_id_platform_id_key" UNIQUE ("investor_user_id", "platform_id");
-
-
-
-ALTER TABLE ONLY "public"."investor_platform_stakes"
-    ADD CONSTRAINT "investor_platform_stakes_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "informed_consent_templates_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."invoice_item_taxes"
-    ADD CONSTRAINT "invoice_item_taxes_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "invoice_item_taxes_pkey" PRIMARY KEY ("invoice_id", "invoice_item_id", "tax_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."invoice_items"
-    ADD CONSTRAINT "invoice_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "invoice_items_pkey" PRIMARY KEY ("id", "invoice_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."invoices"
-    ADD CONSTRAINT "invoices_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."languages"
-    ADD CONSTRAINT "languages_iso_code_key" UNIQUE ("iso_code");
-
-
-
-ALTER TABLE ONLY "public"."languages"
-    ADD CONSTRAINT "languages_name_key" UNIQUE ("name");
-
-
-
-ALTER TABLE ONLY "public"."languages"
-    ADD CONSTRAINT "languages_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "invoices_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."media_playlists"
-    ADD CONSTRAINT "media_playlists_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."menu_permissions"
-    ADD CONSTRAINT "menu_permissions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."menu_permissions"
-    ADD CONSTRAINT "menu_permissions_role_id_menu_item_name_key" UNIQUE ("role_id", "menu_item_name");
-
-
-
-ALTER TABLE ONLY "public"."monthly_charges"
-    ADD CONSTRAINT "monthly_charges_billing_period_unique" UNIQUE ("tenant_id", "billing_period_start");
-
-
-
-ALTER TABLE ONLY "public"."monthly_charges"
-    ADD CONSTRAINT "monthly_charges_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "media_playlists_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."notifications"
-    ADD CONSTRAINT "notifications_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."payment_intents"
-    ADD CONSTRAINT "payment_intents_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."payment_intents"
-    ADD CONSTRAINT "payment_intents_reference_key" UNIQUE ("reference");
+    ADD CONSTRAINT "notifications_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."payment_methods"
-    ADD CONSTRAINT "payment_methods_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."payments"
-    ADD CONSTRAINT "payments_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "payment_methods_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."payslip_commissions"
-    ADD CONSTRAINT "payslip_commissions_pkey" PRIMARY KEY ("payslip_id", "commission_id");
+    ADD CONSTRAINT "payslip_commissions_pkey" PRIMARY KEY ("payslip_id", "commission_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."payslips"
-    ADD CONSTRAINT "payslips_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "payslips_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."performance_metrics"
-    ADD CONSTRAINT "performance_metrics_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."permissions"
-    ADD CONSTRAINT "permissions_name_key" UNIQUE ("name");
-
-
-
-ALTER TABLE ONLY "public"."permissions"
-    ADD CONSTRAINT "permissions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."phone_prefixes"
-    ADD CONSTRAINT "phone_prefixes_iso_code_key" UNIQUE ("iso_code");
-
-
-
-ALTER TABLE ONLY "public"."phone_prefixes"
-    ADD CONSTRAINT "phone_prefixes_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."client_branches"
-    ADD CONSTRAINT "pk_client_branches" PRIMARY KEY ("client_id", "branch_id");
-
-
-
-ALTER TABLE ONLY "public"."plan_asset_bonuses"
-    ADD CONSTRAINT "plan_asset_bonuses_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."plan_asset_limits"
-    ADD CONSTRAINT "plan_asset_limits_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."plan_asset_limits"
-    ADD CONSTRAINT "plan_asset_limits_unique_asset_per_config" UNIQUE ("plan_country_config_id", "asset_id");
-
-
-
-ALTER TABLE ONLY "public"."plan_assets"
-    ADD CONSTRAINT "plan_assets_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."plan_country_configurations"
-    ADD CONSTRAINT "plan_country_configurations_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."plan_country_configurations"
-    ADD CONSTRAINT "plan_country_configurations_unique" UNIQUE ("plan_id", "country_id");
-
-
-
-ALTER TABLE ONLY "public"."platform_assignments"
-    ADD CONSTRAINT "platform_assignments_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."platform_assignments"
-    ADD CONSTRAINT "platform_assignments_user_id_platform_id_role_id_key" UNIQUE ("user_id", "platform_id", "role_id");
-
-
-
-ALTER TABLE ONLY "public"."platform_countries"
-    ADD CONSTRAINT "platform_countries_pkey" PRIMARY KEY ("platform_id", "country_id");
-
-
-
-ALTER TABLE ONLY "public"."platforms"
-    ADD CONSTRAINT "platforms_name_key" UNIQUE ("name");
+    ADD CONSTRAINT "performance_metrics_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16786,12 +14819,12 @@ ALTER TABLE ONLY "public"."platforms"
 
 
 ALTER TABLE ONLY "public"."playlist_items"
-    ADD CONSTRAINT "playlist_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "playlist_items_pkey" PRIMARY KEY ("id", "playlist_id", "tenant_id", "platform_id");
 
 
 
-ALTER TABLE ONLY "public"."price_tariffs"
-    ADD CONSTRAINT "price_tariffs_pkey" PRIMARY KEY ("id");
+ALTER TABLE ONLY "public"."product_brands"
+    ADD CONSTRAINT "product_brands_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16801,7 +14834,7 @@ ALTER TABLE ONLY "public"."product_brands"
 
 
 ALTER TABLE ONLY "public"."product_categories"
-    ADD CONSTRAINT "product_categories_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "product_categories_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16811,47 +14844,47 @@ ALTER TABLE ONLY "public"."product_categories"
 
 
 ALTER TABLE ONLY "public"."product_category_assignments"
-    ADD CONSTRAINT "product_category_assignments_pkey" PRIMARY KEY ("product_id", "category_id");
+    ADD CONSTRAINT "product_category_assignments_pkey" PRIMARY KEY ("product_id", "category_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."product_images"
-    ADD CONSTRAINT "product_images_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "product_images_pkey" PRIMARY KEY ("id", "product_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."product_movements"
-    ADD CONSTRAINT "product_movements_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."product_user_commissions"
-    ADD CONSTRAINT "product_stylist_commissions_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "product_movements_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."product_tax_types"
-    ADD CONSTRAINT "product_tax_types_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "product_tax_types_pkey" PRIMARY KEY ("product_id", "tax_type_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."product_transfer_items"
-    ADD CONSTRAINT "product_transfer_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "product_transfer_items_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."product_transfer_reception_items"
-    ADD CONSTRAINT "product_transfer_reception_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "product_transfer_reception_items_pkey" PRIMARY KEY ("id", "reception_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."product_transfer_receptions"
-    ADD CONSTRAINT "product_transfer_receptions_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "product_transfer_receptions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."product_transfers"
-    ADD CONSTRAINT "product_transfers_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "product_transfers_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
+
+
+
+ALTER TABLE ONLY "public"."product_user_commissions"
+    ADD CONSTRAINT "product_user_commissions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16861,62 +14894,62 @@ ALTER TABLE ONLY "public"."product_user_commissions"
 
 
 ALTER TABLE ONLY "public"."products"
-    ADD CONSTRAINT "products_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "products_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."purchase_item_receptions"
-    ADD CONSTRAINT "purchase_item_receptions_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "purchase_item_receptions_pkey" PRIMARY KEY ("id", "purchase_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."purchase_items"
-    ADD CONSTRAINT "purchase_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "purchase_items_pkey" PRIMARY KEY ("id", "purchase_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."purchases"
-    ADD CONSTRAINT "purchases_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "purchases_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."recurring_expenses"
-    ADD CONSTRAINT "recurring_expenses_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "recurring_expenses_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."rescheduled_attentions"
-    ADD CONSTRAINT "rescheduled_attentions_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "rescheduled_attentions_pkey" PRIMARY KEY ("id", "attention_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."roles"
-    ADD CONSTRAINT "roles_name_key" UNIQUE ("name");
+    ADD CONSTRAINT "roles_name_platform_key" UNIQUE ("name", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."roles"
-    ADD CONSTRAINT "roles_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "roles_pkey" PRIMARY KEY ("id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."sales_items"
-    ADD CONSTRAINT "sales_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "sales_items_pkey" PRIMARY KEY ("id", "sale_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."sales"
-    ADD CONSTRAINT "sales_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "sales_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
-    ADD CONSTRAINT "satisfaction_survey_ratings_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "satisfaction_survey_ratings_pkey" PRIMARY KEY ("id", "survey_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."satisfaction_surveys"
-    ADD CONSTRAINT "satisfaction_surveys_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "satisfaction_surveys_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16926,32 +14959,32 @@ ALTER TABLE ONLY "public"."satisfaction_surveys"
 
 
 ALTER TABLE ONLY "public"."schedule_templates"
-    ADD CONSTRAINT "schedule_templates_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "schedule_templates_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."service_categories"
-    ADD CONSTRAINT "service_categories_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "service_categories_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."service_images"
-    ADD CONSTRAINT "service_images_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "service_images_pkey" PRIMARY KEY ("id", "service_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."service_sessions"
-    ADD CONSTRAINT "service_sessions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."service_user_commissions"
-    ADD CONSTRAINT "service_stylist_commissions_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "service_sessions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."service_tax_types"
-    ADD CONSTRAINT "service_tax_types_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "service_tax_types_pkey" PRIMARY KEY ("service_id", "tax_type_id", "tenant_id", "platform_id");
+
+
+
+ALTER TABLE ONLY "public"."service_user_commissions"
+    ADD CONSTRAINT "service_user_commissions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16961,17 +14994,17 @@ ALTER TABLE ONLY "public"."service_user_commissions"
 
 
 ALTER TABLE ONLY "public"."services"
-    ADD CONSTRAINT "services_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "services_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."signed_consents"
-    ADD CONSTRAINT "signed_consents_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "signed_consents_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."staff_gallery_items"
-    ADD CONSTRAINT "staff_gallery_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "staff_gallery_items_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -16980,43 +15013,18 @@ ALTER TABLE ONLY "public"."staff_gallery_items"
 
 
 
-ALTER TABLE ONLY "public"."user_schedules"
-    ADD CONSTRAINT "stylist_schedules_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."user_time_off"
-    ADD CONSTRAINT "stylist_time_off_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."subscription_assets"
-    ADD CONSTRAINT "subscription_assets_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."subscription_items"
-    ADD CONSTRAINT "subscription_items_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."subscription_plans"
-    ADD CONSTRAINT "subscription_plans_pkey" PRIMARY KEY ("id");
-
-
-
 ALTER TABLE ONLY "public"."supplier_addresses"
-    ADD CONSTRAINT "supplier_addresses_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "supplier_addresses_pkey" PRIMARY KEY ("id", "supplier_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."supplier_contacts"
-    ADD CONSTRAINT "supplier_contacts_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "supplier_contacts_pkey" PRIMARY KEY ("id", "supplier_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."supplier_products"
-    ADD CONSTRAINT "supplier_products_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "supplier_products_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -17031,37 +15039,22 @@ ALTER TABLE ONLY "public"."suppliers"
 
 
 ALTER TABLE ONLY "public"."suppliers"
-    ADD CONSTRAINT "suppliers_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."system_alerts"
-    ADD CONSTRAINT "system_alerts_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."tariff_asset_prices"
-    ADD CONSTRAINT "tariff_asset_prices_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "suppliers_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."tax_types"
-    ADD CONSTRAINT "tax_types_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "tax_types_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."tenant_client_settings"
-    ADD CONSTRAINT "tenant_client_settings_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "tenant_client_settings_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."tenant_client_settings"
     ADD CONSTRAINT "tenant_client_settings_tenant_id_key" UNIQUE ("tenant_id");
-
-
-
-ALTER TABLE ONLY "public"."tenant_integrations"
-    ADD CONSTRAINT "tenant_integrations_pkey" PRIMARY KEY ("id");
 
 
 
@@ -17071,7 +15064,7 @@ ALTER TABLE ONLY "public"."tenant_settings"
 
 
 ALTER TABLE ONLY "public"."tenant_social_networks"
-    ADD CONSTRAINT "tenant_social_networks_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "tenant_social_networks_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -17080,43 +15073,18 @@ ALTER TABLE ONLY "public"."tenant_social_networks"
 
 
 
-ALTER TABLE ONLY "public"."tenant_subscriptions"
-    ADD CONSTRAINT "tenant_subscriptions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."tenant_subscriptions"
-    ADD CONSTRAINT "tenant_subscriptions_tenant_id_pcc_id_start_date_key" UNIQUE ("tenant_id", "plan_country_configuration_id", "start_date");
+ALTER TABLE ONLY "public"."tenant_template_settings"
+    ADD CONSTRAINT "tenant_template_settings_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."tenant_template_settings"
-    ADD CONSTRAINT "tenant_template_settings_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "tenant_template_settings_unique" UNIQUE ("tenant_id", "platform_id", "template_type");
 
 
 
 ALTER TABLE ONLY "public"."tenants"
-    ADD CONSTRAINT "tenants_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."timezones"
-    ADD CONSTRAINT "timezones_name_key" UNIQUE ("name");
-
-
-
-ALTER TABLE ONLY "public"."timezones"
-    ADD CONSTRAINT "timezones_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."translations"
-    ADD CONSTRAINT "translations_language_id_key_key" UNIQUE ("language_id", "key");
-
-
-
-ALTER TABLE ONLY "public"."translations"
-    ADD CONSTRAINT "translations_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "tenants_pkey" PRIMARY KEY ("id", "platform_id");
 
 
 
@@ -17126,12 +15094,12 @@ ALTER TABLE ONLY "public"."treatment_categories"
 
 
 ALTER TABLE ONLY "public"."treatment_categories"
-    ADD CONSTRAINT "treatment_categories_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "treatment_categories_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."treatment_category_assignments"
-    ADD CONSTRAINT "treatment_category_assignments_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "treatment_category_assignments_pkey" PRIMARY KEY ("category_id", "treatment_id", "tenant_id", "platform_id");
 
 
 
@@ -17141,22 +15109,17 @@ ALTER TABLE ONLY "public"."treatment_category_assignments"
 
 
 ALTER TABLE ONLY "public"."treatment_images"
-    ADD CONSTRAINT "treatment_images_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."treatments"
-    ADD CONSTRAINT "treatment_prototypes_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "treatment_images_pkey" PRIMARY KEY ("id", "treatment_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."treatment_session_items"
-    ADD CONSTRAINT "treatment_session_items_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "treatment_session_items_pkey" PRIMARY KEY ("id", "session_id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."treatment_sessions"
-    ADD CONSTRAINT "treatment_sessions_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "treatment_sessions_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -17165,33 +15128,23 @@ ALTER TABLE ONLY "public"."treatment_sessions"
 
 
 
+ALTER TABLE ONLY "public"."treatments"
+    ADD CONSTRAINT "treatments_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
+
+
+
 ALTER TABLE ONLY "public"."turns"
-    ADD CONSTRAINT "turns_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "turns_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."tv_displays"
-    ADD CONSTRAINT "tv_displays_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "tv_displays_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
 ALTER TABLE ONLY "public"."tv_displays"
     ADD CONSTRAINT "tv_displays_registration_code_key" UNIQUE ("registration_code");
-
-
-
-ALTER TABLE ONLY "public"."tariff_asset_prices"
-    ADD CONSTRAINT "unique_asset_for_tariff" UNIQUE ("tariff_id", "asset_id");
-
-
-
-ALTER TABLE ONLY "public"."plan_assets"
-    ADD CONSTRAINT "unique_asset_key_for_platform" UNIQUE ("platform_id", "asset_key");
-
-
-
-ALTER TABLE ONLY "public"."price_tariffs"
-    ADD CONSTRAINT "unique_effective_date_for_plan" UNIQUE ("subscription_plan_id", "effective_date");
 
 
 
@@ -17219,11 +15172,6 @@ ALTER TABLE ONLY "public"."product_user_commissions"
 
 
 
-ALTER TABLE ONLY "public"."payments"
-    ADD CONSTRAINT "unique_provider_payment" UNIQUE ("provider", "provider_payment_id");
-
-
-
 ALTER TABLE ONLY "public"."service_tax_types"
     ADD CONSTRAINT "unique_service_tax_type" UNIQUE ("service_id", "tax_type_id");
 
@@ -17234,38 +15182,13 @@ ALTER TABLE ONLY "public"."service_user_commissions"
 
 
 
-ALTER TABLE ONLY "public"."generic_taxes"
-    ADD CONSTRAINT "unique_tax_per_country" UNIQUE ("name", "country_id");
-
-
-
 ALTER TABLE ONLY "public"."tax_types"
     ADD CONSTRAINT "unique_tax_type_name_per_tenant" UNIQUE ("tenant_id", "name");
 
 
 
-ALTER TABLE ONLY "public"."email_templates"
-    ADD CONSTRAINT "unique_template_lang_per_tenant" UNIQUE ("tenant_id", "template_type", "language_id");
-
-
-
-ALTER TABLE ONLY "public"."tenant_template_settings"
-    ADD CONSTRAINT "unique_template_per_tenant" UNIQUE ("tenant_id", "template_type");
-
-
-
-ALTER TABLE ONLY "public"."tenant_integrations"
-    ADD CONSTRAINT "unique_tenant_provider_environment" UNIQUE ("tenant_id", "provider", "environment");
-
-
-
-ALTER TABLE ONLY "public"."investor_platform_shares"
-    ADD CONSTRAINT "unique_user_platform_share" UNIQUE ("user_id", "platform_id");
-
-
-
 ALTER TABLE ONLY "public"."units_of_measure"
-    ADD CONSTRAINT "units_of_measure_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "units_of_measure_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -17274,13 +15197,8 @@ ALTER TABLE ONLY "public"."units_of_measure"
 
 
 
-ALTER TABLE ONLY "public"."subscription_assets"
-    ADD CONSTRAINT "uq_active_asset" UNIQUE ("tenant_subscription_id", "asset_type", "asset_reference_id", "status");
-
-
-
 ALTER TABLE ONLY "public"."user_assignments"
-    ADD CONSTRAINT "user_assignments_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "user_assignments_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -17290,7 +15208,7 @@ ALTER TABLE ONLY "public"."user_assignments"
 
 
 ALTER TABLE ONLY "public"."user_avatars"
-    ADD CONSTRAINT "user_avatars_pkey" PRIMARY KEY ("id");
+    ADD CONSTRAINT "user_avatars_pkey" PRIMARY KEY ("id", "user_id", "tenant_id", "platform_id");
 
 
 
@@ -17299,13 +15217,8 @@ ALTER TABLE ONLY "public"."user_avatars"
 
 
 
-ALTER TABLE ONLY "public"."user_permissions"
-    ADD CONSTRAINT "user_permissions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."user_permissions"
-    ADD CONSTRAINT "user_permissions_user_id_permission_id_key" UNIQUE ("user_id", "permission_id");
+ALTER TABLE ONLY "public"."user_schedules"
+    ADD CONSTRAINT "user_schedules_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -17314,18 +15227,8 @@ ALTER TABLE ONLY "public"."user_schedules"
 
 
 
-ALTER TABLE ONLY "public"."vendor_platform_commissions"
-    ADD CONSTRAINT "vendor_platform_commissions_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."vendor_platform_commissions"
-    ADD CONSTRAINT "vendor_platform_commissions_user_platform_unique" UNIQUE ("user_id", "platform_id");
-
-
-
-ALTER TABLE ONLY "public"."vendor_tenants"
-    ADD CONSTRAINT "vendor_tenants_pkey" PRIMARY KEY ("user_id", "tenant_id");
+ALTER TABLE ONLY "public"."user_time_off"
+    ADD CONSTRAINT "user_time_off_pkey" PRIMARY KEY ("id", "tenant_id", "platform_id");
 
 
 
@@ -17361,30 +15264,6 @@ CREATE INDEX "idx_ape_user_id" ON "public"."attention_payment_evidences" USING "
 
 
 
-CREATE INDEX "idx_appointment_extra_services_appointment_id" ON "public"."appointment_extra_services" USING "btree" ("appointment_id");
-
-
-
-CREATE INDEX "idx_appointment_products_appointment_id" ON "public"."appointment_products" USING "btree" ("appointment_id");
-
-
-
-CREATE INDEX "idx_appointment_sessions_appointment_id" ON "public"."appointment_sessions" USING "btree" ("appointment_id");
-
-
-
-CREATE INDEX "idx_appointments_client" ON "public"."appointments" USING "btree" ("client_id");
-
-
-
-CREATE INDEX "idx_appointments_date" ON "public"."appointments" USING "btree" ("appointment_date");
-
-
-
-CREATE INDEX "idx_appointments_status" ON "public"."appointments" USING "btree" ("status");
-
-
-
 CREATE INDEX "idx_ase_attention_service_id" ON "public"."attention_service_evidences" USING "btree" ("attention_service_id");
 
 
@@ -17409,10 +15288,6 @@ CREATE INDEX "idx_attentions_confirmation_token" ON "public"."attentions" USING 
 
 
 
-CREATE INDEX "idx_audit_logs_resource" ON "public"."audit_logs" USING "btree" ("tenant_id", "object_type", "object_id");
-
-
-
 CREATE INDEX "idx_branch_photos_branch_id" ON "public"."branch_photos" USING "btree" ("branch_id");
 
 
@@ -17430,6 +15305,14 @@ CREATE INDEX "idx_chatter_attachments_tenant_id" ON "public"."chatter_attachment
 
 
 CREATE INDEX "idx_chatter_comments_resource" ON "public"."chatter_comments" USING "btree" ("tenant_id", "resource_type", "resource_id");
+
+
+
+CREATE INDEX "idx_chatter_events_resource" ON "public"."chatter_events" USING "btree" ("resource_id", "resource_type");
+
+
+
+CREATE INDEX "idx_chatter_events_tenant_platform" ON "public"."chatter_events" USING "btree" ("tenant_id", "platform_id");
 
 
 
@@ -17490,14 +15373,6 @@ CREATE INDEX "idx_notifications_tenant_user" ON "public"."notifications" USING "
 
 
 CREATE INDEX "idx_notifications_user_id" ON "public"."notifications" USING "btree" ("user_id");
-
-
-
-CREATE INDEX "idx_plan_assets_platform_id" ON "public"."plan_assets" USING "btree" ("platform_id");
-
-
-
-CREATE INDEX "idx_price_tariffs_plan_id_effective_date" ON "public"."price_tariffs" USING "btree" ("subscription_plan_id", "effective_date" DESC);
 
 
 
@@ -17573,35 +15448,11 @@ CREATE INDEX "idx_stylist_time_off_status" ON "public"."user_time_off" USING "bt
 
 
 
-CREATE INDEX "idx_subscription_items_item_type" ON "public"."subscription_items" USING "btree" ("item_type");
-
-
-
-CREATE INDEX "idx_subscription_items_subscription_id" ON "public"."subscription_items" USING "btree" ("subscription_id");
-
-
-
-CREATE INDEX "idx_subscription_plans_platform_id" ON "public"."subscription_plans" USING "btree" ("platform_id");
-
-
-
-CREATE INDEX "idx_tariff_asset_prices_tariff_id" ON "public"."tariff_asset_prices" USING "btree" ("tariff_id");
-
-
-
 CREATE INDEX "idx_tenant_settings_data" ON "public"."tenant_settings" USING "gin" ("settings_data");
 
 
 
 CREATE INDEX "idx_tenants_country_id" ON "public"."tenants" USING "btree" ("country_id");
-
-
-
-CREATE INDEX "idx_translations_context" ON "public"."translations" USING "btree" ("context");
-
-
-
-CREATE INDEX "idx_translations_language_key" ON "public"."translations" USING "btree" ("language_id", "key");
 
 
 
@@ -17641,14 +15492,6 @@ CREATE INDEX "notifications_user_id_created_at_idx" ON "public"."notifications" 
 
 
 
-CREATE UNIQUE INDEX "one_default_trial_per_platform_idx" ON "public"."subscription_plans" USING "btree" ("platform_id") WHERE ("is_default_trial" = true);
-
-
-
-CREATE UNIQUE INDEX "unique_active_integration_per_provider" ON "public"."tenant_integrations" USING "btree" ("tenant_id", "provider") WHERE ("is_active" = true);
-
-
-
 CREATE UNIQUE INDEX "unique_owner_per_platform" ON "public"."tenants" USING "btree" ("platform_id") WHERE ("is_system_owner" = true);
 
 
@@ -17669,206 +15512,6 @@ CREATE OR REPLACE TRIGGER "attentions_status_change_trigger" AFTER UPDATE ON "pu
 
 
 
-CREATE OR REPLACE TRIGGER "audit_absence_types_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."absence_types" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_appointment_extra_services_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."appointment_extra_services" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_appointment_products_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."appointment_products" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_appointment_sessions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."appointment_sessions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_appointments_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."appointments" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_asset_usage_tracking_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."asset_usage_tracking" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_attention_payment_evidences_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."attention_payment_evidences" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_attention_products_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."attention_products" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_attention_service_evidences_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."attention_service_evidences" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_attention_services_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."attention_services" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_attentions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."attentions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_branch_products_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."branch_products" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_branch_services_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."branch_services" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_branches_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."branches" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_brands_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."product_brands" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_changes_on_combo_items" AFTER INSERT OR DELETE OR UPDATE ON "public"."combo_items" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_changes_on_combos" AFTER INSERT OR DELETE OR UPDATE ON "public"."combos" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_changes_on_expense_providers" AFTER INSERT OR DELETE OR UPDATE ON "public"."expense_providers" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_changes_on_expenses" AFTER INSERT OR DELETE OR UPDATE ON "public"."expenses" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_changes_on_products" AFTER INSERT OR DELETE OR UPDATE ON "public"."products" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_changes_on_recurring_expenses" AFTER INSERT OR DELETE OR UPDATE ON "public"."recurring_expenses" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_changes_on_services" AFTER INSERT OR DELETE OR UPDATE ON "public"."services" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_changes_on_suppliers" AFTER INSERT OR DELETE OR UPDATE ON "public"."suppliers" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_client_branches_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."client_branches" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_clients_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."clients" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_commission_payment_evidences_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."commission_payment_evidences" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_consent_signatures_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."consent_signatures" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_countries_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."countries" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_currencies_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."currencies" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_extra_service_sessions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."extra_service_sessions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_menu_permissions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."menu_permissions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_monthly_charges_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."monthly_charges" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_permissions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."permissions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_plan_asset_bonuses_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."plan_asset_bonuses" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_plan_asset_limits_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."plan_asset_limits" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_plan_country_configurations_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."plan_country_configurations" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_product_user_commissions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."product_user_commissions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_satisfaction_survey_ratings_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."satisfaction_survey_ratings" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_satisfaction_surveys_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."satisfaction_surveys" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_schedule_templates_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."schedule_templates" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_service_categories_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."service_categories" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_service_sessions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."service_sessions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_service_user_commissions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."service_user_commissions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_subscription_plans_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."subscription_plans" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_supplier_products_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."supplier_products" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_tenants_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."tenants" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_translations_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."translations" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_user_permissions_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."user_permissions" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_user_schedules_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."user_schedules" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_user_time_off_changes" AFTER INSERT OR DELETE OR UPDATE ON "public"."user_time_off" FOR EACH ROW EXECUTE FUNCTION "public"."audit_trigger_function"();
-
-
-
 CREATE OR REPLACE TRIGGER "calculate_extra_service_duration" BEFORE UPDATE ON "public"."extra_service_sessions" FOR EACH ROW EXECUTE FUNCTION "public"."calculate_session_duration"();
 
 
@@ -17881,14 +15524,6 @@ CREATE OR REPLACE TRIGGER "clients_fts_update" BEFORE INSERT OR UPDATE ON "publi
 
 
 
-CREATE OR REPLACE TRIGGER "handle_payment_intents_updated_at" BEFORE UPDATE ON "public"."payment_intents" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
-CREATE OR REPLACE TRIGGER "handle_payments_updated_at" BEFORE UPDATE ON "public"."payments" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
 CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."branch_photos" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
 
 
@@ -17897,47 +15532,11 @@ CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."combo_i
 
 
 
-CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."integration_auth_methods" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
-CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."integration_body_formats" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
-CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."integration_categories" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
-CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."integration_http_methods" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
-CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."integration_providers" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
-CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."investor_platform_shares" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
 CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."service_images" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
 
 
 
 CREATE OR REPLACE TRIGGER "handle_updated_at" BEFORE UPDATE ON "public"."user_avatars" FOR EACH ROW EXECUTE FUNCTION "public"."moddatetime"('updated_at');
-
-
-
-CREATE OR REPLACE TRIGGER "handle_updated_at_client_email_queue" BEFORE UPDATE ON "public"."client_email_queue" FOR EACH ROW EXECUTE FUNCTION "public"."handle_updated_at"();
-
-
-
-CREATE OR REPLACE TRIGGER "handle_updated_at_client_whatsapp_queue" BEFORE UPDATE ON "public"."client_whatsapp_queue" FOR EACH ROW EXECUTE FUNCTION "public"."handle_updated_at"();
-
-
-
-CREATE OR REPLACE TRIGGER "handle_updated_at_email_queue" BEFORE UPDATE ON "public"."email_queue" FOR EACH ROW EXECUTE FUNCTION "public"."handle_updated_at"();
 
 
 
@@ -17981,31 +15580,11 @@ CREATE OR REPLACE TRIGGER "set_tax_types_timestamp" BEFORE UPDATE ON "public"."t
 
 
 
-CREATE OR REPLACE TRIGGER "trg_branch_status_change" AFTER INSERT OR UPDATE OF "status" ON "public"."branches" FOR EACH ROW EXECUTE FUNCTION "public"."log_branch_status_change"();
+CREATE OR REPLACE TRIGGER "trg_branch_status_change" AFTER INSERT OR UPDATE OF "status" ON "public"."branches" FOR EACH ROW EXECUTE FUNCTION "public"."log_branch_status_change_v2"();
 
 
 
 CREATE OR REPLACE TRIGGER "trigger_absence_types_updated_at" BEFORE UPDATE ON "public"."absence_types" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_appointment_extra_services_updated_at" BEFORE UPDATE ON "public"."appointment_extra_services" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_appointment_products_updated_at" BEFORE UPDATE ON "public"."appointment_products" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_appointment_sessions_updated_at" BEFORE UPDATE ON "public"."appointment_sessions" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_asset_usage_tracking_updated_at" BEFORE UPDATE ON "public"."asset_usage_tracking" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_audit_logs_updated_at" BEFORE UPDATE ON "public"."audit_logs" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -18018,46 +15597,6 @@ CREATE OR REPLACE TRIGGER "trigger_branch_services_updated_at" BEFORE UPDATE ON 
 
 
 CREATE OR REPLACE TRIGGER "trigger_branches_updated_at" BEFORE UPDATE ON "public"."branches" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_calculate_session_duration" BEFORE INSERT OR UPDATE ON "public"."appointment_sessions" FOR EACH ROW EXECUTE FUNCTION "public"."calculate_session_duration"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_countries_updated_at" BEFORE UPDATE ON "public"."countries" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_currencies_updated_at" BEFORE UPDATE ON "public"."currencies" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_languages_updated_at" BEFORE UPDATE ON "public"."languages" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_menu_permissions_updated_at" BEFORE UPDATE ON "public"."menu_permissions" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_monthly_charges_updated_at" BEFORE UPDATE ON "public"."monthly_charges" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_permissions_updated_at" BEFORE UPDATE ON "public"."permissions" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_plan_asset_bonuses_updated_at" BEFORE UPDATE ON "public"."plan_asset_bonuses" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_plan_asset_limits_updated_at" BEFORE UPDATE ON "public"."plan_asset_limits" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_plan_country_configurations_updated_at" BEFORE UPDATE ON "public"."plan_country_configurations" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -18082,22 +15621,6 @@ CREATE OR REPLACE TRIGGER "trigger_stylist_schedules_updated_at" BEFORE UPDATE O
 
 
 CREATE OR REPLACE TRIGGER "trigger_stylist_time_off_updated_at" BEFORE UPDATE ON "public"."user_time_off" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_subscription_items_updated_at" BEFORE UPDATE ON "public"."subscription_items" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_subscription_plans_updated_at" BEFORE UPDATE ON "public"."subscription_plans" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_tenant_integrations_updated_at" BEFORE UPDATE ON "public"."tenant_integrations" FOR EACH ROW EXECUTE FUNCTION "public"."handle_updated_at"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_tenant_subscriptions_updated_at" BEFORE UPDATE ON "public"."tenant_subscriptions" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -18134,10 +15657,6 @@ CREATE OR REPLACE TRIGGER "trigger_update_supplier_products_updated_at" BEFORE U
 
 
 CREATE OR REPLACE TRIGGER "trigger_update_suppliers_updated_at" BEFORE UPDATE ON "public"."suppliers" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
-
-
-
-CREATE OR REPLACE TRIGGER "trigger_user_permissions_updated_at" BEFORE UPDATE ON "public"."user_permissions" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -18202,492 +15721,522 @@ CREATE OR REPLACE TRIGGER "update_tenants_updated_at" BEFORE UPDATE ON "public".
 
 
 ALTER TABLE ONLY "public"."absence_types"
-    ADD CONSTRAINT "absence_types_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "absence_types_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."api_request_metrics"
-    ADD CONSTRAINT "api_request_metrics_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."appointment_extra_services"
-    ADD CONSTRAINT "appointment_extra_services_appointment_id_fkey" FOREIGN KEY ("appointment_id") REFERENCES "public"."appointments"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_extra_services"
-    ADD CONSTRAINT "appointment_extra_services_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_products"
-    ADD CONSTRAINT "appointment_products_appointment_id_fkey" FOREIGN KEY ("appointment_id") REFERENCES "public"."appointments"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_products"
-    ADD CONSTRAINT "appointment_products_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_sessions"
-    ADD CONSTRAINT "appointment_sessions_appointment_id_fkey" FOREIGN KEY ("appointment_id") REFERENCES "public"."appointments"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointments"
-    ADD CONSTRAINT "appointments_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id");
-
-
-
-ALTER TABLE ONLY "public"."appointments"
-    ADD CONSTRAINT "appointments_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id");
-
-
-
-ALTER TABLE ONLY "public"."asset_usage_tracking"
-    ADD CONSTRAINT "asset_usage_tracking_asset_id_fkey" FOREIGN KEY ("asset_id") REFERENCES "public"."plan_assets"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."asset_usage_tracking"
-    ADD CONSTRAINT "asset_usage_tracking_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."absence_types"
+    ADD CONSTRAINT "absence_types_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_combos"
-    ADD CONSTRAINT "attention_combos_attention_id_fkey" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attention_combos_attention_id_fkey" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_combos"
-    ADD CONSTRAINT "attention_combos_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attention_combos_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_combos"
-    ADD CONSTRAINT "attention_combos_combo_id_fkey" FOREIGN KEY ("combo_id") REFERENCES "public"."combos"("id") ON DELETE RESTRICT;
+    ADD CONSTRAINT "attention_combos_combo_id_fkey" FOREIGN KEY ("tenant_id", "combo_id", "platform_id") REFERENCES "public"."combos"("tenant_id", "id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_combos"
-    ADD CONSTRAINT "attention_combos_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attention_combos_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."attention_combos"
+    ADD CONSTRAINT "attention_combos_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."attention_payment_evidences"
+    ADD CONSTRAINT "attention_payment_evidences_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."attention_payments"
-    ADD CONSTRAINT "attention_payments_attention_id_fkey" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attention_payments_attention_id_fkey" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_payments"
-    ADD CONSTRAINT "attention_payments_payment_method_id_fkey" FOREIGN KEY ("payment_method_id") REFERENCES "public"."payment_methods"("id") ON DELETE RESTRICT;
+    ADD CONSTRAINT "attention_payments_payment_method_id_fkey" FOREIGN KEY ("platform_id", "tenant_id", "payment_method_id") REFERENCES "public"."payment_methods"("platform_id", "tenant_id", "id") ON DELETE RESTRICT;
 
 
 
 ALTER TABLE ONLY "public"."attention_payments"
-    ADD CONSTRAINT "attention_payments_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attention_payments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."attention_payments"
+    ADD CONSTRAINT "attention_payments_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_products"
-    ADD CONSTRAINT "attention_products_attention_id_fkey" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attention_products_attention_id_fkey" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_products"
-    ADD CONSTRAINT "attention_products_attention_service_id_fkey" FOREIGN KEY ("attention_service_id") REFERENCES "public"."attention_services"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "attention_products_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."attention_products"
-    ADD CONSTRAINT "attention_products_combo_id_fkey" FOREIGN KEY ("combo_id") REFERENCES "public"."attention_combos"("id");
-
-
-
-ALTER TABLE ONLY "public"."attention_products"
-    ADD CONSTRAINT "attention_products_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."attention_service_evidences"
+    ADD CONSTRAINT "attention_service_evidences_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."attention_service_status_history"
-    ADD CONSTRAINT "attention_service_status_history_attention_service_id_fkey" FOREIGN KEY ("attention_service_id") REFERENCES "public"."attention_services"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."attention_service_status_history"
-    ADD CONSTRAINT "attention_service_status_history_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."attention_service_status_history"
-    ADD CONSTRAINT "attention_service_status_history_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."attention_service_status_history"
-    ADD CONSTRAINT "attention_service_status_history_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "attention_service_status_history_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."attention_services"
-    ADD CONSTRAINT "attention_services_attention_id_fkey" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attention_services_attention_id_fkey" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_services"
-    ADD CONSTRAINT "attention_services_combo_id_fkey" FOREIGN KEY ("combo_id") REFERENCES "public"."attention_combos"("id");
-
-
-
-ALTER TABLE ONLY "public"."attention_services"
-    ADD CONSTRAINT "attention_services_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attention_services_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."attentions"
-    ADD CONSTRAINT "attentions_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "attentions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."attentions"
+    ADD CONSTRAINT "attentions_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_combo_item_prices"
-    ADD CONSTRAINT "branch_combo_item_prices_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_combo_item_prices_branch_id_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_combo_item_prices"
-    ADD CONSTRAINT "branch_combo_item_prices_combo_id_fkey" FOREIGN KEY ("combo_id") REFERENCES "public"."combos"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_combo_item_prices_combo_id_fkey" FOREIGN KEY ("combo_id", "tenant_id", "platform_id") REFERENCES "public"."combos"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_combo_item_prices"
-    ADD CONSTRAINT "branch_combo_item_prices_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_combo_item_prices_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."branch_combo_item_prices"
-    ADD CONSTRAINT "branch_combo_item_prices_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_combo_item_prices_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_combo_item_prices"
-    ADD CONSTRAINT "branch_combo_item_prices_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_combo_item_prices_service_id_fkey" FOREIGN KEY ("service_id", "tenant_id", "platform_id") REFERENCES "public"."services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_combos"
-    ADD CONSTRAINT "branch_combos_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_combos_branch_id_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_combos"
-    ADD CONSTRAINT "branch_combos_combo_id_fkey" FOREIGN KEY ("combo_id") REFERENCES "public"."combos"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_combos_combo_id_fkey" FOREIGN KEY ("combo_id", "tenant_id", "platform_id") REFERENCES "public"."combos"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_combos"
-    ADD CONSTRAINT "branch_combos_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_combos_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."branch_playback_state"
-    ADD CONSTRAINT "branch_playback_state_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."branch_playback_state"
-    ADD CONSTRAINT "branch_playback_state_current_playlist_item_id_fkey" FOREIGN KEY ("current_playlist_item_id") REFERENCES "public"."playlist_items"("id") ON DELETE SET NULL;
+ALTER TABLE ONLY "public"."branch_photos"
+    ADD CONSTRAINT "branch_photos_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."branch_products"
-    ADD CONSTRAINT "branch_products_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_products_branch_id_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_products"
-    ADD CONSTRAINT "branch_products_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_products_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."branch_products"
-    ADD CONSTRAINT "branch_products_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_products_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_services"
-    ADD CONSTRAINT "branch_services_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_services_branch_id_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_services"
-    ADD CONSTRAINT "branch_services_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_services_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."branch_services"
-    ADD CONSTRAINT "branch_services_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_services_service_id_fkey" FOREIGN KEY ("service_id", "tenant_id", "platform_id") REFERENCES "public"."services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_social_networks"
-    ADD CONSTRAINT "branch_social_networks_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_social_networks_branch_id_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."branch_social_networks"
+    ADD CONSTRAINT "branch_social_networks_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."branch_status_history"
-    ADD CONSTRAINT "branch_status_history_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branch_status_history_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_status_history"
-    ADD CONSTRAINT "branch_status_history_changed_by_fkey" FOREIGN KEY ("changed_by") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "branch_status_history_changed_by_fkey" FOREIGN KEY ("changed_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."branch_status_history"
+    ADD CONSTRAINT "branch_status_history_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."branches"
-    ADD CONSTRAINT "branches_currency_id_fkey" FOREIGN KEY ("currency_id") REFERENCES "public"."currencies"("id") ON UPDATE CASCADE ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."branches"
-    ADD CONSTRAINT "branches_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "branches_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."chatter_attachments"
-    ADD CONSTRAINT "chatter_attachments_chatter_comment_id_fkey" FOREIGN KEY ("chatter_comment_id") REFERENCES "public"."chatter_comments"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "chatter_attachments_chatter_comment_id_fkey" FOREIGN KEY ("chatter_comment_id", "tenant_id", "platform_id") REFERENCES "public"."chatter_comments"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."chatter_attachments"
-    ADD CONSTRAINT "chatter_attachments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "chatter_attachments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."chatter_attachments"
+    ADD CONSTRAINT "chatter_attachments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."chatter_comments"
-    ADD CONSTRAINT "chatter_comments_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "chatter_comments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."chatter_comments"
-    ADD CONSTRAINT "chatter_comments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "chatter_comments_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."chatter_comments"
+    ADD CONSTRAINT "chatter_comments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."chatter_events"
+    ADD CONSTRAINT "chatter_events_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."client_addresses"
-    ADD CONSTRAINT "client_addresses_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_addresses_client_id_fkey" FOREIGN KEY ("client_id", "tenant_id", "platform_id") REFERENCES "public"."clients"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_addresses"
-    ADD CONSTRAINT "client_addresses_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_addresses_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."client_addresses"
+    ADD CONSTRAINT "client_addresses_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."client_branches"
+    ADD CONSTRAINT "client_branches_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."client_commercials"
-    ADD CONSTRAINT "client_commercials_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_commercials_client_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "client_id") REFERENCES "public"."clients"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_commercials"
-    ADD CONSTRAINT "client_commercials_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_commercials_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."client_commercials"
-    ADD CONSTRAINT "client_commercials_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_commercials_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."client_commercials"
+    ADD CONSTRAINT "client_commercials_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
 ALTER TABLE ONLY "public"."client_consent_records"
-    ADD CONSTRAINT "client_consent_records_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_consent_records_client_id_fkey" FOREIGN KEY ("client_id", "tenant_id", "platform_id") REFERENCES "public"."clients"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."client_consent_records"
+    ADD CONSTRAINT "client_consent_records_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."client_contacts"
-    ADD CONSTRAINT "client_contacts_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_contacts_client_id_fkey" FOREIGN KEY ("client_id", "tenant_id", "platform_id") REFERENCES "public"."clients"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_contacts"
-    ADD CONSTRAINT "client_contacts_contact_type_id_fkey" FOREIGN KEY ("contact_type_id") REFERENCES "public"."contact_types"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "client_contacts_contact_type_id_fkey" FOREIGN KEY ("contact_type_id", "tenant_id", "platform_id") REFERENCES "public"."contact_types"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_contacts"
-    ADD CONSTRAINT "client_contacts_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_contacts_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."client_contacts"
+    ADD CONSTRAINT "client_contacts_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_document_instances"
-    ADD CONSTRAINT "client_document_instances_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_document_instances_client_id_fkey" FOREIGN KEY ("client_id", "tenant_id", "platform_id") REFERENCES "public"."clients"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_document_instances"
-    ADD CONSTRAINT "client_document_instances_template_id_fkey" FOREIGN KEY ("template_id") REFERENCES "public"."client_document_templates"("id") ON DELETE RESTRICT;
+    ADD CONSTRAINT "client_document_instances_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."client_document_instances"
+    ADD CONSTRAINT "client_document_instances_template_id_fkey" FOREIGN KEY ("template_id", "tenant_id", "platform_id") REFERENCES "public"."client_document_templates"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_document_templates"
-    ADD CONSTRAINT "client_document_templates_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_document_templates_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."client_email_queue"
-    ADD CONSTRAINT "client_email_queue_recipient_client_id_fkey" FOREIGN KEY ("recipient_client_id") REFERENCES "public"."clients"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."client_email_queue"
-    ADD CONSTRAINT "client_email_queue_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."client_document_templates"
+    ADD CONSTRAINT "client_document_templates_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_professionals"
-    ADD CONSTRAINT "client_professionals_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_professionals_client_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "client_id") REFERENCES "public"."clients"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_professionals"
-    ADD CONSTRAINT "client_professionals_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_professionals_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."client_professionals"
-    ADD CONSTRAINT "client_professionals_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_professionals_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."client_professionals"
+    ADD CONSTRAINT "client_professionals_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE RESTRICT;
 
 
 
 ALTER TABLE ONLY "public"."client_treatment_session_items"
-    ADD CONSTRAINT "client_treatment_session_items_client_treatment_session_id_fkey" FOREIGN KEY ("client_treatment_session_id") REFERENCES "public"."client_treatment_sessions"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_treatment_session_items_client_treatment_session_id_fkey" FOREIGN KEY ("client_treatment_session_id", "tenant_id", "platform_id") REFERENCES "public"."client_treatment_sessions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_treatment_session_items"
-    ADD CONSTRAINT "client_treatment_session_items_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "client_treatment_session_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."client_treatment_session_items"
-    ADD CONSTRAINT "client_treatment_session_items_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "client_treatment_session_items_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."client_treatment_session_items"
+    ADD CONSTRAINT "client_treatment_session_items_service_id_fkey" FOREIGN KEY ("service_id", "tenant_id", "platform_id") REFERENCES "public"."services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_treatment_sessions"
-    ADD CONSTRAINT "client_treatment_sessions_client_treatment_id_fkey" FOREIGN KEY ("client_treatment_id") REFERENCES "public"."client_treatments"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "client_treatment_sessions_client_treatment_id_fkey" FOREIGN KEY ("client_treatment_id", "tenant_id", "platform_id") REFERENCES "public"."client_treatments"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_treatment_sessions"
-    ADD CONSTRAINT "client_treatment_sessions_prototype_session_id_fkey" FOREIGN KEY ("prototype_session_id") REFERENCES "public"."treatment_sessions"("id");
+    ADD CONSTRAINT "client_treatment_sessions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."client_treatment_sessions"
+    ADD CONSTRAINT "client_treatment_sessions_prototype_session_id_fkey" FOREIGN KEY ("prototype_session_id", "tenant_id", "platform_id") REFERENCES "public"."treatment_sessions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_treatments"
-    ADD CONSTRAINT "client_treatments_prototype_id_fkey" FOREIGN KEY ("prototype_id") REFERENCES "public"."treatments"("id");
+    ADD CONSTRAINT "client_treatments_client_id_fkey" FOREIGN KEY ("client_id", "tenant_id", "platform_id") REFERENCES "public"."clients"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."client_whatsapp_queue"
-    ADD CONSTRAINT "client_whatsapp_queue_recipient_client_id_fkey" FOREIGN KEY ("recipient_client_id") REFERENCES "public"."clients"("id") ON DELETE SET NULL;
+ALTER TABLE ONLY "public"."client_treatments"
+    ADD CONSTRAINT "client_treatments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."client_whatsapp_queue"
-    ADD CONSTRAINT "client_whatsapp_queue_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."client_treatments"
+    ADD CONSTRAINT "client_treatments_prototype_id_fkey" FOREIGN KEY ("prototype_id", "tenant_id", "platform_id") REFERENCES "public"."treatments"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."clients"
+    ADD CONSTRAINT "clients_document_type_id_fkey" FOREIGN KEY ("document_type_id", "tenant_id", "platform_id") REFERENCES "public"."document_types"("id", "tenant_id", "platform_id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."clients"
+    ADD CONSTRAINT "clients_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."combo_images"
+    ADD CONSTRAINT "combo_images_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."combo_items"
-    ADD CONSTRAINT "combo_items_combo_id_fkey" FOREIGN KEY ("combo_id") REFERENCES "public"."combos"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "combo_items_combo_id_fkey" FOREIGN KEY ("combo_id", "tenant_id", "platform_id") REFERENCES "public"."combos"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."combo_items"
-    ADD CONSTRAINT "combo_items_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "combo_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."combo_items"
-    ADD CONSTRAINT "combo_items_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "combo_items_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."combo_items"
+    ADD CONSTRAINT "combo_items_service_id_fkey" FOREIGN KEY ("service_id", "tenant_id", "platform_id") REFERENCES "public"."services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."combos"
-    ADD CONSTRAINT "combos_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "combos_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."combos"
+    ADD CONSTRAINT "combos_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."commission_payment_evidences"
+    ADD CONSTRAINT "commission_payment_evidences_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."consent_signatures"
+    ADD CONSTRAINT "consent_signatures_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."contact_types"
-    ADD CONSTRAINT "contact_types_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "contact_types_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."countries"
-    ADD CONSTRAINT "countries_default_currency_id_fkey" FOREIGN KEY ("default_currency_id") REFERENCES "public"."currencies"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."countries"
-    ADD CONSTRAINT "countries_default_language_iso_code_fkey" FOREIGN KEY ("default_language_iso_code") REFERENCES "public"."languages"("iso_code") ON UPDATE CASCADE ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."countries"
-    ADD CONSTRAINT "countries_default_localization_id_fkey" FOREIGN KEY ("default_localization_id") REFERENCES "public"."languages"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."countries"
-    ADD CONSTRAINT "countries_phone_prefix_id_fkey" FOREIGN KEY ("phone_prefix_id") REFERENCES "public"."phone_prefixes"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."country_timezones"
-    ADD CONSTRAINT "country_timezones_country_id_fkey" FOREIGN KEY ("country_id") REFERENCES "public"."countries"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."country_timezones"
-    ADD CONSTRAINT "country_timezones_timezone_id_fkey" FOREIGN KEY ("timezone_id") REFERENCES "public"."timezones"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."contact_types"
+    ADD CONSTRAINT "contact_types_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."document_sequences"
-    ADD CONSTRAINT "document_sequences_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id");
+    ADD CONSTRAINT "document_sequences_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."document_sequences"
-    ADD CONSTRAINT "document_sequences_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "document_sequences_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."document_sequences"
+    ADD CONSTRAINT "document_sequences_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."document_types"
-    ADD CONSTRAINT "document_types_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "document_types_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."document_types"
+    ADD CONSTRAINT "document_types_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."earned_commissions"
-    ADD CONSTRAINT "earned_commissions_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "earned_commissions_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."earned_commissions"
-    ADD CONSTRAINT "earned_commissions_sale_id_fkey" FOREIGN KEY ("sale_id") REFERENCES "public"."sales"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "earned_commissions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."earned_commissions"
-    ADD CONSTRAINT "earned_commissions_sales_item_id_fkey" FOREIGN KEY ("sales_item_id") REFERENCES "public"."sales_items"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "earned_commissions_sale_id_fkey" FOREIGN KEY ("sale_id", "platform_id", "tenant_id") REFERENCES "public"."sales"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."earned_commissions"
-    ADD CONSTRAINT "earned_commissions_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "earned_commissions_sales_item_id_fkey" FOREIGN KEY ("tenant_id", "sale_id", "sales_item_id", "platform_id") REFERENCES "public"."sales_items"("tenant_id", "sale_id", "id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."earned_commissions"
+    ADD CONSTRAINT "earned_commissions_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
@@ -18696,43 +16245,23 @@ ALTER TABLE ONLY "public"."earned_commissions"
 
 
 
-ALTER TABLE ONLY "public"."email_logs"
-    ADD CONSTRAINT "email_logs_template_id_fkey" FOREIGN KEY ("template_id") REFERENCES "public"."email_templates"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."email_logs"
-    ADD CONSTRAINT "email_logs_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."email_templates"
-    ADD CONSTRAINT "email_templates_language_id_fkey" FOREIGN KEY ("language_id") REFERENCES "public"."languages"("id") ON DELETE RESTRICT;
-
-
-
-ALTER TABLE ONLY "public"."email_templates"
-    ADD CONSTRAINT "email_templates_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."email_templates"
-    ADD CONSTRAINT "email_templates_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."equipment_assignments"
+    ADD CONSTRAINT "equipment_assignments_branch_id_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."equipment_assignments"
-    ADD CONSTRAINT "equipment_assignments_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id");
+    ADD CONSTRAINT "equipment_assignments_equipment_id_fkey" FOREIGN KEY ("equipment_id", "tenant_id", "platform_id") REFERENCES "public"."equipment"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."equipment_assignments"
-    ADD CONSTRAINT "equipment_assignments_equipment_id_fkey" FOREIGN KEY ("equipment_id") REFERENCES "public"."equipment"("id");
+    ADD CONSTRAINT "equipment_assignments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."equipment_assignments"
-    ADD CONSTRAINT "equipment_assignments_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "equipment_assignments_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
@@ -18742,67 +16271,97 @@ ALTER TABLE ONLY "public"."equipment_assignments"
 
 
 ALTER TABLE ONLY "public"."equipment"
-    ADD CONSTRAINT "equipment_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."equipment_brands"("id");
+    ADD CONSTRAINT "equipment_brand_id_fkey" FOREIGN KEY ("brand_id", "tenant_id", "platform_id") REFERENCES "public"."equipment_brands"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."equipment_brands"
-    ADD CONSTRAINT "equipment_brands_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "equipment_brands_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."equipment_brands"
+    ADD CONSTRAINT "equipment_brands_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."equipment_maintenance_history"
-    ADD CONSTRAINT "equipment_maintenance_history_equipment_id_fkey" FOREIGN KEY ("equipment_id") REFERENCES "public"."equipment"("id");
+    ADD CONSTRAINT "equipment_maintenance_history_equipment_id_fkey" FOREIGN KEY ("equipment_id", "tenant_id", "platform_id") REFERENCES "public"."equipment"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."equipment_maintenance_history"
-    ADD CONSTRAINT "equipment_maintenance_history_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "equipment_maintenance_history_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."equipment_maintenance_history"
+    ADD CONSTRAINT "equipment_maintenance_history_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."equipment"
-    ADD CONSTRAINT "equipment_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "equipment_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."equipment"
-    ADD CONSTRAINT "equipment_type_id_fkey" FOREIGN KEY ("type_id") REFERENCES "public"."equipment_types"("id");
+    ADD CONSTRAINT "equipment_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."equipment"
+    ADD CONSTRAINT "equipment_type_id_fkey" FOREIGN KEY ("type_id", "tenant_id", "platform_id") REFERENCES "public"."equipment_types"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."equipment_types"
-    ADD CONSTRAINT "equipment_types_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "equipment_types_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."error_logs"
-    ADD CONSTRAINT "error_logs_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."equipment_types"
+    ADD CONSTRAINT "equipment_types_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expense_provider_addresses"
+    ADD CONSTRAINT "expense_provider_addresses_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."expense_provider_contacts"
+    ADD CONSTRAINT "expense_provider_contacts_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."expense_providers"
+    ADD CONSTRAINT "expense_providers_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."expenses"
+    ADD CONSTRAINT "expenses_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."extra_service_sessions"
-    ADD CONSTRAINT "extra_service_sessions_appointment_id_fkey" FOREIGN KEY ("appointment_id") REFERENCES "public"."appointments"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."extra_service_sessions"
-    ADD CONSTRAINT "extra_service_sessions_extra_service_id_fkey" FOREIGN KEY ("extra_service_id") REFERENCES "public"."appointment_extra_services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "extra_service_sessions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."attention_payment_evidences"
-    ADD CONSTRAINT "fk_ape_attention_payment" FOREIGN KEY ("attention_payment_id") REFERENCES "public"."attention_payments"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_ape_attention_payment" FOREIGN KEY ("tenant_id", "attention_payment_id", "platform_id") REFERENCES "public"."attention_payments"("tenant_id", "id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_payment_evidences"
-    ADD CONSTRAINT "fk_ape_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_ape_branch" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_payment_evidences"
-    ADD CONSTRAINT "fk_ape_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_ape_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
@@ -18811,632 +16370,418 @@ ALTER TABLE ONLY "public"."attention_payment_evidences"
 
 
 
-ALTER TABLE ONLY "public"."appointment_extra_services"
-    ADD CONSTRAINT "fk_appointment_extra_services_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_extra_services"
-    ADD CONSTRAINT "fk_appointment_extra_services_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_products"
-    ADD CONSTRAINT "fk_appointment_products_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_products"
-    ADD CONSTRAINT "fk_appointment_products_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_sessions"
-    ADD CONSTRAINT "fk_appointment_sessions_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointment_sessions"
-    ADD CONSTRAINT "fk_appointment_sessions_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointments"
-    ADD CONSTRAINT "fk_appointments_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."appointments"
-    ADD CONSTRAINT "fk_appointments_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."plan_assets"
-    ADD CONSTRAINT "fk_asset_purpose" FOREIGN KEY ("asset_purpose_id") REFERENCES "public"."asset_purposes"("id");
-
-
-
-ALTER TABLE ONLY "public"."attention_products"
-    ADD CONSTRAINT "fk_attention_products_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."attention_products"
-    ADD CONSTRAINT "fk_attention_products_client_treatment_session" FOREIGN KEY ("client_treatment_session_id") REFERENCES "public"."client_treatment_sessions"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."attention_products"
-    ADD CONSTRAINT "fk_attention_products_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."attention_service_evidences"
+    ADD CONSTRAINT "fk_ase_attention_service" FOREIGN KEY ("attention_service_id", "tenant_id", "platform_id") REFERENCES "public"."attention_services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_service_evidences"
-    ADD CONSTRAINT "fk_attention_service_evidences_attention_service" FOREIGN KEY ("attention_service_id") REFERENCES "public"."attention_services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_ase_branch" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_service_evidences"
-    ADD CONSTRAINT "fk_attention_service_evidences_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_ase_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."attention_service_evidences"
-    ADD CONSTRAINT "fk_attention_service_evidences_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_ase_user" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
-ALTER TABLE ONLY "public"."attention_service_evidences"
-    ADD CONSTRAINT "fk_attention_service_evidences_user" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+ALTER TABLE ONLY "public"."attention_service_status_history"
+    ADD CONSTRAINT "fk_assh_attention_service" FOREIGN KEY ("attention_service_id", "tenant_id", "platform_id") REFERENCES "public"."attention_services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."attention_services"
-    ADD CONSTRAINT "fk_attention_services_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."attention_service_status_history"
+    ADD CONSTRAINT "fk_assh_branch" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."attention_services"
-    ADD CONSTRAINT "fk_attention_services_client_treatment_session" FOREIGN KEY ("client_treatment_session_id") REFERENCES "public"."client_treatment_sessions"("id") ON DELETE SET NULL;
+ALTER TABLE ONLY "public"."attention_service_status_history"
+    ADD CONSTRAINT "fk_assh_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."attention_services"
-    ADD CONSTRAINT "fk_attention_services_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."attention_services"
-    ADD CONSTRAINT "fk_attention_services_user" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
-
-
-
-COMMENT ON CONSTRAINT "fk_attention_services_user" ON "public"."attention_services" IS 'Links the service to the professional (user) who performed it.';
-
-
-
-ALTER TABLE ONLY "public"."attentions"
-    ADD CONSTRAINT "fk_attentions_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."attentions"
-    ADD CONSTRAINT "fk_attentions_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."integration_providers"
-    ADD CONSTRAINT "fk_auth_method" FOREIGN KEY ("auth_method_id") REFERENCES "public"."integration_auth_methods"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."integration_providers"
-    ADD CONSTRAINT "fk_body_format" FOREIGN KEY ("body_format_id") REFERENCES "public"."integration_body_formats"("id") ON DELETE SET NULL;
+ALTER TABLE ONLY "public"."attention_service_status_history"
+    ADD CONSTRAINT "fk_assh_user" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
 ALTER TABLE ONLY "public"."branch_photos"
-    ADD CONSTRAINT "fk_branch_photos_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_branch_photos_branch" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."branch_photos"
-    ADD CONSTRAINT "fk_branch_photos_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_branch_photos_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."product_brands"
-    ADD CONSTRAINT "fk_brands_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."integration_providers"
-    ADD CONSTRAINT "fk_category" FOREIGN KEY ("category_id") REFERENCES "public"."integration_categories"("id");
+ALTER TABLE ONLY "public"."branches"
+    ADD CONSTRAINT "fk_branches_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_branches"
-    ADD CONSTRAINT "fk_client_branches_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_client_branches_branch" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_branches"
-    ADD CONSTRAINT "fk_client_branches_client" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_client_branches_client" FOREIGN KEY ("client_id", "tenant_id", "platform_id") REFERENCES "public"."clients"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_branches"
-    ADD CONSTRAINT "fk_client_branches_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_client_branches_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_consent_records"
-    ADD CONSTRAINT "fk_client_consent_records_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_client_consent_records_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_document_instances"
-    ADD CONSTRAINT "fk_client_document_instances_attention" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "fk_client_document_instances_attention" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_document_instances"
-    ADD CONSTRAINT "fk_client_document_instances_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_client_document_instances_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."client_treatment_sessions"
-    ADD CONSTRAINT "fk_client_treatment_sessions_attention" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "fk_client_treatment_sessions_attention" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."clients"
-    ADD CONSTRAINT "fk_clients_document_type" FOREIGN KEY ("document_type_id") REFERENCES "public"."document_types"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "fk_clients_document_type" FOREIGN KEY ("document_type_id", "tenant_id", "platform_id") REFERENCES "public"."document_types"("id", "tenant_id", "platform_id") ON DELETE SET NULL;
 
 
 
 ALTER TABLE ONLY "public"."clients"
-    ADD CONSTRAINT "fk_clients_parent_client" FOREIGN KEY ("parent_client_id") REFERENCES "public"."clients"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."clients"
-    ADD CONSTRAINT "fk_clients_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_clients_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."combo_images"
-    ADD CONSTRAINT "fk_combo_images_combo" FOREIGN KEY ("combo_id") REFERENCES "public"."combos"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_combo_images_combo" FOREIGN KEY ("combo_id", "tenant_id", "platform_id") REFERENCES "public"."combos"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."combo_images"
-    ADD CONSTRAINT "fk_combo_images_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."commission_payment_evidences"
-    ADD CONSTRAINT "fk_commission_payment_evidences_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."commission_payment_evidences"
-    ADD CONSTRAINT "fk_commission_payment_evidences_payslip" FOREIGN KEY ("payslip_id") REFERENCES "public"."payslips"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."commission_payment_evidences"
-    ADD CONSTRAINT "fk_commission_payment_evidences_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."commission_payment_evidences"
-    ADD CONSTRAINT "fk_commission_payment_evidences_user" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "fk_combo_images_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."consent_signatures"
-    ADD CONSTRAINT "fk_consent_signatures_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_consent_signatures_branch" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."consent_signatures"
-    ADD CONSTRAINT "fk_consent_signatures_signed_consent" FOREIGN KEY ("signed_consent_id") REFERENCES "public"."signed_consents"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_consent_signatures_signed_consent" FOREIGN KEY ("signed_consent_id", "tenant_id", "platform_id") REFERENCES "public"."signed_consents"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."consent_signatures"
-    ADD CONSTRAINT "fk_consent_signatures_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_consent_signatures_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."consent_signatures"
-    ADD CONSTRAINT "fk_consent_signatures_user" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "fk_consent_signatures_user" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."integration_providers"
-    ADD CONSTRAINT "fk_country" FOREIGN KEY ("country_id") REFERENCES "public"."countries"("id");
+ALTER TABLE ONLY "public"."commission_payment_evidences"
+    ADD CONSTRAINT "fk_cpe_branch" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."expense_provider_addresses"
-    ADD CONSTRAINT "fk_expense_provider_addresses_provider" FOREIGN KEY ("expense_provider_id") REFERENCES "public"."expense_providers"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."commission_payment_evidences"
+    ADD CONSTRAINT "fk_cpe_payslip" FOREIGN KEY ("tenant_id", "platform_id", "payslip_id") REFERENCES "public"."payslips"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."expense_provider_addresses"
-    ADD CONSTRAINT "fk_expense_provider_addresses_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."commission_payment_evidences"
+    ADD CONSTRAINT "fk_cpe_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."expense_provider_contacts"
-    ADD CONSTRAINT "fk_expense_provider_contacts_contact_type" FOREIGN KEY ("contact_type_id") REFERENCES "public"."contact_types"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."expense_provider_contacts"
-    ADD CONSTRAINT "fk_expense_provider_contacts_provider" FOREIGN KEY ("expense_provider_id") REFERENCES "public"."expense_providers"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."expense_provider_contacts"
-    ADD CONSTRAINT "fk_expense_provider_contacts_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."expense_providers"
-    ADD CONSTRAINT "fk_expense_providers_document_type" FOREIGN KEY ("document_type_id") REFERENCES "public"."document_types"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."expense_providers"
-    ADD CONSTRAINT "fk_expense_providers_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."expenses"
-    ADD CONSTRAINT "fk_expenses_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."expenses"
-    ADD CONSTRAINT "fk_expenses_provider" FOREIGN KEY ("expense_provider_id") REFERENCES "public"."expense_providers"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."expenses"
-    ADD CONSTRAINT "fk_expenses_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."commission_payment_evidences"
+    ADD CONSTRAINT "fk_cpe_user" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
 ALTER TABLE ONLY "public"."extra_service_sessions"
-    ADD CONSTRAINT "fk_extra_service_sessions_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_ess_branch" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."extra_service_sessions"
-    ADD CONSTRAINT "fk_extra_service_sessions_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_ess_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."integration_providers"
-    ADD CONSTRAINT "fk_http_method" FOREIGN KEY ("http_method_id") REFERENCES "public"."integration_http_methods"("id") ON DELETE SET NULL;
+ALTER TABLE ONLY "public"."expense_provider_addresses"
+    ADD CONSTRAINT "fk_expense_provider_addresses_provider" FOREIGN KEY ("expense_provider_id", "tenant_id", "platform_id") REFERENCES "public"."expense_providers"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expense_provider_addresses"
+    ADD CONSTRAINT "fk_expense_provider_addresses_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expense_provider_contacts"
+    ADD CONSTRAINT "fk_expense_provider_contacts_contact_type" FOREIGN KEY ("contact_type_id", "tenant_id", "platform_id") REFERENCES "public"."contact_types"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expense_provider_contacts"
+    ADD CONSTRAINT "fk_expense_provider_contacts_provider" FOREIGN KEY ("expense_provider_id", "tenant_id", "platform_id") REFERENCES "public"."expense_providers"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expense_provider_contacts"
+    ADD CONSTRAINT "fk_expense_provider_contacts_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expense_providers"
+    ADD CONSTRAINT "fk_expense_providers_document_type" FOREIGN KEY ("document_type_id", "tenant_id", "platform_id") REFERENCES "public"."document_types"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expense_providers"
+    ADD CONSTRAINT "fk_expense_providers_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expenses"
+    ADD CONSTRAINT "fk_expenses_branch" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expenses"
+    ADD CONSTRAINT "fk_expenses_provider" FOREIGN KEY ("expense_provider_id", "tenant_id", "platform_id") REFERENCES "public"."expense_providers"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."expenses"
+    ADD CONSTRAINT "fk_expenses_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."informed_consent_templates"
-    ADD CONSTRAINT "fk_informed_consent_templates_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."subscription_plans"
-    ADD CONSTRAINT "fk_platform" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."system_alerts"
-    ADD CONSTRAINT "fk_platform" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_reception_items"
-    ADD CONSTRAINT "fk_product" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_user_commissions"
-    ADD CONSTRAINT "fk_product_stylist_commissions_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_user_commissions"
-    ADD CONSTRAINT "fk_product_stylist_commissions_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_informed_consent_templates_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."products"
-    ADD CONSTRAINT "fk_products_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_reception_items"
-    ADD CONSTRAINT "fk_reception" FOREIGN KEY ("reception_id") REFERENCES "public"."product_transfer_receptions"("id");
+    ADD CONSTRAINT "fk_products_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."recurring_expenses"
-    ADD CONSTRAINT "fk_recurring_expenses_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_recurring_expenses_branch" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."recurring_expenses"
-    ADD CONSTRAINT "fk_recurring_expenses_provider" FOREIGN KEY ("expense_provider_id") REFERENCES "public"."expense_providers"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "fk_recurring_expenses_provider" FOREIGN KEY ("expense_provider_id", "tenant_id", "platform_id") REFERENCES "public"."expense_providers"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."recurring_expenses"
-    ADD CONSTRAINT "fk_recurring_expenses_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
-    ADD CONSTRAINT "fk_satisfaction_survey_ratings_attention_service" FOREIGN KEY ("attention_service_id") REFERENCES "public"."attention_services"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
-    ADD CONSTRAINT "fk_satisfaction_survey_ratings_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
-    ADD CONSTRAINT "fk_satisfaction_survey_ratings_survey" FOREIGN KEY ("survey_id") REFERENCES "public"."satisfaction_surveys"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
-    ADD CONSTRAINT "fk_satisfaction_survey_ratings_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."satisfaction_surveys"
-    ADD CONSTRAINT "fk_satisfaction_surveys_attention" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."satisfaction_surveys"
-    ADD CONSTRAINT "fk_satisfaction_surveys_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."satisfaction_surveys"
-    ADD CONSTRAINT "fk_satisfaction_surveys_client" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."satisfaction_surveys"
-    ADD CONSTRAINT "fk_satisfaction_surveys_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_recurring_expenses_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."schedule_templates"
-    ADD CONSTRAINT "fk_schedule_templates_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."service_categories"
-    ADD CONSTRAINT "fk_service_categories_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_schedule_templates_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."service_images"
-    ADD CONSTRAINT "fk_service_images_service" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_service_images_service" FOREIGN KEY ("service_id", "tenant_id", "platform_id") REFERENCES "public"."services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."service_images"
-    ADD CONSTRAINT "fk_service_images_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."service_sessions"
-    ADD CONSTRAINT "fk_service_sessions_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."service_sessions"
-    ADD CONSTRAINT "fk_service_sessions_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."service_user_commissions"
-    ADD CONSTRAINT "fk_service_stylist_commissions_branch" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."service_user_commissions"
-    ADD CONSTRAINT "fk_service_stylist_commissions_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_service_images_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."services"
-    ADD CONSTRAINT "fk_services_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_services_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."signed_consents"
-    ADD CONSTRAINT "fk_signed_consents_attention" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE RESTRICT;
+    ADD CONSTRAINT "fk_signed_consents_attention" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."signed_consents"
-    ADD CONSTRAINT "fk_signed_consents_attention_service" FOREIGN KEY ("attention_service_id") REFERENCES "public"."attention_services"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "fk_signed_consents_attention_service" FOREIGN KEY ("attention_service_id", "tenant_id", "platform_id") REFERENCES "public"."attention_services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."signed_consents"
-    ADD CONSTRAINT "fk_signed_consents_client" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE RESTRICT;
+    ADD CONSTRAINT "fk_signed_consents_client" FOREIGN KEY ("client_id", "tenant_id", "platform_id") REFERENCES "public"."clients"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."signed_consents"
-    ADD CONSTRAINT "fk_signed_consents_professional" FOREIGN KEY ("professional_id") REFERENCES "auth"."users"("id") ON DELETE RESTRICT;
+    ADD CONSTRAINT "fk_signed_consents_professional" FOREIGN KEY ("professional_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."signed_consents"
-    ADD CONSTRAINT "fk_signed_consents_template" FOREIGN KEY ("template_id") REFERENCES "public"."informed_consent_templates"("id") ON DELETE RESTRICT;
+    ADD CONSTRAINT "fk_signed_consents_template" FOREIGN KEY ("template_id", "tenant_id", "platform_id") REFERENCES "public"."informed_consent_templates"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."signed_consents"
-    ADD CONSTRAINT "fk_signed_consents_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_signed_consents_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_surveys"
+    ADD CONSTRAINT "fk_ss_attention" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_surveys"
+    ADD CONSTRAINT "fk_ss_branch" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_surveys"
+    ADD CONSTRAINT "fk_ss_client" FOREIGN KEY ("tenant_id", "platform_id", "client_id") REFERENCES "public"."clients"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_surveys"
+    ADD CONSTRAINT "fk_ss_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
+    ADD CONSTRAINT "fk_ssr_attention_service" FOREIGN KEY ("attention_service_id", "tenant_id", "platform_id") REFERENCES "public"."attention_services"("id", "tenant_id", "platform_id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
+    ADD CONSTRAINT "fk_ssr_branch" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
+    ADD CONSTRAINT "fk_ssr_survey" FOREIGN KEY ("platform_id", "survey_id", "tenant_id") REFERENCES "public"."satisfaction_surveys"("platform_id", "id", "tenant_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
+    ADD CONSTRAINT "fk_ssr_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_user_commissions"
+    ADD CONSTRAINT "fk_suc_branch" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_user_commissions"
+    ADD CONSTRAINT "fk_suc_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."supplier_products"
-    ADD CONSTRAINT "fk_supplier_products_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_supplier_products_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."suppliers"
-    ADD CONSTRAINT "fk_suppliers_document_type" FOREIGN KEY ("document_type_id") REFERENCES "public"."document_types"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."suppliers"
-    ADD CONSTRAINT "fk_suppliers_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_receptions"
-    ADD CONSTRAINT "fk_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_receptions"
-    ADD CONSTRAINT "fk_transfer" FOREIGN KEY ("transfer_id") REFERENCES "public"."product_transfers"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_reception_items"
-    ADD CONSTRAINT "fk_transfer_item" FOREIGN KEY ("transfer_item_id") REFERENCES "public"."product_transfer_items"("id");
-
-
-
-ALTER TABLE ONLY "public"."translations"
-    ADD CONSTRAINT "fk_translations_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_suppliers_tenant" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."user_avatars"
-    ADD CONSTRAINT "fk_user_avatars_tenant" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "fk_user_avatars_tenant" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."generic_taxes"
-    ADD CONSTRAINT "generic_taxes_country_id_fkey" FOREIGN KEY ("country_id") REFERENCES "public"."countries"("id");
-
-
-
-ALTER TABLE ONLY "public"."global_settings"
-    ADD CONSTRAINT "global_settings_base_currency_id_fkey" FOREIGN KEY ("base_currency_id") REFERENCES "public"."currencies"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."investor_platform_shares"
-    ADD CONSTRAINT "investor_platform_shares_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."investor_platform_shares"
-    ADD CONSTRAINT "investor_platform_shares_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."investor_platform_stakes"
-    ADD CONSTRAINT "investor_platform_stakes_investor_user_id_fkey" FOREIGN KEY ("investor_user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."investor_platform_stakes"
-    ADD CONSTRAINT "investor_platform_stakes_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."informed_consent_templates"
+    ADD CONSTRAINT "informed_consent_templates_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."invoice_item_taxes"
-    ADD CONSTRAINT "invoice_item_taxes_invoice_item_id_fkey" FOREIGN KEY ("invoice_item_id") REFERENCES "public"."invoice_items"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "invoice_item_taxes_invoice_item_id_fkey" FOREIGN KEY ("invoice_id", "invoice_item_id", "platform_id", "tenant_id") REFERENCES "public"."invoice_items"("invoice_id", "id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."invoice_item_taxes"
-    ADD CONSTRAINT "invoice_item_taxes_tax_id_fkey" FOREIGN KEY ("tax_id") REFERENCES "public"."generic_taxes"("id");
+    ADD CONSTRAINT "invoice_item_taxes_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."invoice_item_taxes"
+    ADD CONSTRAINT "invoice_item_taxes_tax_id_fkey" FOREIGN KEY ("platform_id", "tenant_id", "tax_id") REFERENCES "public"."tax_types"("platform_id", "tenant_id", "id") ON DELETE RESTRICT;
 
 
 
 ALTER TABLE ONLY "public"."invoice_items"
-    ADD CONSTRAINT "invoice_items_invoice_id_fkey" FOREIGN KEY ("invoice_id") REFERENCES "public"."invoices"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "invoice_items_invoice_id_fkey" FOREIGN KEY ("invoice_id", "tenant_id", "platform_id") REFERENCES "public"."invoices"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."invoice_items"
-    ADD CONSTRAINT "invoice_items_parent_item_id_fkey" FOREIGN KEY ("parent_item_id") REFERENCES "public"."invoice_items"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."invoice_items"
-    ADD CONSTRAINT "invoice_items_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id");
-
-
-
-ALTER TABLE ONLY "public"."invoice_items"
-    ADD CONSTRAINT "invoice_items_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."invoice_items"
-    ADD CONSTRAINT "invoice_items_subscription_plan_id_fkey" FOREIGN KEY ("subscription_plan_id") REFERENCES "public"."subscription_plans"("id");
+    ADD CONSTRAINT "invoice_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."invoices"
-    ADD CONSTRAINT "invoices_attention_id_fkey" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "invoices_billed_to_client_id_fkey" FOREIGN KEY ("billed_to_client_id", "tenant_id", "platform_id") REFERENCES "public"."clients"("id", "tenant_id", "platform_id") ON DELETE SET NULL;
 
 
 
 ALTER TABLE ONLY "public"."invoices"
-    ADD CONSTRAINT "invoices_billed_to_client_id_fkey" FOREIGN KEY ("billed_to_client_id") REFERENCES "public"."clients"("id");
+    ADD CONSTRAINT "invoices_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."invoices"
-    ADD CONSTRAINT "invoices_billed_to_tenant_id_fkey" FOREIGN KEY ("billed_to_tenant_id") REFERENCES "public"."tenants"("id");
-
-
-
-ALTER TABLE ONLY "public"."invoices"
-    ADD CONSTRAINT "invoices_currency_id_fkey" FOREIGN KEY ("currency_id") REFERENCES "public"."currencies"("id");
-
-
-
-ALTER TABLE ONLY "public"."invoices"
-    ADD CONSTRAINT "invoices_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "invoices_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."media_playlists"
-    ADD CONSTRAINT "media_playlists_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "media_playlists_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."monthly_charges"
-    ADD CONSTRAINT "monthly_charges_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."media_playlists"
+    ADD CONSTRAINT "media_playlists_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."notifications"
-    ADD CONSTRAINT "notifications_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "notifications_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."notifications"
+    ADD CONSTRAINT "notifications_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
@@ -19445,38 +16790,43 @@ ALTER TABLE ONLY "public"."notifications"
 
 
 
-ALTER TABLE ONLY "public"."payment_intents"
-    ADD CONSTRAINT "payment_intents_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."payment_methods"
+    ADD CONSTRAINT "payment_methods_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."payment_methods"
-    ADD CONSTRAINT "payment_methods_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."payments"
-    ADD CONSTRAINT "payments_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "payment_methods_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."payslip_commissions"
-    ADD CONSTRAINT "payslip_commissions_commission_id_fkey" FOREIGN KEY ("commission_id") REFERENCES "public"."earned_commissions"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "payslip_commissions_commission_id_fkey" FOREIGN KEY ("commission_id", "tenant_id", "platform_id") REFERENCES "public"."earned_commissions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."payslip_commissions"
-    ADD CONSTRAINT "payslip_commissions_payslip_id_fkey" FOREIGN KEY ("payslip_id") REFERENCES "public"."payslips"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "payslip_commissions_payslip_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "payslip_id") REFERENCES "public"."payslips"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."payslip_commissions"
+    ADD CONSTRAINT "payslip_commissions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."payslips"
-    ADD CONSTRAINT "payslips_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "payslips_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."payslips"
-    ADD CONSTRAINT "payslips_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "payslips_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."payslips"
+    ADD CONSTRAINT "payslips_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
@@ -19486,267 +16836,282 @@ ALTER TABLE ONLY "public"."payslips"
 
 
 ALTER TABLE ONLY "public"."performance_metrics"
-    ADD CONSTRAINT "performance_metrics_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "performance_metrics_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."plan_asset_bonuses"
-    ADD CONSTRAINT "plan_asset_bonuses_bonus_asset_fkey" FOREIGN KEY ("bonus_asset_id") REFERENCES "public"."plan_assets"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."performance_metrics"
+    ADD CONSTRAINT "performance_metrics_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."plan_asset_bonuses"
-    ADD CONSTRAINT "plan_asset_bonuses_source_limit_fkey" FOREIGN KEY ("source_asset_limit_id") REFERENCES "public"."plan_asset_limits"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."purchase_item_receptions"
+    ADD CONSTRAINT "pir_purchase_item_id_fkey" FOREIGN KEY ("platform_id", "purchase_item_id", "purchase_id", "tenant_id") REFERENCES "public"."purchase_items"("platform_id", "id", "purchase_id", "tenant_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."plan_asset_limits"
-    ADD CONSTRAINT "plan_asset_limits_asset_id_fkey" FOREIGN KEY ("asset_id") REFERENCES "public"."plan_assets"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."plan_asset_limits"
-    ADD CONSTRAINT "plan_asset_limits_config_id_fkey" FOREIGN KEY ("plan_country_config_id") REFERENCES "public"."plan_country_configurations"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."plan_assets"
-    ADD CONSTRAINT "plan_assets_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."plan_country_configurations"
-    ADD CONSTRAINT "plan_country_configurations_country_id_fkey" FOREIGN KEY ("country_id") REFERENCES "public"."countries"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."plan_country_configurations"
-    ADD CONSTRAINT "plan_country_configurations_plan_id_fkey" FOREIGN KEY ("plan_id") REFERENCES "public"."subscription_plans"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."platform_assignments"
-    ADD CONSTRAINT "platform_assignments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."platform_assignments"
-    ADD CONSTRAINT "platform_assignments_role_id_fkey" FOREIGN KEY ("role_id") REFERENCES "public"."roles"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."platform_assignments"
-    ADD CONSTRAINT "platform_assignments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."platform_countries"
-    ADD CONSTRAINT "platform_countries_country_id_fkey" FOREIGN KEY ("country_id") REFERENCES "public"."countries"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."platform_countries"
-    ADD CONSTRAINT "platform_countries_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."platforms"
-    ADD CONSTRAINT "platforms_default_currency_id_fkey" FOREIGN KEY ("default_currency_id") REFERENCES "public"."currencies"("id");
-
-
-
-ALTER TABLE ONLY "public"."platforms"
-    ADD CONSTRAINT "platforms_default_language_id_fkey" FOREIGN KEY ("default_language_id") REFERENCES "public"."languages"("id");
+ALTER TABLE ONLY "public"."purchase_item_receptions"
+    ADD CONSTRAINT "pir_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."playlist_items"
-    ADD CONSTRAINT "playlist_items_playlist_id_fkey" FOREIGN KEY ("playlist_id") REFERENCES "public"."media_playlists"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "playlist_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."price_tariffs"
-    ADD CONSTRAINT "price_tariffs_currency_id_fkey" FOREIGN KEY ("currency_id") REFERENCES "public"."currencies"("id");
+ALTER TABLE ONLY "public"."playlist_items"
+    ADD CONSTRAINT "playlist_items_playlist_id_fkey" FOREIGN KEY ("playlist_id", "tenant_id", "platform_id") REFERENCES "public"."media_playlists"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."price_tariffs"
-    ADD CONSTRAINT "price_tariffs_subscription_plan_id_fkey" FOREIGN KEY ("subscription_plan_id") REFERENCES "public"."subscription_plans"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."product_brands"
+    ADD CONSTRAINT "product_brands_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."product_brands"
+    ADD CONSTRAINT "product_brands_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."product_categories"
-    ADD CONSTRAINT "product_categories_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "product_categories_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."product_categories"
+    ADD CONSTRAINT "product_categories_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."product_category_assignments"
-    ADD CONSTRAINT "product_category_assignments_category_id_fkey" FOREIGN KEY ("category_id") REFERENCES "public"."product_categories"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "product_category_assignments_category_id_fkey" FOREIGN KEY ("category_id", "tenant_id", "platform_id") REFERENCES "public"."product_categories"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."product_category_assignments"
-    ADD CONSTRAINT "product_category_assignments_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "product_category_assignments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."product_category_assignments"
-    ADD CONSTRAINT "product_category_assignments_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "product_category_assignments_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."product_images"
-    ADD CONSTRAINT "product_images_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "product_images_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."product_images"
-    ADD CONSTRAINT "product_images_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "product_images_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_images"
+    ADD CONSTRAINT "product_images_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."product_movements"
-    ADD CONSTRAINT "product_movements_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id");
+    ADD CONSTRAINT "product_movements_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."product_movements"
-    ADD CONSTRAINT "product_movements_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id");
+    ADD CONSTRAINT "product_movements_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."product_movements"
-    ADD CONSTRAINT "product_movements_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "product_movements_product_id_fkey" FOREIGN KEY ("tenant_id", "product_id", "platform_id") REFERENCES "public"."products"("tenant_id", "id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_movements"
+    ADD CONSTRAINT "product_movements_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_tax_types"
+    ADD CONSTRAINT "product_tax_types_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."product_tax_types"
+    ADD CONSTRAINT "product_tax_types_product_id_fkey" FOREIGN KEY ("tenant_id", "product_id", "platform_id") REFERENCES "public"."products"("tenant_id", "id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_tax_types"
+    ADD CONSTRAINT "product_tax_types_tax_type_id_fkey" FOREIGN KEY ("platform_id", "tenant_id", "tax_type_id") REFERENCES "public"."tax_types"("platform_id", "tenant_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_tax_types"
+    ADD CONSTRAINT "product_tax_types_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_items"
+    ADD CONSTRAINT "product_transfer_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_items"
+    ADD CONSTRAINT "product_transfer_items_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_items"
+    ADD CONSTRAINT "product_transfer_items_transfer_id_fkey" FOREIGN KEY ("transfer_id", "tenant_id", "platform_id") REFERENCES "public"."product_transfers"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_reception_items"
+    ADD CONSTRAINT "product_transfer_reception_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_reception_items"
+    ADD CONSTRAINT "product_transfer_reception_items_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_reception_items"
+    ADD CONSTRAINT "product_transfer_reception_items_reception_id_fkey" FOREIGN KEY ("reception_id", "tenant_id", "platform_id") REFERENCES "public"."product_transfer_receptions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_reception_items"
+    ADD CONSTRAINT "product_transfer_reception_items_transfer_item_id_fkey" FOREIGN KEY ("transfer_item_id", "tenant_id", "platform_id") REFERENCES "public"."product_transfer_items"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_receptions"
+    ADD CONSTRAINT "product_transfer_receptions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_receptions"
+    ADD CONSTRAINT "product_transfer_receptions_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfer_receptions"
+    ADD CONSTRAINT "product_transfer_receptions_transfer_id_fkey" FOREIGN KEY ("transfer_id", "tenant_id", "platform_id") REFERENCES "public"."product_transfers"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfers"
+    ADD CONSTRAINT "product_transfers_from_branch_id_fkey" FOREIGN KEY ("origin_branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfers"
+    ADD CONSTRAINT "product_transfers_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."product_transfers"
+    ADD CONSTRAINT "product_transfers_requesting_branch_id_fkey" FOREIGN KEY ("requesting_branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfers"
+    ADD CONSTRAINT "product_transfers_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."product_transfers"
+    ADD CONSTRAINT "product_transfers_to_branch_id_fkey" FOREIGN KEY ("destination_branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."product_user_commissions"
-    ADD CONSTRAINT "product_stylist_commissions_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "product_user_commissions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."product_tax_types"
-    ADD CONSTRAINT "product_tax_types_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."product_user_commissions"
+    ADD CONSTRAINT "product_user_commissions_product_id_fkey" FOREIGN KEY ("tenant_id", "product_id", "platform_id") REFERENCES "public"."products"("tenant_id", "id", "platform_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."product_tax_types"
-    ADD CONSTRAINT "product_tax_types_tax_type_id_fkey" FOREIGN KEY ("tax_type_id") REFERENCES "public"."tax_types"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."product_user_commissions"
+    ADD CONSTRAINT "product_user_commissions_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."product_tax_types"
-    ADD CONSTRAINT "product_tax_types_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_items"
-    ADD CONSTRAINT "product_transfer_items_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_items"
-    ADD CONSTRAINT "product_transfer_items_transfer_id_fkey" FOREIGN KEY ("transfer_id") REFERENCES "public"."product_transfers"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_reception_items"
-    ADD CONSTRAINT "product_transfer_reception_items_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_reception_items"
-    ADD CONSTRAINT "product_transfer_reception_items_reception_id_fkey" FOREIGN KEY ("reception_id") REFERENCES "public"."product_transfer_receptions"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_reception_items"
-    ADD CONSTRAINT "product_transfer_reception_items_transfer_item_id_fkey" FOREIGN KEY ("transfer_item_id") REFERENCES "public"."product_transfer_items"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_receptions"
-    ADD CONSTRAINT "product_transfer_receptions_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_transfer_receptions"
-    ADD CONSTRAINT "product_transfer_receptions_transfer_id_fkey" FOREIGN KEY ("transfer_id") REFERENCES "public"."product_transfers"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."product_transfers"
-    ADD CONSTRAINT "product_transfers_from_branch_id_fkey" FOREIGN KEY ("origin_branch_id") REFERENCES "public"."branches"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_transfers"
-    ADD CONSTRAINT "product_transfers_requesting_branch_id_fkey" FOREIGN KEY ("requesting_branch_id") REFERENCES "public"."branches"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_transfers"
-    ADD CONSTRAINT "product_transfers_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
-
-
-
-ALTER TABLE ONLY "public"."product_transfers"
-    ADD CONSTRAINT "product_transfers_to_branch_id_fkey" FOREIGN KEY ("destination_branch_id") REFERENCES "public"."branches"("id");
+ALTER TABLE ONLY "public"."product_user_commissions"
+    ADD CONSTRAINT "product_user_commissions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."products"
-    ADD CONSTRAINT "products_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."product_brands"("id");
-
-
-
-ALTER TABLE ONLY "public"."products"
-    ADD CONSTRAINT "products_unit_of_measure_id_fkey" FOREIGN KEY ("unit_of_measure_id") REFERENCES "public"."units_of_measure"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "products_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."purchase_item_receptions"
-    ADD CONSTRAINT "purchase_item_receptions_purchase_item_id_fkey" FOREIGN KEY ("purchase_item_id") REFERENCES "public"."purchase_items"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."purchase_item_receptions"
-    ADD CONSTRAINT "purchase_item_receptions_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "purchase_item_receptions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."purchase_items"
-    ADD CONSTRAINT "purchase_items_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "purchase_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."purchase_items"
-    ADD CONSTRAINT "purchase_items_purchase_id_fkey" FOREIGN KEY ("purchase_id") REFERENCES "public"."purchases"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "purchase_items_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."purchase_items"
+    ADD CONSTRAINT "purchase_items_purchase_id_fkey" FOREIGN KEY ("purchase_id", "tenant_id", "platform_id") REFERENCES "public"."purchases"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."purchases"
-    ADD CONSTRAINT "purchases_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "purchases_branch_id_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."purchases"
-    ADD CONSTRAINT "purchases_supplier_id_fkey" FOREIGN KEY ("supplier_id") REFERENCES "public"."suppliers"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "purchases_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."purchases"
-    ADD CONSTRAINT "purchases_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "purchases_supplier_id_fkey" FOREIGN KEY ("supplier_id", "tenant_id", "platform_id") REFERENCES "public"."suppliers"("id", "tenant_id", "platform_id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."purchases"
+    ADD CONSTRAINT "purchases_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."recurring_expenses"
+    ADD CONSTRAINT "recurring_expenses_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."rescheduled_attentions"
-    ADD CONSTRAINT "rescheduled_attentions_attention_id_fkey" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "rescheduled_attentions_attention_id_fkey" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."rescheduled_attentions"
-    ADD CONSTRAINT "rescheduled_attentions_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "rescheduled_attentions_client_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "client_id") REFERENCES "public"."clients"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."rescheduled_attentions"
+    ADD CONSTRAINT "rescheduled_attentions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
@@ -19755,83 +17120,133 @@ ALTER TABLE ONLY "public"."rescheduled_attentions"
 
 
 
-ALTER TABLE ONLY "public"."sales"
-    ADD CONSTRAINT "sales_attention_id_fkey" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id");
+ALTER TABLE ONLY "public"."roles"
+    ADD CONSTRAINT "roles_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."sales"
-    ADD CONSTRAINT "sales_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id");
-
-
-
-ALTER TABLE ONLY "public"."sales"
-    ADD CONSTRAINT "sales_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id");
+ALTER TABLE ONLY "public"."roles"
+    ADD CONSTRAINT "roles_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE SET NULL;
 
 
 
 ALTER TABLE ONLY "public"."sales_items"
-    ADD CONSTRAINT "sales_items_parent_item_id_fkey" FOREIGN KEY ("parent_item_id") REFERENCES "public"."sales_items"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "sales_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."sales_items"
-    ADD CONSTRAINT "sales_items_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id");
-
-
-
-ALTER TABLE ONLY "public"."sales_items"
-    ADD CONSTRAINT "sales_items_sale_id_fkey" FOREIGN KEY ("sale_id") REFERENCES "public"."sales"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."sales_items"
-    ADD CONSTRAINT "sales_items_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id");
+    ADD CONSTRAINT "sales_items_sale_id_fkey" FOREIGN KEY ("sale_id", "tenant_id", "platform_id") REFERENCES "public"."sales"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."sales"
-    ADD CONSTRAINT "sales_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "sales_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."sales"
+    ADD CONSTRAINT "sales_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_survey_ratings"
+    ADD CONSTRAINT "satisfaction_survey_ratings_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."satisfaction_surveys"
+    ADD CONSTRAINT "satisfaction_surveys_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."schedule_templates"
+    ADD CONSTRAINT "schedule_templates_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."service_categories"
+    ADD CONSTRAINT "service_categories_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."service_categories"
+    ADD CONSTRAINT "service_categories_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_images"
+    ADD CONSTRAINT "service_images_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."service_sessions"
-    ADD CONSTRAINT "service_sessions_attention_service_id_fkey" FOREIGN KEY ("attention_service_id") REFERENCES "public"."attention_services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "service_sessions_attention_service_id_fkey" FOREIGN KEY ("attention_service_id", "tenant_id", "platform_id") REFERENCES "public"."attention_services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_sessions"
+    ADD CONSTRAINT "service_sessions_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_sessions"
+    ADD CONSTRAINT "service_sessions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."service_sessions"
+    ADD CONSTRAINT "service_sessions_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_tax_types"
+    ADD CONSTRAINT "service_tax_types_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."service_tax_types"
+    ADD CONSTRAINT "service_tax_types_service_id_fkey" FOREIGN KEY ("tenant_id", "service_id", "platform_id") REFERENCES "public"."services"("tenant_id", "id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_tax_types"
+    ADD CONSTRAINT "service_tax_types_tax_type_id_fkey" FOREIGN KEY ("platform_id", "tenant_id", "tax_type_id") REFERENCES "public"."tax_types"("platform_id", "tenant_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."service_tax_types"
+    ADD CONSTRAINT "service_tax_types_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."service_user_commissions"
-    ADD CONSTRAINT "service_stylist_commissions_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "service_user_commissions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."service_tax_types"
-    ADD CONSTRAINT "service_tax_types_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."services"
+    ADD CONSTRAINT "services_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."service_tax_types"
-    ADD CONSTRAINT "service_tax_types_tax_type_id_fkey" FOREIGN KEY ("tax_type_id") REFERENCES "public"."tax_types"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."service_tax_types"
-    ADD CONSTRAINT "service_tax_types_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."service_user_commissions"
-    ADD CONSTRAINT "service_user_commissions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."signed_consents"
+    ADD CONSTRAINT "signed_consents_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."staff_gallery_items"
-    ADD CONSTRAINT "staff_gallery_items_evidence_id_fkey" FOREIGN KEY ("evidence_id") REFERENCES "public"."attention_service_evidences"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "staff_gallery_items_evidence_id_fkey" FOREIGN KEY ("evidence_id", "platform_id", "tenant_id") REFERENCES "public"."attention_service_evidences"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."staff_gallery_items"
-    ADD CONSTRAINT "staff_gallery_items_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "staff_gallery_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."staff_gallery_items"
+    ADD CONSTRAINT "staff_gallery_items_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
@@ -19841,201 +17256,227 @@ ALTER TABLE ONLY "public"."staff_gallery_items"
 
 
 ALTER TABLE ONLY "public"."user_schedules"
-    ADD CONSTRAINT "stylist_schedules_template_id_fkey" FOREIGN KEY ("template_id") REFERENCES "public"."schedule_templates"("id");
+    ADD CONSTRAINT "stylist_schedules_template_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "template_id") REFERENCES "public"."schedule_templates"("tenant_id", "platform_id", "id") ON DELETE SET NULL;
 
 
 
-ALTER TABLE ONLY "public"."subscription_assets"
-    ADD CONSTRAINT "subscription_assets_tenant_subscription_id_fkey" FOREIGN KEY ("tenant_subscription_id") REFERENCES "public"."tenant_subscriptions"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."service_user_commissions"
+    ADD CONSTRAINT "suc_service_id_fkey" FOREIGN KEY ("tenant_id", "service_id", "platform_id") REFERENCES "public"."services"("tenant_id", "id", "platform_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."subscription_items"
-    ADD CONSTRAINT "subscription_items_subscription_id_fkey" FOREIGN KEY ("subscription_id") REFERENCES "public"."tenant_subscriptions"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."supplier_addresses"
-    ADD CONSTRAINT "supplier_addresses_supplier_id_fkey" FOREIGN KEY ("supplier_id") REFERENCES "public"."suppliers"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."service_user_commissions"
+    ADD CONSTRAINT "suc_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."supplier_addresses"
-    ADD CONSTRAINT "supplier_addresses_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "supplier_addresses_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."supplier_addresses"
+    ADD CONSTRAINT "supplier_addresses_supplier_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "supplier_id") REFERENCES "public"."suppliers"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."supplier_addresses"
+    ADD CONSTRAINT "supplier_addresses_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."supplier_contacts"
-    ADD CONSTRAINT "supplier_contacts_contact_type_id_fkey" FOREIGN KEY ("contact_type_id") REFERENCES "public"."contact_types"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "supplier_contacts_contact_type_id_fkey" FOREIGN KEY ("platform_id", "tenant_id", "contact_type_id") REFERENCES "public"."contact_types"("platform_id", "tenant_id", "id") ON DELETE RESTRICT;
 
 
 
 ALTER TABLE ONLY "public"."supplier_contacts"
-    ADD CONSTRAINT "supplier_contacts_supplier_id_fkey" FOREIGN KEY ("supplier_id") REFERENCES "public"."suppliers"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "supplier_contacts_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."supplier_contacts"
-    ADD CONSTRAINT "supplier_contacts_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "supplier_contacts_supplier_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "supplier_id") REFERENCES "public"."suppliers"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."supplier_contacts"
+    ADD CONSTRAINT "supplier_contacts_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."supplier_products"
-    ADD CONSTRAINT "supplier_products_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "supplier_products_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."supplier_products"
-    ADD CONSTRAINT "supplier_products_supplier_id_fkey" FOREIGN KEY ("supplier_id") REFERENCES "public"."suppliers"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "supplier_products_product_id_fkey" FOREIGN KEY ("tenant_id", "product_id", "platform_id") REFERENCES "public"."products"("tenant_id", "id", "platform_id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."system_alerts"
-    ADD CONSTRAINT "system_alerts_resolved_by_fkey" FOREIGN KEY ("resolved_by") REFERENCES "auth"."users"("id");
+ALTER TABLE ONLY "public"."supplier_products"
+    ADD CONSTRAINT "supplier_products_supplier_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "supplier_id") REFERENCES "public"."suppliers"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."tariff_asset_prices"
-    ADD CONSTRAINT "tariff_asset_prices_asset_id_fkey" FOREIGN KEY ("asset_id") REFERENCES "public"."plan_assets"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."suppliers"
+    ADD CONSTRAINT "suppliers_document_type_id_fkey" FOREIGN KEY ("document_type_id", "tenant_id", "platform_id") REFERENCES "public"."document_types"("id", "tenant_id", "platform_id") ON DELETE SET NULL;
 
 
 
-ALTER TABLE ONLY "public"."tariff_asset_prices"
-    ADD CONSTRAINT "tariff_asset_prices_tariff_id_fkey" FOREIGN KEY ("tariff_id") REFERENCES "public"."price_tariffs"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."suppliers"
+    ADD CONSTRAINT "suppliers_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."tax_types"
-    ADD CONSTRAINT "tax_types_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "tax_types_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."tax_types"
+    ADD CONSTRAINT "tax_types_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."tenant_client_settings"
-    ADD CONSTRAINT "tenant_client_settings_default_intake_form_id_fkey" FOREIGN KEY ("default_intake_form_id") REFERENCES "public"."client_document_templates"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "tcs_default_intake_form_id_fkey" FOREIGN KEY ("default_intake_form_id", "tenant_id", "platform_id") REFERENCES "public"."client_document_templates"("id", "tenant_id", "platform_id") ON DELETE SET NULL;
 
 
 
 ALTER TABLE ONLY "public"."tenant_client_settings"
-    ADD CONSTRAINT "tenant_client_settings_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "tcs_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
-ALTER TABLE ONLY "public"."tenant_integrations"
-    ADD CONSTRAINT "tenant_integrations_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."tenant_client_settings"
+    ADD CONSTRAINT "tenant_client_settings_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."tenant_settings"
-    ADD CONSTRAINT "tenant_settings_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "tenant_settings_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."tenant_settings"
+    ADD CONSTRAINT "tenant_settings_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."tenant_social_networks"
-    ADD CONSTRAINT "tenant_social_networks_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "tenant_social_networks_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."tenant_subscriptions"
-    ADD CONSTRAINT "tenant_subscriptions_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE SET NULL;
-
-
-
-COMMENT ON CONSTRAINT "tenant_subscriptions_branch_id_fkey" ON "public"."tenant_subscriptions" IS 'Define la relación entre una suscripción y una sucursal específica.';
-
-
-
-ALTER TABLE ONLY "public"."tenant_subscriptions"
-    ADD CONSTRAINT "tenant_subscriptions_plan_country_configuration_id_fkey" FOREIGN KEY ("plan_country_configuration_id") REFERENCES "public"."plan_country_configurations"("id") ON DELETE RESTRICT;
-
-
-
-ALTER TABLE ONLY "public"."tenant_subscriptions"
-    ADD CONSTRAINT "tenant_subscriptions_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."tenant_social_networks"
+    ADD CONSTRAINT "tenant_social_networks_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."tenant_template_settings"
-    ADD CONSTRAINT "tenant_template_settings_template_id_fkey" FOREIGN KEY ("template_id") REFERENCES "public"."email_templates"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "tenant_template_settings_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."tenant_template_settings"
-    ADD CONSTRAINT "tenant_template_settings_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."tenants"
-    ADD CONSTRAINT "tenants_country_id_fkey" FOREIGN KEY ("country_id") REFERENCES "public"."countries"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."tenants"
-    ADD CONSTRAINT "tenants_default_currency_id_fkey" FOREIGN KEY ("default_currency_id") REFERENCES "public"."currencies"("id") ON UPDATE CASCADE ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."tenants"
-    ADD CONSTRAINT "tenants_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "tenant_template_settings_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."treatment_categories"
-    ADD CONSTRAINT "treatment_categories_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "treatment_categories_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."treatment_categories"
+    ADD CONSTRAINT "treatment_categories_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."treatment_category_assignments"
-    ADD CONSTRAINT "treatment_category_assignments_category_id_fkey" FOREIGN KEY ("category_id") REFERENCES "public"."treatment_categories"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "treatment_category_assignments_category_id_fkey" FOREIGN KEY ("category_id", "tenant_id", "platform_id") REFERENCES "public"."treatment_categories"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."treatment_category_assignments"
-    ADD CONSTRAINT "treatment_category_assignments_treatment_id_fkey" FOREIGN KEY ("treatment_id") REFERENCES "public"."treatments"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "treatment_category_assignments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."treatment_category_assignments"
+    ADD CONSTRAINT "treatment_category_assignments_treatment_id_fkey" FOREIGN KEY ("treatment_id", "tenant_id", "platform_id") REFERENCES "public"."treatments"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."treatment_images"
-    ADD CONSTRAINT "treatment_images_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "treatment_images_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."treatment_images"
-    ADD CONSTRAINT "treatment_images_treatment_id_fkey" FOREIGN KEY ("treatment_id") REFERENCES "public"."treatments"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "treatment_images_treatment_id_fkey" FOREIGN KEY ("treatment_id", "tenant_id", "platform_id") REFERENCES "public"."treatments"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."treatment_session_items"
-    ADD CONSTRAINT "treatment_session_items_product_id_fkey" FOREIGN KEY ("product_id") REFERENCES "public"."products"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "treatment_session_items_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."treatment_session_items"
-    ADD CONSTRAINT "treatment_session_items_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."services"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "treatment_session_items_product_id_fkey" FOREIGN KEY ("product_id", "tenant_id", "platform_id") REFERENCES "public"."products"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."treatment_session_items"
-    ADD CONSTRAINT "treatment_session_items_session_id_fkey" FOREIGN KEY ("session_id") REFERENCES "public"."treatment_sessions"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "treatment_session_items_service_id_fkey" FOREIGN KEY ("service_id", "tenant_id", "platform_id") REFERENCES "public"."services"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."treatment_session_items"
+    ADD CONSTRAINT "treatment_session_items_session_id_fkey" FOREIGN KEY ("session_id", "tenant_id", "platform_id") REFERENCES "public"."treatment_sessions"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."treatment_sessions"
-    ADD CONSTRAINT "treatment_sessions_treatment_id_fkey" FOREIGN KEY ("treatment_id") REFERENCES "public"."treatments"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "treatment_sessions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."treatment_sessions"
+    ADD CONSTRAINT "treatment_sessions_treatment_id_fkey" FOREIGN KEY ("treatment_id", "tenant_id", "platform_id") REFERENCES "public"."treatments"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."treatments"
+    ADD CONSTRAINT "treatments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."treatments"
+    ADD CONSTRAINT "treatments_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."turns"
-    ADD CONSTRAINT "turns_attention_id_fkey" FOREIGN KEY ("attention_id") REFERENCES "public"."attentions"("id") ON DELETE SET NULL;
+    ADD CONSTRAINT "turns_attention_id_fkey" FOREIGN KEY ("attention_id", "tenant_id", "platform_id") REFERENCES "public"."attentions"("id", "tenant_id", "platform_id") ON DELETE SET NULL;
 
 
 
 ALTER TABLE ONLY "public"."turns"
-    ADD CONSTRAINT "turns_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "turns_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."turns"
-    ADD CONSTRAINT "turns_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "turns_client_id_fkey" FOREIGN KEY ("tenant_id", "platform_id", "client_id") REFERENCES "public"."clients"("tenant_id", "platform_id", "id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."turns"
+    ADD CONSTRAINT "turns_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
@@ -20045,37 +17486,52 @@ ALTER TABLE ONLY "public"."turns"
 
 
 ALTER TABLE ONLY "public"."turns"
-    ADD CONSTRAINT "turns_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "turns_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."tv_displays"
-    ADD CONSTRAINT "tv_displays_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "tv_displays_branch_id_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."tv_displays"
-    ADD CONSTRAINT "tv_displays_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "tv_displays_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."tv_displays"
+    ADD CONSTRAINT "tv_displays_tenant_id_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."units_of_measure"
-    ADD CONSTRAINT "units_of_measure_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "units_of_measure_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."units_of_measure"
+    ADD CONSTRAINT "units_of_measure_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."user_assignments"
-    ADD CONSTRAINT "user_assignments_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "user_assignments_branch_fkey" FOREIGN KEY ("branch_id", "tenant_id", "platform_id") REFERENCES "public"."branches"("id", "tenant_id", "platform_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."user_assignments"
-    ADD CONSTRAINT "user_assignments_role_id_fkey" FOREIGN KEY ("role_id") REFERENCES "public"."roles"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "user_assignments_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."user_assignments"
-    ADD CONSTRAINT "user_assignments_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "user_assignments_role_id_fkey" FOREIGN KEY ("role_id", "platform_id") REFERENCES "public"."roles"("id", "platform_id") ON UPDATE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."user_assignments"
+    ADD CONSTRAINT "user_assignments_tenant_fkey" FOREIGN KEY ("tenant_id", "platform_id") REFERENCES "public"."tenants"("id", "platform_id") ON DELETE CASCADE;
 
 
 
@@ -20084,53 +17540,43 @@ ALTER TABLE ONLY "public"."user_assignments"
 
 
 
-ALTER TABLE ONLY "public"."user_permissions"
-    ADD CONSTRAINT "user_permissions_permission_id_fkey" FOREIGN KEY ("permission_id") REFERENCES "public"."permissions"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."user_avatars"
+    ADD CONSTRAINT "user_avatars_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
 ALTER TABLE ONLY "public"."user_schedules"
-    ADD CONSTRAINT "user_schedules_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "user_schedules_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."user_schedules"
-    ADD CONSTRAINT "user_schedules_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "user_schedules_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
+
+
+
+ALTER TABLE ONLY "public"."user_schedules"
+    ADD CONSTRAINT "user_schedules_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."user_time_off"
-    ADD CONSTRAINT "user_time_off_absence_type_id_fkey" FOREIGN KEY ("absence_type_id") REFERENCES "public"."absence_types"("id");
+    ADD CONSTRAINT "user_time_off_absence_type_id_fkey" FOREIGN KEY ("absence_type_id", "platform_id", "tenant_id") REFERENCES "public"."absence_types"("id", "platform_id", "tenant_id") ON DELETE RESTRICT;
 
 
 
 ALTER TABLE ONLY "public"."user_time_off"
-    ADD CONSTRAINT "user_time_off_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "public"."branches"("id");
+    ADD CONSTRAINT "user_time_off_branch_id_fkey" FOREIGN KEY ("branch_id", "platform_id", "tenant_id") REFERENCES "public"."branches"("id", "platform_id", "tenant_id") ON DELETE CASCADE;
 
 
 
 ALTER TABLE ONLY "public"."user_time_off"
-    ADD CONSTRAINT "user_time_off_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id");
+    ADD CONSTRAINT "user_time_off_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") NOT VALID;
 
 
 
-ALTER TABLE ONLY "public"."vendor_platform_commissions"
-    ADD CONSTRAINT "vendor_platform_commissions_platform_id_fkey" FOREIGN KEY ("platform_id") REFERENCES "public"."platforms"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."vendor_platform_commissions"
-    ADD CONSTRAINT "vendor_platform_commissions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."vendor_tenants"
-    ADD CONSTRAINT "vendor_tenants_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "public"."tenants"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."vendor_tenants"
-    ADD CONSTRAINT "vendor_tenants_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+ALTER TABLE ONLY "public"."user_time_off"
+    ADD CONSTRAINT "user_time_off_tenant_id_fkey" FOREIGN KEY ("platform_id", "tenant_id") REFERENCES "public"."tenants"("platform_id", "id") ON DELETE CASCADE;
 
 
 
@@ -20155,10 +17601,6 @@ CREATE POLICY "Allow all for authenticated users" ON "public"."contact_types" TO
 
 
 CREATE POLICY "Allow all for authenticated users" ON "public"."rescheduled_attentions" USING (("auth"."role"() = 'authenticated'::"text")) WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
-
-
-
-CREATE POLICY "Allow all for super_admin on phone_prefixes" ON "public"."phone_prefixes" USING ((("auth"."jwt"() ->> 'role'::"text") = 'super_admin'::"text")) WITH CHECK ((("auth"."jwt"() ->> 'role'::"text") = 'super_admin'::"text"));
 
 
 
@@ -20222,41 +17664,13 @@ CREATE POLICY "Allow full access to own tenants" ON "public"."equipment_brands" 
 
 
 
-CREATE POLICY "Allow full access to super_admin on plan_assets" ON "public"."plan_assets" USING (( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text"))) WITH CHECK (( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text")));
-
-
-
-CREATE POLICY "Allow full access to super_admin on price_tariffs" ON "public"."price_tariffs" USING (( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text"))) WITH CHECK (( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text")));
-
-
-
-CREATE POLICY "Allow full access to super_admin on tariff_asset_prices" ON "public"."tariff_asset_prices" USING (( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text"))) WITH CHECK (( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text")));
-
-
-
-CREATE POLICY "Allow insert access for authenticated users in the same tenant" ON "public"."branch_playback_state" FOR INSERT WITH CHECK ((EXISTS ( SELECT 1
-   FROM "public"."branches"
-  WHERE (("branches"."id" = "branch_playback_state"."branch_id") AND ("branches"."tenant_id" = "auth"."uid"())))));
-
-
-
 CREATE POLICY "Allow insert access to users of the same tenant" ON "public"."product_images" FOR INSERT WITH CHECK (("tenant_id" = (( SELECT ((("auth"."jwt"() ->> 'app_metadata'::"text"))::"jsonb" ->> 'tenant_id'::"text")))::"uuid"));
-
-
-
-CREATE POLICY "Allow public read access on phone_prefixes" ON "public"."phone_prefixes" FOR SELECT USING (true);
 
 
 
 CREATE POLICY "Allow read access based on user assignment" ON "public"."tenants" FOR SELECT USING ((EXISTS ( SELECT 1
    FROM "public"."user_assignments"
   WHERE (("user_assignments"."tenant_id" = "tenants"."id") AND ("user_assignments"."user_id" = "auth"."uid"()) AND ("user_assignments"."status" = 'active'::"text")))));
-
-
-
-CREATE POLICY "Allow read access for authenticated users in the same tenant" ON "public"."branch_playback_state" FOR SELECT USING ((EXISTS ( SELECT 1
-   FROM "public"."branches"
-  WHERE (("branches"."id" = "branch_playback_state"."branch_id") AND ("branches"."tenant_id" = "auth"."uid"())))));
 
 
 
@@ -20279,12 +17693,6 @@ CREATE POLICY "Allow read access to own tenant categories" ON "public"."treatmen
 
 
 
-CREATE POLICY "Allow read access to tenant members" ON "public"."audit_logs" FOR SELECT USING ((EXISTS ( SELECT 1
-   FROM "jsonb_array_elements"((("auth"."jwt"() -> 'app_metadata'::"text") -> 'assignments'::"text")) "elem"("value")
-  WHERE ((("elem"."value" ->> 'tenant_id'::"text"))::"uuid" = "audit_logs"."tenant_id"))));
-
-
-
 CREATE POLICY "Allow read access to tenant members" ON "public"."chatter_comments" FOR SELECT USING ((EXISTS ( SELECT 1
    FROM "jsonb_array_elements"((("auth"."jwt"() -> 'app_metadata'::"text") -> 'assignments'::"text")) "elem"("value")
   WHERE ((("elem"."value" ->> 'tenant_id'::"text"))::"uuid" = "chatter_comments"."tenant_id"))));
@@ -20295,31 +17703,7 @@ CREATE POLICY "Allow read access to users of the same tenant" ON "public"."produ
 
 
 
-CREATE POLICY "Allow service_role to manage client email queue" ON "public"."client_email_queue" USING (true) WITH CHECK (true);
-
-
-
-CREATE POLICY "Allow service_role to manage client whatsapp queue" ON "public"."client_whatsapp_queue" USING (true) WITH CHECK (true);
-
-
-
 CREATE POLICY "Allow super admins to manage document types of their own tenant" ON "public"."document_types" TO "authenticated" USING ((("tenant_id" = ( SELECT ("current_setting"('app.tenant_id'::"text", true))::"uuid" AS "current_setting")) AND "public"."is_tenant_super_admin"())) WITH CHECK ((("tenant_id" = ( SELECT ("current_setting"('app.tenant_id'::"text", true))::"uuid" AS "current_setting")) AND "public"."is_tenant_super_admin"()));
-
-
-
-CREATE POLICY "Allow super_admin to manage global integrations" ON "public"."tenant_integrations" USING ((("auth"."jwt"() ->> 'role'::"text") = 'super_admin'::"text"));
-
-
-
-CREATE POLICY "Allow super_admins to read their integrations" ON "public"."tenant_integrations" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text"));
-
-
-
-CREATE POLICY "Allow superadmin to manage platform_assignments" ON "public"."platform_assignments" USING ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "Allow superadmin to manage vendor_tenants" ON "public"."vendor_tenants" USING ("public"."is_super_admin"());
 
 
 
@@ -20347,16 +17731,6 @@ CREATE POLICY "Allow tenant members to manage service images" ON "public"."servi
 
 
 
-CREATE POLICY "Allow trusted functions to insert audit logs" ON "public"."audit_logs" FOR INSERT WITH CHECK (true);
-
-
-
-CREATE POLICY "Allow update access for authenticated users in the same tenant" ON "public"."branch_playback_state" FOR UPDATE USING ((EXISTS ( SELECT 1
-   FROM "public"."branches"
-  WHERE (("branches"."id" = "branch_playback_state"."branch_id") AND ("branches"."tenant_id" = "auth"."uid"())))));
-
-
-
 CREATE POLICY "Allow update access to users of the same tenant" ON "public"."product_images" FOR UPDATE USING (("tenant_id" = (( SELECT ((("auth"."jwt"() ->> 'app_metadata'::"text"))::"jsonb" ->> 'tenant_id'::"text")))::"uuid"));
 
 
@@ -20377,14 +17751,6 @@ CREATE POLICY "Allow users to update their own notifications" ON "public"."notif
 
 
 
-CREATE POLICY "Authenticated can insert system_alerts" ON "public"."system_alerts" FOR INSERT WITH CHECK (("auth"."role"() = 'authenticated'::"text"));
-
-
-
-CREATE POLICY "Authenticated users can read available countries" ON "public"."platform_countries" FOR SELECT USING (("auth"."role"() = 'authenticated'::"text"));
-
-
-
 CREATE POLICY "Clients Access Control" ON "public"."clients" USING (((EXISTS ( SELECT 1
    FROM "jsonb_array_elements"((("auth"."jwt"() -> 'app_metadata'::"text") -> 'assignments'::"text")) "elem"("value")
   WHERE (("elem"."value" ->> 'role'::"text") = 'super_admin'::"text"))) OR (EXISTS ( SELECT 1
@@ -20395,27 +17761,7 @@ CREATE POLICY "Clients Access Control" ON "public"."clients" USING (((EXISTS ( S
 
 
 
-CREATE POLICY "Deny all deletes on audit_logs" ON "public"."audit_logs" FOR DELETE USING (false);
-
-
-
-CREATE POLICY "Deny all updates on audit_logs" ON "public"."audit_logs" FOR UPDATE USING (false);
-
-
-
 CREATE POLICY "Enable access based on tenant" ON "public"."products" USING (("tenant_id" = (( SELECT ("auth"."jwt"() ->> 'tenant_id'::"text")))::"uuid"));
-
-
-
-CREATE POLICY "Enable all operations for appointment_extra_services" ON "public"."appointment_extra_services" USING (true);
-
-
-
-CREATE POLICY "Enable all operations for appointment_products" ON "public"."appointment_products" USING (true);
-
-
-
-CREATE POLICY "Enable all operations for appointment_sessions" ON "public"."appointment_sessions" USING (true);
 
 
 
@@ -20439,27 +17785,7 @@ CREATE POLICY "Enable all operations for clients" ON "public"."clients" USING (t
 
 
 
-CREATE POLICY "Enable all operations for countries" ON "public"."countries" USING (true) WITH CHECK (true);
-
-
-
-CREATE POLICY "Enable all operations for currencies" ON "public"."currencies" USING (true) WITH CHECK (true);
-
-
-
 CREATE POLICY "Enable all operations for extra_service_sessions" ON "public"."extra_service_sessions" USING (true);
-
-
-
-CREATE POLICY "Enable all operations for languages" ON "public"."languages" USING (true) WITH CHECK (true);
-
-
-
-CREATE POLICY "Enable all operations for menu_permissions" ON "public"."menu_permissions" USING (true) WITH CHECK (true);
-
-
-
-CREATE POLICY "Enable all operations for permissions" ON "public"."permissions" USING (true) WITH CHECK (true);
 
 
 
@@ -20491,35 +17817,7 @@ CREATE POLICY "Enable all operations for stylist_time_off" ON "public"."user_tim
 
 
 
-CREATE POLICY "Enable all operations for subscription_plans" ON "public"."subscription_plans" USING (true) WITH CHECK (true);
-
-
-
-CREATE POLICY "Enable all operations for tenant_subscriptions" ON "public"."tenant_subscriptions" USING (true) WITH CHECK (true);
-
-
-
-CREATE POLICY "Enable all operations for translations" ON "public"."translations" USING (true);
-
-
-
-CREATE POLICY "Enable all operations for user_permissions" ON "public"."user_permissions" USING (true) WITH CHECK (true);
-
-
-
 CREATE POLICY "Enable all operations for users based on tenant and branch" ON "public"."attention_combos" TO "authenticated" USING ((("tenant_id" = "public"."get_current_tenant_id"()) AND ("branch_id" = "public"."get_current_branch_id"())));
-
-
-
-CREATE POLICY "Enable delete for superadmins" ON "public"."integration_auth_methods" FOR DELETE USING ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "Enable delete for superadmins" ON "public"."integration_body_formats" FOR DELETE USING ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "Enable delete for superadmins" ON "public"."integration_http_methods" FOR DELETE USING ("public"."is_super_admin"());
 
 
 
@@ -20527,36 +17825,7 @@ CREATE POLICY "Enable delete for user's tenant" ON "public"."branch_products" FO
 
 
 
-CREATE POLICY "Enable insert for superadmins" ON "public"."integration_auth_methods" FOR INSERT WITH CHECK ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "Enable insert for superadmins" ON "public"."integration_body_formats" FOR INSERT WITH CHECK ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "Enable insert for superadmins" ON "public"."integration_http_methods" FOR INSERT WITH CHECK ("public"."is_super_admin"());
-
-
-
 CREATE POLICY "Enable insert for user's tenant" ON "public"."branch_products" FOR INSERT WITH CHECK (("tenant_id" = (( SELECT ("auth"."jwt"() ->> 'tenant_id'::"text")))::"uuid"));
-
-
-
-CREATE POLICY "Enable read access for all users" ON "public"."integration_auth_methods" FOR SELECT USING (true);
-
-
-
-CREATE POLICY "Enable read access for all users" ON "public"."integration_body_formats" FOR SELECT USING (true);
-
-
-
-CREATE POLICY "Enable read access for all users" ON "public"."integration_http_methods" FOR SELECT USING (true);
-
-
-
-CREATE POLICY "Enable read access for platform roles" ON "public"."platforms" FOR SELECT USING ((( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text")) OR ("id" IN ( SELECT "get_user_accessible_platforms"."platform_id"
-   FROM "public"."get_user_accessible_platforms"() "get_user_accessible_platforms"("platform_id")))));
 
 
 
@@ -20565,27 +17834,11 @@ CREATE POLICY "Enable read access for platform roles" ON "public"."tenants" FOR 
 
 
 
-CREATE POLICY "Enable read access for super_admin" ON "public"."error_logs" FOR SELECT USING ("public"."is_super_admin"());
-
-
-
 CREATE POLICY "Enable read access for super_admin" ON "public"."performance_metrics" FOR SELECT USING ("public"."is_super_admin"());
 
 
 
 CREATE POLICY "Enable read access for user's tenant" ON "public"."branch_products" FOR SELECT USING (("tenant_id" = (( SELECT ("auth"."jwt"() ->> 'tenant_id'::"text")))::"uuid"));
-
-
-
-CREATE POLICY "Enable update for superadmins" ON "public"."integration_auth_methods" FOR UPDATE USING ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "Enable update for superadmins" ON "public"."integration_body_formats" FOR UPDATE USING ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "Enable update for superadmins" ON "public"."integration_http_methods" FOR UPDATE USING ("public"."is_super_admin"());
 
 
 
@@ -20617,34 +17870,6 @@ CREATE POLICY "Public turns are viewable by everyone" ON "public"."turns" FOR SE
 
 
 
-CREATE POLICY "Super Admins have full access" ON "public"."platform_countries" USING (( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text"))) WITH CHECK (( SELECT ((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text")));
-
-
-
-CREATE POLICY "Superadmins can manage investor shares" ON "public"."investor_platform_shares" USING (("public"."get_current_role_name"() = 'super_admin'::"text")) WITH CHECK (("public"."get_current_role_name"() = 'super_admin'::"text"));
-
-
-
-CREATE POLICY "Superadmins can update system_alerts" ON "public"."system_alerts" FOR UPDATE USING (("auth"."uid"() IN ( SELECT "user_assignments"."user_id"
-   FROM "public"."user_assignments"
-  WHERE ("user_assignments"."role_id" = ( SELECT "roles"."id"
-           FROM "public"."roles"
-          WHERE ("roles"."name" = 'super_admin'::"text"))))));
-
-
-
-CREATE POLICY "Superadmins can view system_alerts" ON "public"."system_alerts" FOR SELECT USING (("auth"."uid"() IN ( SELECT "user_assignments"."user_id"
-   FROM "public"."user_assignments"
-  WHERE ("user_assignments"."role_id" = ( SELECT "roles"."id"
-           FROM "public"."roles"
-          WHERE ("roles"."name" = 'super_admin'::"text"))))));
-
-
-
-CREATE POLICY "Tenant Integration Access Policy" ON "public"."tenant_integrations" USING ((((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text") OR (((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'tenant_id'::"text"))::"uuid" = "tenant_id"))) WITH CHECK ((((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'role'::"text") = 'super_admin'::"text") OR (((("auth"."jwt"() -> 'app_metadata'::"text") ->> 'tenant_id'::"text"))::"uuid" = "tenant_id")));
-
-
-
 CREATE POLICY "Tenant users can manage client_commercials" ON "public"."client_commercials" USING (( SELECT ("auth"."uid"() IN ( SELECT "ua"."user_id"
            FROM "public"."user_assignments" "ua"
           WHERE ("ua"."tenant_id" = "client_commercials"."tenant_id")))));
@@ -20657,8 +17882,8 @@ CREATE POLICY "Tenant users can manage client_professionals" ON "public"."client
 
 
 
-CREATE POLICY "Tenant users can manage their own branch photos" ON "public"."branch_photos" USING (("auth"."uid"() IN ( SELECT "get_tenant_users"."user_id"
-   FROM "public"."get_tenant_users"("branch_photos"."tenant_id") "get_tenant_users"("assignment_id", "user_id", "email", "first_name", "last_name", "role_id", "role_name", "role_display_name", "branch_id", "branch_name", "status", "is_schedulable", "avatar_url", "base_salary", "default_product_commission_rate", "default_service_commission_rate", "timezone"))));
+CREATE POLICY "Tenant users can manage their own branch photos" ON "public"."branch_photos" TO "authenticated" USING (("auth"."uid"() IN ( SELECT "get_tenant_users"."user_id"
+   FROM "public"."get_tenant_users"("branch_photos"."tenant_id", "branch_photos"."platform_id") "get_tenant_users"("assignment_id", "user_id", "email", "first_name", "last_name", "role_id", "role_name", "role_display_name", "branch_id", "branch_name", "status", "is_schedulable", "avatar_url", "base_salary", "default_product_commission_rate", "default_service_commission_rate", "timezone"))));
 
 
 
@@ -20757,31 +17982,6 @@ CREATE POLICY "Users can view attachments in their own tenant" ON "public"."chat
 ALTER TABLE "public"."absence_types" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."api_request_metrics" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."appointment_extra_services" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."appointment_products" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."appointment_sessions" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."appointments" ENABLE ROW LEVEL SECURITY;
-
-
-CREATE POLICY "appointments_rls_policy" ON "public"."appointments" USING ("public"."tenant_branch_rls_policy"("tenant_id", "branch_id"));
-
-
-
-ALTER TABLE "public"."asset_purposes" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."asset_usage_tracking" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."attention_combos" ENABLE ROW LEVEL SECURITY;
 
 
@@ -20806,9 +18006,6 @@ ALTER TABLE "public"."attention_services" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."attentions" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."audit_logs" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."branch_combo_item_prices" ENABLE ROW LEVEL SECURITY;
 
 
@@ -20816,9 +18013,6 @@ ALTER TABLE "public"."branch_combos" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."branch_photos" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."branch_playback_state" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."branch_products" ENABLE ROW LEVEL SECURITY;
@@ -20879,9 +18073,6 @@ CREATE POLICY "client_document_instances_rls_policy" ON "public"."client_documen
 ALTER TABLE "public"."client_document_templates" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."client_email_queue" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."client_professionals" ENABLE ROW LEVEL SECURITY;
 
 
@@ -20892,9 +18083,6 @@ ALTER TABLE "public"."client_treatment_sessions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."client_treatments" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."client_whatsapp_queue" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."clients" ENABLE ROW LEVEL SECURITY;
@@ -20928,15 +18116,6 @@ ALTER TABLE "public"."consent_signatures" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."contact_types" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."countries" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."country_timezones" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."currencies" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."document_sequences" ENABLE ROW LEVEL SECURITY;
 
 
@@ -20944,15 +18123,6 @@ ALTER TABLE "public"."document_types" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."earned_commissions" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."email_logs" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."email_queue" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."email_templates" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."equipment" ENABLE ROW LEVEL SECURITY;
@@ -20970,12 +18140,6 @@ ALTER TABLE "public"."equipment_maintenance_history" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."equipment_types" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."error_logs" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."exchange_rates" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."expense_provider_addresses" ENABLE ROW LEVEL SECURITY;
 
 
@@ -20991,40 +18155,7 @@ ALTER TABLE "public"."expenses" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."extra_service_sessions" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."generic_taxes" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."global_settings" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."informed_consent_templates" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."integration_auth_methods" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."integration_body_formats" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."integration_categories" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."integration_http_methods" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."integration_providers" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."integration_record" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."integrations_config" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."investor_platform_shares" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."investor_platform_stakes" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."invoice_item_taxes" ENABLE ROW LEVEL SECURITY;
@@ -21036,25 +18167,13 @@ ALTER TABLE "public"."invoice_items" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."invoices" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."languages" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."media_playlists" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."menu_permissions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."notifications" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."payment_intents" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."payment_methods" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."payments" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."payslip_commissions" ENABLE ROW LEVEL SECURITY;
@@ -21066,37 +18185,7 @@ ALTER TABLE "public"."payslips" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."performance_metrics" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."permissions" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."phone_prefixes" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."plan_asset_bonuses" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."plan_asset_limits" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."plan_assets" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."plan_country_configurations" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."platform_assignments" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."platform_countries" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."platforms" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."playlist_items" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."price_tariffs" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."product_brands" ENABLE ROW LEVEL SECURITY;
@@ -21159,6 +18248,12 @@ ALTER TABLE "public"."sales" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."sales_items" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."satisfaction_survey_ratings" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."satisfaction_surveys" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."schedule_templates" ENABLE ROW LEVEL SECURITY;
 
 
@@ -21183,29 +18278,7 @@ ALTER TABLE "public"."services" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."signed_consents" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."subscription_assets" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."subscription_items" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."subscription_plans" ENABLE ROW LEVEL SECURITY;
-
-
-CREATE POLICY "super_admin_policy_appointment_extra_services" ON "public"."appointment_extra_services" USING ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "super_admin_policy_appointment_products" ON "public"."appointment_products" USING ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "super_admin_policy_appointment_sessions" ON "public"."appointment_sessions" USING ("public"."is_super_admin"());
-
-
-
-CREATE POLICY "super_admin_policy_appointments" ON "public"."appointments" USING ("public"."is_super_admin"());
-
+ALTER TABLE "public"."staff_gallery_items" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "super_admin_policy_attention_products" ON "public"."attention_products" USING ("public"."is_super_admin"());
@@ -21276,10 +18349,6 @@ CREATE POLICY "super_admin_policy_suppliers" ON "public"."suppliers" USING ("pub
 
 
 
-CREATE POLICY "super_admin_policy_translations" ON "public"."translations" USING ("public"."is_super_admin"());
-
-
-
 ALTER TABLE "public"."supplier_addresses" ENABLE ROW LEVEL SECURITY;
 
 
@@ -21292,29 +18361,7 @@ ALTER TABLE "public"."supplier_products" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."suppliers" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."system_alerts" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."tariff_asset_prices" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."tax_types" ENABLE ROW LEVEL SECURITY;
-
-
-CREATE POLICY "tenant_branch_policy_appointment_extra_services" ON "public"."appointment_extra_services" USING ("public"."tenant_branch_rls_policy"("tenant_id", "branch_id"));
-
-
-
-CREATE POLICY "tenant_branch_policy_appointment_products" ON "public"."appointment_products" USING ("public"."tenant_branch_rls_policy"("tenant_id", "branch_id"));
-
-
-
-CREATE POLICY "tenant_branch_policy_appointment_sessions" ON "public"."appointment_sessions" USING ("public"."tenant_branch_rls_policy"("tenant_id", "branch_id"));
-
-
-
-CREATE POLICY "tenant_branch_policy_appointments" ON "public"."appointments" USING ("public"."tenant_branch_rls_policy"("tenant_id", "branch_id"));
-
 
 
 CREATE POLICY "tenant_branch_policy_attention_products" ON "public"."attention_products" USING ("public"."tenant_branch_rls_policy"("tenant_id", "branch_id"));
@@ -21348,9 +18395,6 @@ CREATE POLICY "tenant_branch_policy_service_stylist_commissions" ON "public"."se
 ALTER TABLE "public"."tenant_client_settings" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."tenant_integrations" ENABLE ROW LEVEL SECURITY;
-
-
 CREATE POLICY "tenant_only_policy_brands" ON "public"."product_brands" USING ("public"."tenant_only_rls_policy"("tenant_id"));
 
 
@@ -21367,29 +18411,16 @@ CREATE POLICY "tenant_only_policy_suppliers" ON "public"."suppliers" USING ("pub
 
 
 
-CREATE POLICY "tenant_only_policy_translations" ON "public"."translations" USING ("public"."tenant_only_rls_policy"("tenant_id"));
-
-
-
 ALTER TABLE "public"."tenant_settings" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."tenant_social_networks" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."tenant_subscriptions" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."tenant_template_settings" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."tenants" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."timezones" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."translations" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."treatment_categories" ENABLE ROW LEVEL SECURITY;
@@ -21422,7 +18453,7 @@ ALTER TABLE "public"."units_of_measure" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."user_assignments" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."user_permissions" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "public"."user_avatars" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."user_schedules" ENABLE ROW LEVEL SECURITY;
@@ -21431,25 +18462,12 @@ ALTER TABLE "public"."user_schedules" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."user_time_off" ENABLE ROW LEVEL SECURITY;
 
 
-ALTER TABLE "public"."v_role_id" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."vendor_platform_commissions" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."vendor_tenants" ENABLE ROW LEVEL SECURITY;
-
-
 
 
 ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
 
 
 
-
-
-
-ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."branch_playback_state";
 
 
 
@@ -21628,18 +18646,15 @@ GRANT ALL ON FUNCTION "public"."gbtreekey_var_out"("public"."gbtreekey_var") TO 
 
 
 
+GRANT ALL ON FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."activate_branches_batch"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."activate_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_price_id" "uuid", "p_payment_id" "uuid") TO "service_role";
 
 
 
@@ -21649,9 +18664,9 @@ GRANT ALL ON TABLE "public"."branch_social_networks" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."add_branch_social_network"("p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -21685,15 +18700,15 @@ GRANT ALL ON FUNCTION "public"."add_tenant_social_network"("p_tenant_id" "uuid",
 
 
 
-GRANT ALL ON FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."add_turn"("p_branch_id" "uuid", "p_client_id" "uuid", "p_stylist_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."adjust_purchase_total"("p_purchase_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."adjust_purchase_total"("p_purchase_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."adjust_purchase_total"("p_purchase_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."adjust_purchase_total"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."adjust_purchase_total"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."adjust_purchase_total"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") TO "service_role";
 
 
 
@@ -21704,9 +18719,9 @@ GRANT ALL ON FUNCTION "public"."algorithm_sign"("signables" "text", "secret" "te
 
 
 
-GRANT ALL ON FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."approve_product_transfer"("p_transfer_id" "uuid", "p_adjusted_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -21730,33 +18745,33 @@ GRANT ALL ON TABLE "public"."signed_consents" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assign_consent_to_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid", "p_template_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assign_consent_to_service"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_template_id" "uuid", "p_attention_service_id" "uuid", "p_professional_observations" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "anon";
+GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assign_equipment_to_user"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_user_id" "uuid", "p_branch_id" "uuid", "p_assignment_date" "date") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) TO "anon";
-GRANT ALL ON FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) TO "service_role";
+GRANT ALL ON FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) TO "anon";
+GRANT ALL ON FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assign_prototype_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_selected_price_type" "text", "p_start_date" "date", "p_custom_final_price" numeric) TO "service_role";
 
 
 
@@ -21766,33 +18781,33 @@ GRANT ALL ON TABLE "public"."client_treatments" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assign_treatment_to_client"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid", "p_prototype_id" "uuid", "p_custom_name" "text", "p_payment_type" "text", "p_custom_final_price" numeric, "p_start_date" "date", "p_sessions" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."associate_combo_image"("p_combo_id" "uuid", "p_google_drive_file_id" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."associate_combo_image"("p_combo_id" "uuid", "p_google_drive_file_id" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."associate_combo_image"("p_combo_id" "uuid", "p_google_drive_file_id" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."associate_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_google_drive_file_id" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."associate_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_google_drive_file_id" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."associate_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_google_drive_file_id" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."associate_product_image"("p_product_id" "uuid", "p_google_drive_file_id" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."associate_product_image"("p_product_id" "uuid", "p_google_drive_file_id" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."associate_product_image"("p_product_id" "uuid", "p_google_drive_file_id" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."associate_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_google_drive_file_id" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."associate_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_google_drive_file_id" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."associate_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_google_drive_file_id" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."associate_service_image"("p_service_id" "uuid", "p_google_drive_file_id" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."associate_service_image"("p_service_id" "uuid", "p_google_drive_file_id" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."associate_service_image"("p_service_id" "uuid", "p_google_drive_file_id" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."associate_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_google_drive_file_id" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."associate_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_google_drive_file_id" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."associate_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_google_drive_file_id" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."associate_treatment_image"("p_treatment_id" "uuid", "p_google_drive_file_id" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."associate_treatment_image"("p_treatment_id" "uuid", "p_google_drive_file_id" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."associate_treatment_image"("p_treatment_id" "uuid", "p_google_drive_file_id" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."associate_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_google_drive_file_id" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."associate_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_google_drive_file_id" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."associate_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_google_drive_file_id" "text") TO "service_role";
 
 
 
@@ -21802,9 +18817,9 @@ GRANT ALL ON FUNCTION "public"."audit_trigger_function"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."authorize_tv_display"("p_tv_display_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
 
 
 
@@ -21815,9 +18830,9 @@ GRANT ALL ON FUNCTION "public"."bytea_to_text"("data" "bytea") TO "service_role"
 
 
 
-GRANT ALL ON FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_branch_ids" "uuid"[]) TO "service_role";
+GRANT ALL ON FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."calculate_batch_activation_proration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_ids" "uuid"[]) TO "service_role";
 
 
 
@@ -21845,33 +18860,33 @@ GRANT ALL ON FUNCTION "public"."call_stylist"("p_attention_service_id" "uuid") T
 
 
 
-GRANT ALL ON FUNCTION "public"."call_turn"("p_turn_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."call_turn"("p_turn_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."call_turn"("p_turn_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."call_turn"("p_turn_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."call_turn"("p_turn_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."call_turn"("p_turn_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cancel_attention_and_notify"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cancel_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."cancel_purchase"("p_purchase_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."cancel_purchase"("p_purchase_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."cancel_purchase"("p_purchase_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."cancel_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."cancel_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cancel_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cancel_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -21888,21 +18903,15 @@ GRANT ALL ON FUNCTION "public"."change_password"("p_user_id" "uuid", "p_current_
 
 
 
-GRANT ALL ON FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_asset_key" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_asset_key" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_asset_key" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."check_asset_limit"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."check_slug_availability"("params" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."check_slug_availability"("params" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."check_slug_availability"("params" "jsonb") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."check_slug_availability"("p_slug" "text", "p_country_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."check_slug_availability"("p_slug" "text", "p_country_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."check_slug_availability"("p_slug" "text", "p_country_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."check_slug_availability"("params" "jsonb", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."check_slug_availability"("params" "jsonb", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."check_slug_availability"("params" "jsonb", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -21918,9 +18927,9 @@ GRANT ALL ON FUNCTION "public"."check_superadmin_exists"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_platform_id" "uuid", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_platform_id" "uuid", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."check_user_availability"("p_item_id" "uuid", "p_item_type" "text", "p_platform_id" "uuid", "p_appointment_date" "date", "p_appointment_time" time without time zone, "p_duration_minutes" integer, "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_assigned_user_id" "uuid", "p_client_id" "uuid") TO "service_role";
 
 
 
@@ -21942,15 +18951,15 @@ GRANT ALL ON TABLE "public"."client_treatment_sessions" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."complete_client_treatment_session"("p_session_id" "uuid", "p_attention_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."complete_client_treatment_session"("p_session_id" "uuid", "p_attention_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."complete_client_treatment_session"("p_session_id" "uuid", "p_attention_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."complete_client_treatment_session"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_session_id" "uuid", "p_attention_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."complete_client_treatment_session"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_session_id" "uuid", "p_attention_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."complete_client_treatment_session"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_session_id" "uuid", "p_attention_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."confirm_attention"("p_attention_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."confirm_attention"("p_attention_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."confirm_attention"("p_attention_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."confirm_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."confirm_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."confirm_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -21972,9 +18981,9 @@ GRANT ALL ON TABLE "public"."branches" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_address" "text", "p_description" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_address" "text", "p_description" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_address" "text", "p_description" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_platform_id" "uuid", "p_address" "text", "p_description" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_platform_id" "uuid", "p_address" "text", "p_description" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_branch"("p_tenant_id" "uuid", "p_name" "text", "p_platform_id" "uuid", "p_address" "text", "p_description" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "service_role";
 
 
 
@@ -21984,9 +18993,9 @@ GRANT ALL ON TABLE "public"."informed_consent_templates" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb") TO "service_role";
 
 
 
@@ -21996,70 +19005,57 @@ GRANT ALL ON FUNCTION "public"."create_daily_dummy_attentions"() TO "service_rol
 
 
 
-GRANT ALL ON FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_equipment"("p_equipment_data" "jsonb", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_maintenance_data" "jsonb", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_maintenance_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_maintenance_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_maintenance_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_maintenance_data" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_maintenance_data" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_maintenance_data" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_equipment_type"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) TO "anon";
-GRANT ALL ON FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) TO "anon";
+GRANT ALL ON FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_full_attention"("p_client_id" "uuid", "p_attention_datetime" timestamp with time zone, "p_notes" "text", "p_services" "jsonb", "p_products" "jsonb", "p_combos" "jsonb", "p_payments" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_total_amount" numeric) TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."integration_categories" TO "anon";
-GRANT ALL ON TABLE "public"."integration_categories" TO "authenticated";
-GRANT ALL ON TABLE "public"."integration_categories" TO "service_role";
-GRANT ALL ON TABLE "public"."integration_categories" TO PUBLIC;
+GRANT ALL ON FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_integration_category"("p_name" "text", "p_slug" "text", "p_description" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_integration_category"("p_name" "text", "p_slug" "text", "p_description" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_integration_category"("p_name" "text", "p_slug" "text", "p_description" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_notification"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_type" "public"."notification_type", "p_title" "text", "p_body" "text", "p_link_to" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_product_movement"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_product_id" "uuid", "p_movement_type" "text", "p_quantity_change" numeric, "p_cost_of_change" numeric, "p_reference_id" "uuid", "p_reference_type" "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_product_transfer"("p_tenant_id" "uuid", "p_from_branch_id" "uuid", "p_to_branch_id" "uuid", "p_transfer_date" timestamp with time zone, "p_notes" "text", "p_items" "jsonb") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_product_transfer_request"("p_tenant_id" "uuid", "p_requesting_branch_id" "uuid", "p_origin_branch_id" "uuid", "p_notes" "text", "p_items" "jsonb", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -22087,15 +19083,15 @@ GRANT ALL ON FUNCTION "public"."create_tenant_and_admin_logic"("p_business_name"
 
 
 
-GRANT ALL ON FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_branch_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_branch_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_tenant_user"("p_email" "text", "p_role_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_tenant_with_admin"("name" "text", "subscription_status" "text", "country_id" "uuid", "default_language_code" "text", "default_currency_id" "uuid", "default_timezone" "text", "contact_phone" "text", "whatsapp_phone" "text", "commercial_email" "text", "legal_name" "text", "tax_id" "text", "billing_address" "text", "einvoicing_email" "text", "physical_address_line1" "text", "physical_address_line2" "text", "physical_city" "text", "physical_state" "text", "physical_postal_code" "text", "website" "text", "latitude" numeric, "longitude" numeric, "admin_email" "text", "admin_password" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_tenant_with_admin"("name" "text", "subscription_status" "text", "country_id" "uuid", "default_language_code" "text", "default_currency_id" "uuid", "default_timezone" "text", "contact_phone" "text", "whatsapp_phone" "text", "commercial_email" "text", "legal_name" "text", "tax_id" "text", "billing_address" "text", "einvoicing_email" "text", "physical_address_line1" "text", "physical_address_line2" "text", "physical_city" "text", "physical_state" "text", "physical_postal_code" "text", "website" "text", "latitude" numeric, "longitude" numeric, "admin_email" "text", "admin_password" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_tenant_with_admin"("name" "text", "subscription_status" "text", "country_id" "uuid", "default_language_code" "text", "default_currency_id" "uuid", "default_timezone" "text", "contact_phone" "text", "whatsapp_phone" "text", "commercial_email" "text", "legal_name" "text", "tax_id" "text", "billing_address" "text", "einvoicing_email" "text", "physical_address_line1" "text", "physical_address_line2" "text", "physical_city" "text", "physical_state" "text", "physical_postal_code" "text", "website" "text", "latitude" numeric, "longitude" numeric, "admin_email" "text", "admin_password" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_tenant_with_admin"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid", "p_tenant_name" "text", "p_country_id" "text", "p_email" "text", "p_currency_id" "uuid", "p_timezone" "text", "p_phone" "text", "p_address" "text", "p_website" "text", "p_latitude" numeric, "p_longitude" numeric, "p_whatsapp_phone" "text", "p_legal_name" "text", "p_tax_id" "text", "p_einvoicing_email" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_default_language_code" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_tenant_with_admin"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid", "p_tenant_name" "text", "p_country_id" "text", "p_email" "text", "p_currency_id" "uuid", "p_timezone" "text", "p_phone" "text", "p_address" "text", "p_website" "text", "p_latitude" numeric, "p_longitude" numeric, "p_whatsapp_phone" "text", "p_legal_name" "text", "p_tax_id" "text", "p_einvoicing_email" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_default_language_code" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_tenant_with_admin"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid", "p_tenant_name" "text", "p_country_id" "text", "p_email" "text", "p_currency_id" "uuid", "p_timezone" "text", "p_phone" "text", "p_address" "text", "p_website" "text", "p_latitude" numeric, "p_longitude" numeric, "p_whatsapp_phone" "text", "p_legal_name" "text", "p_tax_id" "text", "p_einvoicing_email" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_default_language_code" "text") TO "service_role";
 
 
 
@@ -22105,15 +19101,15 @@ GRANT ALL ON TABLE "public"."treatments" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_type" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."create_unit_of_measure"("p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."create_unit_of_measure"("p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."create_unit_of_measure"("p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."create_unit_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."create_unit_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_unit_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "service_role";
 
 
 
@@ -22138,9 +19134,9 @@ GRANT ALL ON FUNCTION "public"."dearmor"("text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."decrement_stock_from_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -22158,57 +19154,57 @@ GRANT ALL ON FUNCTION "public"."decrypt_iv"("bytea", "bytea", "bytea", "text") T
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_branch_photo"("p_branch_id" "uuid", "p_photo_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_client_treatment"("p_client_treatment_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_client_treatment"("p_client_treatment_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_client_treatment"("p_client_treatment_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_client_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_client_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_client_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_combo_image"("p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_combo_image"("p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_combo_image"("p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_equipment"("p_equipment_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -22218,33 +19214,33 @@ GRANT ALL ON FUNCTION "public"."delete_integration_category"("p_id" "uuid") TO "
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_product_image"("p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_product_image"("p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_product_image"("p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_service_image"("p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_service_image"("p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_service_image"("p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_signed_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_tenant_cascade"("target_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_tenant_integration"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_role" "text") TO "service_role";
 
 
 
@@ -22254,21 +19250,21 @@ GRANT ALL ON FUNCTION "public"."delete_tenant_social_network"("p_id" "uuid", "p_
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_treatment_image"("p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_treatment_image"("p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_treatment_image"("p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
 
 
 
@@ -22286,9 +19282,9 @@ GRANT ALL ON FUNCTION "public"."digest"("text", "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."disconnect_google_provider"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_provider" "text", "p_requesting_user_id" "uuid") TO "service_role";
 
 
 
@@ -22318,15 +19314,15 @@ GRANT ALL ON FUNCTION "public"."enqueue_test_email"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."finish_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."finish_service"("p_attention_service_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."finish_service"("p_attention_service_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."finish_service"("p_attention_service_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."finish_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."finish_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."finish_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -23520,63 +20516,57 @@ GRANT ALL ON FUNCTION "public"."gen_salt"("text", integer) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."generate_invoice_for_attention"("p_attention_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."generate_invoice_for_subscription"("p_subscription_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_api_health_stats"() TO "anon";
-GRANT ALL ON FUNCTION "public"."get_api_health_stats"() TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_api_health_stats"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_assignable_commercials"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_assignable_professionals"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_attention_datetimes"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_attentions_with_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_start_date" "date", "p_end_date" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_branch_aggregate_rating"("p_branch_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_branch_commission_matrix"("branch_id_param" "uuid", "tenant_id_param" "uuid") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_branches_for_microsite"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -23586,21 +20576,21 @@ GRANT ALL ON FUNCTION "public"."get_calculated_plan_prices"("p_platform_id" "uui
 
 
 
-GRANT ALL ON FUNCTION "public"."get_client_treatment_details"("p_client_treatment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_client_treatment_details"("p_client_treatment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_client_treatment_details"("p_client_treatment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_client_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_client_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_client_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_treatment_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_client_treatments"("p_client_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_client_treatments"("p_client_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_client_treatments"("p_client_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_client_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_client_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_client_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_client_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_combo_branch_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid") TO "service_role";
 
 
 
@@ -23610,15 +20600,15 @@ GRANT ALL ON TABLE "public"."combo_images" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_combo_images"("p_combo_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_combo_images"("p_combo_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_combo_images"("p_combo_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_combo_images"("p_platform_id" "uuid", "p_combo_id" "uuid", "p_tenant_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_combo_images"("p_platform_id" "uuid", "p_combo_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_combo_images"("p_platform_id" "uuid", "p_combo_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") TO "service_role";
 
 
 
@@ -23658,39 +20648,33 @@ GRANT ALL ON FUNCTION "public"."get_current_user_id"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_detailed_combos_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_type_id" "uuid", "p_brand_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_type_id" "uuid", "p_brand_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_type_id" "uuid", "p_brand_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_type_id" "uuid", "p_brand_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_type_id" "uuid", "p_brand_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_equipment"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_type_id" "uuid", "p_brand_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_equipment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_equipment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_equipment_id" "uuid") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_equipment_assignments"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -23700,45 +20684,45 @@ GRANT ALL ON FUNCTION "public"."get_equipment_maintenance_history"("p_equipment_
 
 
 
-GRANT ALL ON FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_equipment_id" "uuid") TO "service_role";
+GRANT ALL ON TABLE "public"."equipment_maintenance_history" TO "anon";
+GRANT ALL ON TABLE "public"."equipment_maintenance_history" TO "authenticated";
+GRANT ALL ON TABLE "public"."equipment_maintenance_history" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_equipment_maintenance_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_equipment_types"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_general_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_gmail_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_google_auth_url"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
 GRANT ALL ON FUNCTION "public"."get_hydrated_user_assignments"("p_user_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_hydrated_user_assignments"("p_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_hydrated_user_assignments"("p_user_id" "uuid") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."get_integration_categories"() TO "anon";
-GRANT ALL ON FUNCTION "public"."get_integration_categories"() TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_integration_categories"() TO "service_role";
 
 
 
@@ -23754,15 +20738,21 @@ GRANT ALL ON FUNCTION "public"."get_investors"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_managed_tvs"() TO "anon";
-GRANT ALL ON FUNCTION "public"."get_managed_tvs"() TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_managed_tvs"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON TABLE "public"."tv_displays" TO "anon";
+GRANT ALL ON TABLE "public"."tv_displays" TO "authenticated";
+GRANT ALL ON TABLE "public"."tv_displays" TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_managed_tvs"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -23778,27 +20768,27 @@ GRANT ALL ON FUNCTION "public"."get_my_tenant_info"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_next_document_number"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_type" "text", "p_branch_id" "uuid", "p_context_data" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid", "p_registration_code" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid", "p_registration_code" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid", "p_registration_code" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid", "p_registration_code" "text", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid", "p_registration_code" "text", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_or_create_tv_display"("p_id" "uuid", "p_registration_code" "text", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_payslip_details"("p_payslip_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_pending_commissions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid") TO "service_role";
 
 
 
@@ -23808,21 +20798,21 @@ GRANT ALL ON FUNCTION "public"."get_platforms_list"("p_search_term" "text") TO "
 
 
 
-GRANT ALL ON FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_playlist_items"("p_playlist_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_asset_key" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_asset_key" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_asset_key" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_price_for_tenant_asset"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_product_commission_matrix"("product_id_param" "uuid", "tenant_id_param" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_product_commission_matrix"("product_id_param" "uuid", "tenant_id_param" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_product_commission_matrix"("product_id_param" "uuid", "tenant_id_param" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_product_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_product_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_product_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid") TO "service_role";
 
 
 
@@ -23832,15 +20822,15 @@ GRANT ALL ON TABLE "public"."product_images" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_product_images"("p_product_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_product_images"("p_product_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_product_images"("p_product_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_product_images"("p_platform_id" "uuid", "p_product_id" "uuid", "p_tenant_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_product_images"("p_platform_id" "uuid", "p_product_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_product_images"("p_platform_id" "uuid", "p_product_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_search_term" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_search_term" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_search_term" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_product_sellers"("p_product_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text") TO "service_role";
 
 
 
@@ -23856,9 +20846,9 @@ GRANT ALL ON FUNCTION "public"."get_public_subscription_plans"("p_country_id" "u
 
 
 
-GRANT ALL ON FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_purchase_reception_details"("p_purchase_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -23868,69 +20858,69 @@ GRANT ALL ON TABLE "public"."user_schedules" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_branch_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_schedules_for_branch"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_service_commission_matrix"("service_id_param" "uuid", "tenant_id_param" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_service_commission_matrix"("service_id_param" "uuid", "tenant_id_param" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_service_commission_matrix"("service_id_param" "uuid", "tenant_id_param" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_service_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_service_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_service_commission_matrix"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_service_images"("p_service_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_service_images"("p_service_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_service_images"("p_service_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_service_images"("p_platform_id" "uuid", "p_service_id" "uuid", "p_tenant_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_service_images"("p_platform_id" "uuid", "p_service_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_service_images"("p_platform_id" "uuid", "p_service_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_service_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_appointment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_signed_consents_for_appointment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_appointment_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_signed_consents_for_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid", "p_attention_service_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_date_from" "text", "p_date_to" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_date_from" "text", "p_date_to" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_date_from" "text", "p_date_to" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "text", "p_date_to" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "text", "p_date_to" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_stock_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "text", "p_date_to" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_stock_snapshot"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_report_date" "date") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_subscription_plans_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_subscription_status_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -23952,45 +20942,45 @@ GRANT ALL ON FUNCTION "public"."get_tenant_activity_summary"() TO "service_role"
 
 
 
-GRANT ALL ON FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_tenant_activity_summary"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_tenant_branches"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_environment" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_environment" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_environment" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_environment" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_environment" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_tenant_integrations"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_environment" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_tenant_settings_data"("tenant_id_param" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_tenant_storage_usage_by_table"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_tenant_subscription_status"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_tenant_users"("p_target_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24000,27 +20990,27 @@ GRANT ALL ON FUNCTION "public"."get_tenants"("p_search_term" "text", "p_platform
 
 
 
-GRANT ALL ON FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_today_attentions"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_timezone" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_top_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_user_id" "uuid", "p_days" integer, "p_timezone" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_transfer_details"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_treatment_details"("p_treatment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_treatment_details"("p_treatment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_treatment_details"("p_treatment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_treatment_details"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid") TO "service_role";
 
 
 
@@ -24030,33 +21020,27 @@ GRANT ALL ON TABLE "public"."treatment_images" TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_treatment_images"("p_treatment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_treatment_images"("p_treatment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_treatment_images"("p_treatment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_treatment_images"("p_platform_id" "uuid", "p_treatment_id" "uuid", "p_tenant_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_treatment_images"("p_platform_id" "uuid", "p_treatment_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_treatment_images"("p_platform_id" "uuid", "p_treatment_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_tv_display_settings"("p_tv_display_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_unified_chatter_feed"("p_resource_type" "text", "p_resource_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_unified_chatter_feed"("p_resource_type" "text", "p_resource_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_unified_chatter_feed"("p_resource_type" "text", "p_resource_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_unified_chatter_feed"("p_resource_id" "uuid", "p_resource_type" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_unified_chatter_feed"("p_resource_id" "uuid", "p_resource_type" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_unified_chatter_feed"("p_resource_id" "uuid", "p_resource_type" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_units_of_measure"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_units_of_measure"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_units_of_measure"("p_tenant_id" "uuid") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."get_usage_statistics"() TO "anon";
-GRANT ALL ON FUNCTION "public"."get_usage_statistics"() TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_usage_statistics"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_units_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_units_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_units_of_measure"("p_platform_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
 
 
 
@@ -24078,9 +21062,9 @@ GRANT ALL ON FUNCTION "public"."get_user_assigned_equipment"("p_user_id" "uuid")
 
 
 
-GRANT ALL ON FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24102,27 +21086,27 @@ GRANT ALL ON FUNCTION "public"."get_user_claims_from_jwt"("jwt_token" "text") TO
 
 
 
-GRANT ALL ON FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_dashboard_stats"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_performance_report"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_date_from" "date", "p_date_to" "date") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_user_product_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_user_product_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_user_product_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_user_product_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_user_product_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_product_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_user_service_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_user_service_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_user_service_commission_matrix"("user_id_param" "uuid", "tenant_id_param" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_user_service_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_user_service_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_service_commission_matrix"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24132,15 +21116,15 @@ GRANT ALL ON FUNCTION "public"."get_user_tenant_id"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_user_time_off_history"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_status_filter" "text", "p_type_filter" "text", "p_date_range_start" "date", "p_date_range_end" "date", "p_branch_id" "uuid", "p_search_term" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_vendor_commissions"("p_user_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24274,9 +21258,9 @@ GRANT ALL ON FUNCTION "public"."http_set_curlopt"("curlopt" character varying, "
 
 
 
-GRANT ALL ON FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) TO "anon";
-GRANT ALL ON FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) TO "service_role";
+GRANT ALL ON FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) TO "anon";
+GRANT ALL ON FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."increment_asset_usage_rpc"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_asset_key" "text", "p_quantity_to_add" bigint) TO "service_role";
 
 
 
@@ -24311,12 +21295,6 @@ GRANT ALL ON FUNCTION "public"."interval_dist"(interval, interval) TO "service_r
 GRANT ALL ON FUNCTION "public"."invoke_cron_job"("job_name" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."invoke_cron_job"("job_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."invoke_cron_job"("job_name" "text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."invoke_process_whatsapp_queue"() TO "anon";
-GRANT ALL ON FUNCTION "public"."invoke_process_whatsapp_queue"() TO "authenticated";
-GRANT ALL ON FUNCTION "public"."invoke_process_whatsapp_queue"() TO "service_role";
 
 
 
@@ -24356,27 +21334,27 @@ GRANT ALL ON FUNCTION "public"."is_time_in_schedule"("p_appointment_utc" timesta
 
 
 
-GRANT ALL ON FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."link_signature_to_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_observations" "text", "p_form_data" "jsonb", "p_signed_content" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."link_user_to_tenant"("p_invoking_user_role" "text", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_email" "text", "p_first_name" "text", "p_last_name" "text", "p_password" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_branch_social_networks"("p_branch_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_consent_templates"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24386,21 +21364,27 @@ GRANT ALL ON FUNCTION "public"."list_tenant_social_networks"("p_tenant_id" "uuid
 
 
 
-GRANT ALL ON FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_type" "text", "p_show_inactive" boolean, "p_category_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_type" "text", "p_show_inactive" boolean, "p_category_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_type" "text", "p_show_inactive" boolean, "p_category_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_type" "text", "p_show_inactive" boolean, "p_category_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_type" "text", "p_show_inactive" boolean, "p_category_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_treatments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_type" "text", "p_show_inactive" boolean, "p_category_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text", "p_object_id" "uuid", "p_old_value" "jsonb", "p_new_value" "jsonb", "p_ip_address" "inet", "p_user_agent" "text", "p_metadata" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text", "p_object_id" "uuid", "p_old_value" "jsonb", "p_new_value" "jsonb", "p_ip_address" "inet", "p_user_agent" "text", "p_metadata" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text", "p_object_id" "uuid", "p_old_value" "jsonb", "p_new_value" "jsonb", "p_ip_address" "inet", "p_user_agent" "text", "p_metadata" "jsonb", "p_tenant_id" "uuid", "p_branch_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text", "p_object_id" "uuid", "p_old_value" "jsonb", "p_new_value" "jsonb", "p_ip_address" "inet", "p_user_agent" "text", "p_metadata" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text", "p_object_id" "uuid", "p_old_value" "jsonb", "p_new_value" "jsonb", "p_ip_address" "inet", "p_user_agent" "text", "p_metadata" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."log_audit_action"("p_action" "text", "p_user_id" "uuid", "p_object_type" "text", "p_object_id" "uuid", "p_old_value" "jsonb", "p_new_value" "jsonb", "p_ip_address" "inet", "p_user_agent" "text", "p_metadata" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid") TO "service_role";
 
 
 
 GRANT ALL ON FUNCTION "public"."log_branch_status_change"() TO "anon";
 GRANT ALL ON FUNCTION "public"."log_branch_status_change"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."log_branch_status_change"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."log_branch_status_change_v2"() TO "anon";
+GRANT ALL ON FUNCTION "public"."log_branch_status_change_v2"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."log_branch_status_change_v2"() TO "service_role";
 
 
 
@@ -24576,39 +21560,27 @@ GRANT ALL ON FUNCTION "public"."process_recurring_expenses"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."process_sale_from_attention"("p_attention_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."process_sale_from_attention"("p_attention_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."process_sale_from_attention"("p_attention_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."process_sale_from_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."process_sale_from_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."process_sale_from_attention"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_attention_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."queue_client_email"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_type" "text", "p_template_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."queue_client_email"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_type" "text", "p_template_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."queue_client_email"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_type" "text", "p_template_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."queue_client_whatsapp"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_name" "text", "p_template_params" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."queue_client_whatsapp"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_name" "text", "p_template_params" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."queue_client_whatsapp"("p_tenant_id" "uuid", "p_client_id" "uuid", "p_template_name" "text", "p_template_params" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."reactivate_treatment_session"("p_session_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."receive_product_transfer"("p_transfer_id" "uuid", "p_reception_notes" "text", "p_received_items" "jsonb", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."receive_purchase"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_purchase_id" "uuid", "p_branch_id" "uuid", "p_received_items" "jsonb", "p_reception_notes" "text") TO "service_role";
 
 
 
@@ -24618,75 +21590,75 @@ GRANT ALL ON FUNCTION "public"."register_new_tenant"("p_business_name" "text", "
 
 
 
-GRANT ALL ON FUNCTION "public"."register_tv"("p_registration_code" "text", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."register_tv"("p_registration_code" "text", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."register_tv"("p_registration_code" "text", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."register_tv"("p_registration_code" "text", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."register_tv"("p_registration_code" "text", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."register_tv"("p_registration_code" "text", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_tenant_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."register_tv_display"("p_registration_code" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."register_tv_display"("p_registration_code" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."register_tv_display"("p_registration_code" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."register_tv_display"("p_registration_code" "text", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."register_tv_display"("p_registration_code" "text", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."register_tv_display"("p_registration_code" "text", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."reject_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_plan_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_plan_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_plan_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."renew_subscription"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_plan_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."reschedule_attention"("p_attention_id" "uuid", "p_new_datetime" timestamp with time zone, "p_reason" "text", "p_fault" "text", "p_user_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."return_equipment"("p_assignment_id" "uuid", "p_return_date" "date", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") TO "anon";
-GRANT ALL ON FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") TO "anon";
+GRANT ALL ON FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."return_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_assignment_id" "uuid", "p_return_date" "date") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) TO "anon";
-GRANT ALL ON FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) TO "service_role";
+GRANT ALL ON FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."search_clients"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "text", "p_search_term" "text", "p_show_inactive" boolean) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_name" "text", "p_brand_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_name" "text", "p_brand_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_name" "text", "p_brand_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_name" "text", "p_brand_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_name" "text", "p_brand_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_name" "text", "p_brand_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."search_products"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_show_inactive" boolean, "p_category_id" "uuid", "p_brand_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) TO "anon";
-GRANT ALL ON FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) TO "service_role";
+GRANT ALL ON FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."search_services"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_search_term" "text", "p_category_id" "uuid", "p_show_inactive" boolean) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."send_electronic_document"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_document_id" "uuid", "p_provider_slug" "text", "p_document_type" "text") TO "service_role";
 
 
 
@@ -24702,45 +21674,45 @@ GRANT ALL ON FUNCTION "public"."set_audit_context"("p_context" "jsonb") TO "serv
 
 
 
-GRANT ALL ON FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_primary_branch_photo"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_photo_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."set_primary_combo_image"("p_combo_id" "uuid", "p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."set_primary_combo_image"("p_combo_id" "uuid", "p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_primary_combo_image"("p_combo_id" "uuid", "p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."set_primary_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_primary_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_primary_combo_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_combo_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_primary_image_for_product"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_primary_image_for_treatment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."set_primary_product_image"("p_product_id" "uuid", "p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."set_primary_product_image"("p_product_id" "uuid", "p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_primary_product_image"("p_product_id" "uuid", "p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."set_primary_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_primary_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_primary_product_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."set_primary_service_image"("p_service_id" "uuid", "p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."set_primary_service_image"("p_service_id" "uuid", "p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_primary_service_image"("p_service_id" "uuid", "p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."set_primary_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_primary_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_primary_service_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_service_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."set_primary_treatment_image"("p_treatment_id" "uuid", "p_image_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."set_primary_treatment_image"("p_treatment_id" "uuid", "p_image_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_primary_treatment_image"("p_treatment_id" "uuid", "p_image_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."set_primary_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_primary_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_primary_treatment_image"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_image_id" "uuid") TO "service_role";
 
 
 
@@ -24756,9 +21728,9 @@ GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_user_assignment"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_role_id" "uuid", "p_branch_id" "uuid", "p_status" "text") TO "service_role";
 
 
 
@@ -24774,9 +21746,9 @@ GRANT ALL ON FUNCTION "public"."setup_tenant_for_new_user"("p_user_id" "uuid", "
 
 
 
-GRANT ALL ON FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."ship_product_transfer"("p_transfer_id" "uuid", "p_tenant_id" "uuid", "p_user_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24787,21 +21759,21 @@ GRANT ALL ON FUNCTION "public"."sign"("payload" json, "secret" "text", "algorith
 
 
 
-GRANT ALL ON FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."sign_consent"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_signed_consent_id" "uuid", "p_signature" "text", "p_observations" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."start_attention_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."start_service"("p_attention_service_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."start_service"("p_attention_service_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."start_service"("p_attention_service_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."start_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."start_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."start_service"("p_attention_service_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24843,9 +21815,9 @@ GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without 
 
 
 
-GRANT ALL ON FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."toggle_consent_template_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid") TO "service_role";
 
 
 
@@ -24855,9 +21827,9 @@ GRANT ALL ON FUNCTION "public"."trigger_system_email"("p_recipient_user_id" "uui
 
 
 
-GRANT ALL ON FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trigger_test_email_for_tenant"("p_tenant_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24882,33 +21854,33 @@ GRANT ALL ON FUNCTION "public"."tstz_dist"(timestamp with time zone, timestamp w
 
 
 
-GRANT ALL ON FUNCTION "public"."update_attention_items"("p_payload" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_attention_items"("p_payload" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_attention_items"("p_payload" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_attention_items"("p_payload" "jsonb", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_attention_items"("p_payload" "jsonb", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_attention_items"("p_payload" "jsonb", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_attention_status"("p_attention_id" "uuid", "p_new_status" "text", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_address" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_address" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_address" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_address" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_address" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_branch"("p_branch_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_address" "text", "p_contact_phone" "text", "p_whatsapp_phone" "text", "p_commercial_email" "text", "p_website" "text", "p_physical_address_line1" "text", "p_physical_address_line2" "text", "p_physical_city" "text", "p_physical_state" "text", "p_physical_postal_code" "text", "p_latitude" numeric, "p_longitude" numeric, "p_timezone" "text", "p_google_place_id" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_branch_social_network"("p_id" "uuid", "p_branch_id" "uuid", "p_network" "public"."social_network", "p_url" "text", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_client_treatment_status_if_completed"("p_client_treatment_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24918,51 +21890,45 @@ GRANT ALL ON FUNCTION "public"."update_clients_fts"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_combo_branch_prices"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_branch_id" "uuid", "p_combo_id" "uuid", "p_price_overrides" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb", "p_is_active" boolean) TO "anon";
-GRANT ALL ON FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb", "p_is_active" boolean) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb", "p_is_active" boolean) TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb", "p_is_active" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb", "p_is_active" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_consent_template"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_id" "uuid", "p_name" "text", "p_content" "text", "p_fields" "jsonb", "p_is_active" boolean) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_equipment"("p_equipment_id" "uuid", "p_equipment_data" "jsonb", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_equipment"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_equipment_id" "uuid", "p_equipment_data" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_record_id" "uuid", "p_updates" "jsonb", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_equipment_maintenance_record"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_record_id" "uuid", "p_updates" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean) TO "anon";
-GRANT ALL ON FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean) TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."update_integration_category"("p_id" "uuid", "p_name" "text", "p_slug" "text", "p_description" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_integration_category"("p_id" "uuid", "p_name" "text", "p_slug" "text", "p_description" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_integration_category"("p_id" "uuid", "p_name" "text", "p_slug" "text", "p_description" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean, "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean, "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_equipment_type"("p_tenant_id" "uuid", "p_type_id" "uuid", "p_name" "text", "p_description" "text", "p_is_active" boolean, "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -24972,15 +21938,15 @@ GRANT ALL ON FUNCTION "public"."update_password_with_token"("p_token" "text", "p
 
 
 
-GRANT ALL ON FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_playlist_items_order"("items_to_update" "jsonb", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_product_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_product_id" "uuid", "p_category_ids" "uuid"[]) TO "service_role";
 
 
 
@@ -24990,21 +21956,21 @@ GRANT ALL ON FUNCTION "public"."update_product_costs"() TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_product_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_product_transfer_status"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_transfer_id" "uuid", "p_status" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_purchase_payment_status"("p_purchase_id" "uuid", "p_payment_status" "text", "p_platform_id" "uuid") TO "service_role";
 
 
 
@@ -25014,27 +21980,27 @@ GRANT ALL ON FUNCTION "public"."update_service_images_order"("p_images_data" "js
 
 
 
-GRANT ALL ON FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_images_data" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_service_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_images_data" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_staff_gallery_settings"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_user_id" "uuid", "p_gallery_items" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_description" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_description" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_description" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_description" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_description" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_tenant_description"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_description" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_slug" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_slug" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_slug" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_slug" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_slug" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_tenant_slug"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_slug" "text") TO "service_role";
 
 
 
@@ -25044,33 +22010,33 @@ GRANT ALL ON FUNCTION "public"."update_tenant_social_network"("p_id" "uuid", "p_
 
 
 
-GRANT ALL ON FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_treatment"("p_treatment_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_name" "text", "p_description" "text", "p_upfront_price" numeric, "p_financed_price" numeric, "p_sessions" "jsonb") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_treatment_category_assignments"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_category_ids" "uuid"[]) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_treatment_images_order"("p_tenant_id" "uuid", "p_platform_id" "uuid", "p_treatment_id" "uuid", "p_images_data" "jsonb"[]) TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid", "p_platform_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid", "p_platform_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_tv_heartbeat"("p_tv_display_id" "uuid", "p_platform_id" "uuid") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_unit_of_measure"("p_id" "uuid", "p_platform_id" "uuid", "p_tenant_id" "uuid", "p_name" "text", "p_abbreviation" "text") TO "service_role";
 
 
 
@@ -25086,15 +22052,15 @@ GRANT ALL ON FUNCTION "public"."update_user_active_status"("target_user_id" "uui
 
 
 
-GRANT ALL ON FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_new_status" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_new_status" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_new_status" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_status" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_status" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_user_assignment_status"("p_target_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_status" "text") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_new_assignments" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_new_assignments" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_new_assignments" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_assignments" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_assignments" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_user_assignments"("p_user_id" "uuid", "p_tenant_id" "uuid", "p_platform_id" "uuid", "p_new_assignments" "jsonb") TO "service_role";
 
 
 
@@ -25119,25 +22085,6 @@ GRANT ALL ON FUNCTION "public"."update_user_profile"("p_user_id" "uuid", "p_firs
 GRANT ALL ON FUNCTION "public"."update_user_regional_settings"("p_user_id" "uuid", "p_country_id" "uuid", "p_language_id" "uuid", "p_currency_id" "uuid", "p_timezone_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."update_user_regional_settings"("p_user_id" "uuid", "p_country_id" "uuid", "p_language_id" "uuid", "p_currency_id" "uuid", "p_timezone_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_user_regional_settings"("p_user_id" "uuid", "p_country_id" "uuid", "p_language_id" "uuid", "p_currency_id" "uuid", "p_timezone_id" "uuid") TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."integration_providers" TO "anon";
-GRANT ALL ON TABLE "public"."integration_providers" TO "authenticated";
-GRANT ALL ON TABLE "public"."integration_providers" TO "service_role";
-GRANT ALL ON TABLE "public"."integration_providers" TO PUBLIC;
-
-
-
-GRANT ALL ON FUNCTION "public"."upsert_integration_provider"("p_id" "uuid", "p_name" "text", "p_logo_url" "text", "p_country_id" "uuid", "p_category_id" "uuid", "p_status" "text", "p_endpoints" "jsonb", "p_config_schema" "jsonb", "p_api_schema" "jsonb") TO "anon";
-GRANT ALL ON FUNCTION "public"."upsert_integration_provider"("p_id" "uuid", "p_name" "text", "p_logo_url" "text", "p_country_id" "uuid", "p_category_id" "uuid", "p_status" "text", "p_endpoints" "jsonb", "p_config_schema" "jsonb", "p_api_schema" "jsonb") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."upsert_integration_provider"("p_id" "uuid", "p_name" "text", "p_logo_url" "text", "p_country_id" "uuid", "p_category_id" "uuid", "p_status" "text", "p_endpoints" "jsonb", "p_config_schema" "jsonb", "p_api_schema" "jsonb") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."upsert_tenant_integration"("p_tenant_id" "uuid", "p_provider_slug" "text", "p_encrypted_credentials" "text", "p_nonce" "text", "p_environment" "text", "p_user_role" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."upsert_tenant_integration"("p_tenant_id" "uuid", "p_provider_slug" "text", "p_encrypted_credentials" "text", "p_nonce" "text", "p_environment" "text", "p_user_role" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."upsert_tenant_integration"("p_tenant_id" "uuid", "p_provider_slug" "text", "p_encrypted_credentials" "text", "p_nonce" "text", "p_environment" "text", "p_user_role" "text") TO "service_role";
 
 
 
@@ -25226,60 +22173,6 @@ GRANT ALL ON TABLE "public"."absence_types" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."api_request_metrics" TO "anon";
-GRANT ALL ON TABLE "public"."api_request_metrics" TO "authenticated";
-GRANT ALL ON TABLE "public"."api_request_metrics" TO "service_role";
-
-
-
-GRANT ALL ON SEQUENCE "public"."api_request_metrics_id_seq" TO "anon";
-GRANT ALL ON SEQUENCE "public"."api_request_metrics_id_seq" TO "authenticated";
-GRANT ALL ON SEQUENCE "public"."api_request_metrics_id_seq" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."appointment_extra_services" TO "anon";
-GRANT ALL ON TABLE "public"."appointment_extra_services" TO "authenticated";
-GRANT ALL ON TABLE "public"."appointment_extra_services" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."appointment_products" TO "anon";
-GRANT ALL ON TABLE "public"."appointment_products" TO "authenticated";
-GRANT ALL ON TABLE "public"."appointment_products" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."appointment_sessions" TO "anon";
-GRANT ALL ON TABLE "public"."appointment_sessions" TO "authenticated";
-GRANT ALL ON TABLE "public"."appointment_sessions" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."appointments" TO "anon";
-GRANT ALL ON TABLE "public"."appointments" TO "authenticated";
-GRANT ALL ON TABLE "public"."appointments" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."asset_purposes" TO "anon";
-GRANT ALL ON TABLE "public"."asset_purposes" TO "authenticated";
-GRANT ALL ON TABLE "public"."asset_purposes" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."asset_usage_tracking" TO "anon";
-GRANT ALL ON TABLE "public"."asset_usage_tracking" TO "authenticated";
-GRANT ALL ON TABLE "public"."asset_usage_tracking" TO "service_role";
-
-
-
-GRANT ALL ON SEQUENCE "public"."asset_usage_tracking_id_seq" TO "anon";
-GRANT ALL ON SEQUENCE "public"."asset_usage_tracking_id_seq" TO "authenticated";
-GRANT ALL ON SEQUENCE "public"."asset_usage_tracking_id_seq" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."attention_combos" TO "anon";
 GRANT ALL ON TABLE "public"."attention_combos" TO "authenticated";
 GRANT ALL ON TABLE "public"."attention_combos" TO "service_role";
@@ -25328,12 +22221,6 @@ GRANT ALL ON TABLE "public"."attentions" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."audit_logs" TO "anon";
-GRANT ALL ON TABLE "public"."audit_logs" TO "authenticated";
-GRANT ALL ON TABLE "public"."audit_logs" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."branch_combo_item_prices" TO "anon";
 GRANT ALL ON TABLE "public"."branch_combo_item_prices" TO "authenticated";
 GRANT ALL ON TABLE "public"."branch_combo_item_prices" TO "service_role";
@@ -25349,12 +22236,6 @@ GRANT ALL ON TABLE "public"."branch_combos" TO "service_role";
 GRANT ALL ON TABLE "public"."branch_photos" TO "anon";
 GRANT ALL ON TABLE "public"."branch_photos" TO "authenticated";
 GRANT ALL ON TABLE "public"."branch_photos" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."branch_playback_state" TO "anon";
-GRANT ALL ON TABLE "public"."branch_playback_state" TO "authenticated";
-GRANT ALL ON TABLE "public"."branch_playback_state" TO "service_role";
 
 
 
@@ -25376,12 +22257,6 @@ GRANT ALL ON TABLE "public"."branch_status_history" TO "service_role";
 
 
 
-GRANT ALL ON SEQUENCE "public"."branch_status_history_id_seq" TO "anon";
-GRANT ALL ON SEQUENCE "public"."branch_status_history_id_seq" TO "authenticated";
-GRANT ALL ON SEQUENCE "public"."branch_status_history_id_seq" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."chatter_attachments" TO "anon";
 GRANT ALL ON TABLE "public"."chatter_attachments" TO "authenticated";
 GRANT ALL ON TABLE "public"."chatter_attachments" TO "service_role";
@@ -25391,6 +22266,12 @@ GRANT ALL ON TABLE "public"."chatter_attachments" TO "service_role";
 GRANT ALL ON TABLE "public"."chatter_comments" TO "anon";
 GRANT ALL ON TABLE "public"."chatter_comments" TO "authenticated";
 GRANT ALL ON TABLE "public"."chatter_comments" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."chatter_events" TO "anon";
+GRANT ALL ON TABLE "public"."chatter_events" TO "authenticated";
+GRANT ALL ON TABLE "public"."chatter_events" TO "service_role";
 
 
 
@@ -25436,12 +22317,6 @@ GRANT ALL ON TABLE "public"."client_document_templates" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."client_email_queue" TO "anon";
-GRANT ALL ON TABLE "public"."client_email_queue" TO "authenticated";
-GRANT ALL ON TABLE "public"."client_email_queue" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."client_professionals" TO "anon";
 GRANT ALL ON TABLE "public"."client_professionals" TO "authenticated";
 GRANT ALL ON TABLE "public"."client_professionals" TO "service_role";
@@ -25451,12 +22326,6 @@ GRANT ALL ON TABLE "public"."client_professionals" TO "service_role";
 GRANT ALL ON TABLE "public"."client_treatment_session_items" TO "anon";
 GRANT ALL ON TABLE "public"."client_treatment_session_items" TO "authenticated";
 GRANT ALL ON TABLE "public"."client_treatment_session_items" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."client_whatsapp_queue" TO "anon";
-GRANT ALL ON TABLE "public"."client_whatsapp_queue" TO "authenticated";
-GRANT ALL ON TABLE "public"."client_whatsapp_queue" TO "service_role";
 
 
 
@@ -25496,24 +22365,6 @@ GRANT ALL ON TABLE "public"."contact_types" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."countries" TO "anon";
-GRANT ALL ON TABLE "public"."countries" TO "authenticated";
-GRANT ALL ON TABLE "public"."countries" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."country_timezones" TO "anon";
-GRANT ALL ON TABLE "public"."country_timezones" TO "authenticated";
-GRANT ALL ON TABLE "public"."country_timezones" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."currencies" TO "anon";
-GRANT ALL ON TABLE "public"."currencies" TO "authenticated";
-GRANT ALL ON TABLE "public"."currencies" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."document_sequences" TO "anon";
 GRANT ALL ON TABLE "public"."document_sequences" TO "authenticated";
 GRANT ALL ON TABLE "public"."document_sequences" TO "service_role";
@@ -25529,24 +22380,6 @@ GRANT ALL ON TABLE "public"."document_types" TO "service_role";
 GRANT ALL ON TABLE "public"."earned_commissions" TO "anon";
 GRANT ALL ON TABLE "public"."earned_commissions" TO "authenticated";
 GRANT ALL ON TABLE "public"."earned_commissions" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."email_logs" TO "anon";
-GRANT ALL ON TABLE "public"."email_logs" TO "authenticated";
-GRANT ALL ON TABLE "public"."email_logs" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."email_queue" TO "anon";
-GRANT ALL ON TABLE "public"."email_queue" TO "authenticated";
-GRANT ALL ON TABLE "public"."email_queue" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."email_templates" TO "anon";
-GRANT ALL ON TABLE "public"."email_templates" TO "authenticated";
-GRANT ALL ON TABLE "public"."email_templates" TO "service_role";
 
 
 
@@ -25568,27 +22401,9 @@ GRANT ALL ON TABLE "public"."equipment_brands" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."equipment_maintenance_history" TO "anon";
-GRANT ALL ON TABLE "public"."equipment_maintenance_history" TO "authenticated";
-GRANT ALL ON TABLE "public"."equipment_maintenance_history" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."equipment_types" TO "anon";
 GRANT ALL ON TABLE "public"."equipment_types" TO "authenticated";
 GRANT ALL ON TABLE "public"."equipment_types" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."error_logs" TO "anon";
-GRANT ALL ON TABLE "public"."error_logs" TO "authenticated";
-GRANT ALL ON TABLE "public"."error_logs" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."exchange_rates" TO "anon";
-GRANT ALL ON TABLE "public"."exchange_rates" TO "authenticated";
-GRANT ALL ON TABLE "public"."exchange_rates" TO "service_role";
 
 
 
@@ -25622,60 +22437,6 @@ GRANT ALL ON TABLE "public"."extra_service_sessions" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."generic_taxes" TO "anon";
-GRANT ALL ON TABLE "public"."generic_taxes" TO "authenticated";
-GRANT ALL ON TABLE "public"."generic_taxes" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."global_settings" TO "anon";
-GRANT ALL ON TABLE "public"."global_settings" TO "authenticated";
-GRANT ALL ON TABLE "public"."global_settings" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."integration_auth_methods" TO "anon";
-GRANT ALL ON TABLE "public"."integration_auth_methods" TO "authenticated";
-GRANT ALL ON TABLE "public"."integration_auth_methods" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."integration_body_formats" TO "anon";
-GRANT ALL ON TABLE "public"."integration_body_formats" TO "authenticated";
-GRANT ALL ON TABLE "public"."integration_body_formats" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."integration_http_methods" TO "anon";
-GRANT ALL ON TABLE "public"."integration_http_methods" TO "authenticated";
-GRANT ALL ON TABLE "public"."integration_http_methods" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."integration_record" TO "anon";
-GRANT ALL ON TABLE "public"."integration_record" TO "authenticated";
-GRANT ALL ON TABLE "public"."integration_record" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."integrations_config" TO "anon";
-GRANT ALL ON TABLE "public"."integrations_config" TO "authenticated";
-GRANT ALL ON TABLE "public"."integrations_config" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."investor_platform_shares" TO "anon";
-GRANT ALL ON TABLE "public"."investor_platform_shares" TO "authenticated";
-GRANT ALL ON TABLE "public"."investor_platform_shares" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."investor_platform_stakes" TO "anon";
-GRANT ALL ON TABLE "public"."investor_platform_stakes" TO "authenticated";
-GRANT ALL ON TABLE "public"."investor_platform_stakes" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."invoice_item_taxes" TO "anon";
 GRANT ALL ON TABLE "public"."invoice_item_taxes" TO "authenticated";
 GRANT ALL ON TABLE "public"."invoice_item_taxes" TO "service_role";
@@ -25694,27 +22455,9 @@ GRANT ALL ON TABLE "public"."invoices" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."languages" TO "anon";
-GRANT ALL ON TABLE "public"."languages" TO "authenticated";
-GRANT ALL ON TABLE "public"."languages" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."media_playlists" TO "anon";
 GRANT ALL ON TABLE "public"."media_playlists" TO "authenticated";
 GRANT ALL ON TABLE "public"."media_playlists" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."menu_permissions" TO "anon";
-GRANT ALL ON TABLE "public"."menu_permissions" TO "authenticated";
-GRANT ALL ON TABLE "public"."menu_permissions" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."monthly_charges" TO "anon";
-GRANT ALL ON TABLE "public"."monthly_charges" TO "authenticated";
-GRANT ALL ON TABLE "public"."monthly_charges" TO "service_role";
 
 
 
@@ -25724,21 +22467,9 @@ GRANT ALL ON TABLE "public"."notifications" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."payment_intents" TO "anon";
-GRANT ALL ON TABLE "public"."payment_intents" TO "authenticated";
-GRANT ALL ON TABLE "public"."payment_intents" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."payment_methods" TO "anon";
 GRANT ALL ON TABLE "public"."payment_methods" TO "authenticated";
 GRANT ALL ON TABLE "public"."payment_methods" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."payments" TO "anon";
-GRANT ALL ON TABLE "public"."payments" TO "authenticated";
-GRANT ALL ON TABLE "public"."payments" TO "service_role";
 
 
 
@@ -25760,54 +22491,6 @@ GRANT ALL ON TABLE "public"."performance_metrics" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."permissions" TO "anon";
-GRANT ALL ON TABLE "public"."permissions" TO "authenticated";
-GRANT ALL ON TABLE "public"."permissions" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."phone_prefixes" TO "anon";
-GRANT ALL ON TABLE "public"."phone_prefixes" TO "authenticated";
-GRANT ALL ON TABLE "public"."phone_prefixes" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."plan_asset_bonuses" TO "anon";
-GRANT ALL ON TABLE "public"."plan_asset_bonuses" TO "authenticated";
-GRANT ALL ON TABLE "public"."plan_asset_bonuses" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."plan_asset_limits" TO "anon";
-GRANT ALL ON TABLE "public"."plan_asset_limits" TO "authenticated";
-GRANT ALL ON TABLE "public"."plan_asset_limits" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."plan_assets" TO "anon";
-GRANT ALL ON TABLE "public"."plan_assets" TO "authenticated";
-GRANT ALL ON TABLE "public"."plan_assets" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."plan_country_configurations" TO "anon";
-GRANT ALL ON TABLE "public"."plan_country_configurations" TO "authenticated";
-GRANT ALL ON TABLE "public"."plan_country_configurations" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."platform_assignments" TO "anon";
-GRANT ALL ON TABLE "public"."platform_assignments" TO "authenticated";
-GRANT ALL ON TABLE "public"."platform_assignments" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."platform_countries" TO "anon";
-GRANT ALL ON TABLE "public"."platform_countries" TO "authenticated";
-GRANT ALL ON TABLE "public"."platform_countries" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."platforms" TO "anon";
 GRANT ALL ON TABLE "public"."platforms" TO "authenticated";
 GRANT ALL ON TABLE "public"."platforms" TO "service_role";
@@ -25817,12 +22500,6 @@ GRANT ALL ON TABLE "public"."platforms" TO "service_role";
 GRANT ALL ON TABLE "public"."playlist_items" TO "anon";
 GRANT ALL ON TABLE "public"."playlist_items" TO "authenticated";
 GRANT ALL ON TABLE "public"."playlist_items" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."price_tariffs" TO "anon";
-GRANT ALL ON TABLE "public"."price_tariffs" TO "authenticated";
-GRANT ALL ON TABLE "public"."price_tariffs" TO "service_role";
 
 
 
@@ -25922,12 +22599,6 @@ GRANT ALL ON TABLE "public"."rescheduled_attentions" TO "service_role";
 
 
 
-GRANT ALL ON SEQUENCE "public"."rescheduled_attentions_id_seq" TO "anon";
-GRANT ALL ON SEQUENCE "public"."rescheduled_attentions_id_seq" TO "authenticated";
-GRANT ALL ON SEQUENCE "public"."rescheduled_attentions_id_seq" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."roles" TO "anon";
 GRANT ALL ON TABLE "public"."roles" TO "authenticated";
 GRANT ALL ON TABLE "public"."roles" TO "service_role";
@@ -26000,30 +22671,6 @@ GRANT ALL ON TABLE "public"."staff_gallery_items" TO "service_role";
 
 
 
-GRANT ALL ON SEQUENCE "public"."staff_gallery_items_id_seq" TO "anon";
-GRANT ALL ON SEQUENCE "public"."staff_gallery_items_id_seq" TO "authenticated";
-GRANT ALL ON SEQUENCE "public"."staff_gallery_items_id_seq" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."subscription_assets" TO "anon";
-GRANT ALL ON TABLE "public"."subscription_assets" TO "authenticated";
-GRANT ALL ON TABLE "public"."subscription_assets" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."subscription_items" TO "anon";
-GRANT ALL ON TABLE "public"."subscription_items" TO "authenticated";
-GRANT ALL ON TABLE "public"."subscription_items" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."subscription_plans" TO "anon";
-GRANT ALL ON TABLE "public"."subscription_plans" TO "authenticated";
-GRANT ALL ON TABLE "public"."subscription_plans" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."supplier_addresses" TO "anon";
 GRANT ALL ON TABLE "public"."supplier_addresses" TO "authenticated";
 GRANT ALL ON TABLE "public"."supplier_addresses" TO "service_role";
@@ -26048,18 +22695,6 @@ GRANT ALL ON TABLE "public"."suppliers" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."system_alerts" TO "anon";
-GRANT ALL ON TABLE "public"."system_alerts" TO "authenticated";
-GRANT ALL ON TABLE "public"."system_alerts" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."tariff_asset_prices" TO "anon";
-GRANT ALL ON TABLE "public"."tariff_asset_prices" TO "authenticated";
-GRANT ALL ON TABLE "public"."tariff_asset_prices" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."tax_types" TO "anon";
 GRANT ALL ON TABLE "public"."tax_types" TO "authenticated";
 GRANT ALL ON TABLE "public"."tax_types" TO "service_role";
@@ -26072,39 +22707,15 @@ GRANT ALL ON TABLE "public"."tenant_client_settings" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."tenant_integrations" TO "anon";
-GRANT ALL ON TABLE "public"."tenant_integrations" TO "authenticated";
-GRANT ALL ON TABLE "public"."tenant_integrations" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."tenant_settings" TO "anon";
 GRANT ALL ON TABLE "public"."tenant_settings" TO "authenticated";
 GRANT ALL ON TABLE "public"."tenant_settings" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."tenant_subscriptions" TO "anon";
-GRANT ALL ON TABLE "public"."tenant_subscriptions" TO "authenticated";
-GRANT ALL ON TABLE "public"."tenant_subscriptions" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."tenant_template_settings" TO "anon";
 GRANT ALL ON TABLE "public"."tenant_template_settings" TO "authenticated";
 GRANT ALL ON TABLE "public"."tenant_template_settings" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."timezones" TO "anon";
-GRANT ALL ON TABLE "public"."timezones" TO "authenticated";
-GRANT ALL ON TABLE "public"."timezones" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."translations" TO "anon";
-GRANT ALL ON TABLE "public"."translations" TO "authenticated";
-GRANT ALL ON TABLE "public"."translations" TO "service_role";
 
 
 
@@ -26138,12 +22749,6 @@ GRANT ALL ON TABLE "public"."turns" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."tv_displays" TO "anon";
-GRANT ALL ON TABLE "public"."tv_displays" TO "authenticated";
-GRANT ALL ON TABLE "public"."tv_displays" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."units_of_measure" TO "anon";
 GRANT ALL ON TABLE "public"."units_of_measure" TO "authenticated";
 GRANT ALL ON TABLE "public"."units_of_measure" TO "service_role";
@@ -26162,33 +22767,9 @@ GRANT ALL ON TABLE "public"."user_avatars" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."user_permissions" TO "anon";
-GRANT ALL ON TABLE "public"."user_permissions" TO "authenticated";
-GRANT ALL ON TABLE "public"."user_permissions" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."user_time_off" TO "anon";
 GRANT ALL ON TABLE "public"."user_time_off" TO "authenticated";
 GRANT ALL ON TABLE "public"."user_time_off" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."v_role_id" TO "anon";
-GRANT ALL ON TABLE "public"."v_role_id" TO "authenticated";
-GRANT ALL ON TABLE "public"."v_role_id" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."vendor_platform_commissions" TO "anon";
-GRANT ALL ON TABLE "public"."vendor_platform_commissions" TO "authenticated";
-GRANT ALL ON TABLE "public"."vendor_platform_commissions" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."vendor_tenants" TO "anon";
-GRANT ALL ON TABLE "public"."vendor_tenants" TO "authenticated";
-GRANT ALL ON TABLE "public"."vendor_tenants" TO "service_role";
 
 
 

@@ -444,10 +444,10 @@ Deno.serve(async (req) => {
 
       case 'invite_or_assign_user_to_tenant': {
         console.log('Iniciando acción: invite_or_assign_user_to_tenant');
-        const { email, password, tenantId, roleName, branchName, platformId, firstName, lastName, tenantData } = payload;
+        const { email, password, tenantId, roleId, branchId, platformId, firstName, lastName, tenantData } = payload;
 
-        if (!email || !tenantId || !roleName || !platformId) {
-          throw new Error('Los campos email, tenantId, roleName y platformId son obligatorios.');
+        if (!email || !tenantId || !roleId || !platformId) {
+          throw new Error('Los campos email, tenantId, roleId y platformId son obligatorios.');
         }
 
         // 1. Buscar o crear el usuario en auth.users (Responsabilidad de la Edge Function)
@@ -477,10 +477,47 @@ Deno.serve(async (req) => {
 
         if (!userToAssign) throw new Error('No se pudo obtener el usuario para asignar.');
 
-        // 2. Delegar TODA la lógica de base de datos a la RPC (Tenant, Sucursal, Asignación)
-        console.log('Invocando RPC create_tenant_with_admin para manejar base de datos...');
-        
-        const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc('create_tenant_with_admin', {
+        // 2. Verificar si el tenant ya existe
+        const { data: tenantExists, error: tenantCheckError } = await supabaseAdmin
+          .from('tenants')
+          .select('id')
+          .eq('id', tenantId)
+          .eq('platform_id', platformId)
+          .single();
+
+        if (tenantCheckError && tenantCheckError.code !== 'PGRST116') {
+          throw new Error(`Error al verificar tenant: ${tenantCheckError.message}`);
+        }
+
+        let rpcResult;
+        let rpcError;
+
+        if (tenantExists) {
+          // TENANT EXISTE: Usar update_user_assignments para insertar en user_assignments
+          console.log(`Tenant ${tenantId} existe. Asignando usuario con roleId: ${roleId}`);
+          const assignment = {
+            assignment_id: crypto.randomUUID(),
+            tenant_id: tenantId,
+            role_id: roleId,
+            branch_id: branchId || null,
+            status: 'active',
+            base_salary: 0,
+            default_product_commission_rate: 0,
+            default_service_commission_rate: 0,
+            is_schedulable: false
+          };
+          const result = await supabaseAdmin.rpc('update_user_assignments', {
+            p_user_id: userToAssign.id,
+            p_tenant_id: tenantId,
+            p_platform_id: platformId,
+            p_new_assignments: [assignment]
+          });
+          rpcResult = result.data;
+          rpcError = result.error;
+        } else {
+          // TENANT NO EXISTE: Crear tenant + asignar super_admin (flujo registro inicial)
+          console.log(`Tenant ${tenantId} NO existe. Creando tenant y asignando super_admin...`);
+          const result = await supabaseAdmin.rpc('create_tenant_with_admin', {
             p_tenant_id: tenantId,
             p_user_id: userToAssign.id,
             p_platform_id: platformId,
@@ -504,16 +541,19 @@ Deno.serve(async (req) => {
             p_physical_state: tenantData?.physical_state || null,
             p_physical_postal_code: tenantData?.physical_postal_code || null,
             p_default_language_code: tenantData?.default_language_code || 'es'
-        });
+          });
+          rpcResult = result.data;
+          rpcError = result.error;
+        }
 
         if (rpcError) {
-            console.error('Error en RPC create_tenant_with_admin:', rpcError);
+            console.error('Error en RPC:', rpcError);
             throw new Error(`Error en base de datos: ${rpcError.message}`);
         }
 
         responseData = { 
             success: true, 
-            message: 'Usuario y Tenant procesados exitosamente.', 
+            message: tenantExists ? 'Usuario asignado al tenant exitosamente.' : 'Usuario y Tenant creados exitosamente.', 
             user: userToAssign,
             db_details: rpcResult 
         };

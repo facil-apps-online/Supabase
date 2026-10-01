@@ -81,10 +81,7 @@ serve(async (req) => {
 
         case 'public_get_or_create_tv_display': {
           const { p_id, p_registration_code } = payload;
-          const { data, error } = await tenantSupabase.rpc('get_or_create_tv_display', { 
-            p_id: p_id, 
-            p_registration_code: p_registration_code 
-          });
+          const { data, error } = await tenantSupabase.rpc('get_or_create_tv_display', { p_id: p_id, p_registration_code: p_registration_code, p_platform_id: payload.platform_id || payload.platformId });
           if (error) throw error;
           responseData = (data && data.length > 0) ? data[0] : null;
           break;
@@ -93,7 +90,7 @@ serve(async (req) => {
         case 'public_get_current_turns': {
           const { p_branch_id } = payload;
           if (!p_branch_id) throw new Error('Branch ID is required.');
-          const { data, error } = await tenantSupabase.rpc('get_current_turns_for_branch', { p_branch_id });
+          const { data, error } = await tenantSupabase.rpc('get_current_turns_for_branch', { p_branch_id: p_branch_id, p_platform_id: payload.platform_id || payload.platformId });
           if (error) throw error;
           responseData = data;
           break;
@@ -190,6 +187,7 @@ serve(async (req) => {
           let branchesData;
           const { data, error: branchesError } = await tenantSupabase.rpc('get_branches_for_microsite', {
             p_tenant_id: finalTenantData.id,
+            p_platform_id: platform_id
           });
 
           if (branchesError) {

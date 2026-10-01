@@ -259,7 +259,7 @@ const _getSubscriptionUsageDetails = async (supabaseAdmin: any, coreSupabase: an
 
     if (assetPurpose === 'storage') {
       // --- Special handling for STORAGE (Local RPC) ---
-      const { data: usageByTable, error: rpcError } = await supabaseAdmin.rpc('get_tenant_storage_usage_by_table', { p_tenant_id: tenantId });
+      const { data: usageByTable, error: rpcError } = await supabaseAdmin.rpc('get_tenant_storage_usage_by_table', { p_tenant_id: tenantId, p_platform_id: platformId });
       if (rpcError) {
         console.error(`[Usage] DB Error fetching storage usage breakdown: ${rpcError.message}`);
         throw new Error(`DB Error fetching storage usage breakdown: ${rpcError.message}`);
@@ -330,7 +330,7 @@ const _getSubscriptionUsageDetails = async (supabaseAdmin: any, coreSupabase: an
 };
 
 // Helper function to get ONLY storage usage details from the correct DBs
-const _getCoreStorageUsage = async (coreSupabase: any, supabaseAdmin: any, tenantId: string) => {
+const _getCoreStorageUsage = async (coreSupabase: any, supabaseAdmin: any, tenantId: string, platformId: string) => {
   // 1. Get active subscription and STORAGE asset limit from CORE database
   const { data: subData, error: subError } = await coreSupabase
     .from('tenant_subscriptions')
@@ -358,7 +358,7 @@ const _getCoreStorageUsage = async (coreSupabase: any, supabaseAdmin: any, tenan
   const storageLimitBytes = storageLimitGB * 1024 * 1024 * 1024;
 
   // 2. Get storage usage breakdown from TENANT database
-  const { data: usageByTable, error: rpcError } = await supabaseAdmin.rpc('get_tenant_storage_usage_by_table', { p_tenant_id: tenantId });
+  const { data: usageByTable, error: rpcError } = await supabaseAdmin.rpc('get_tenant_storage_usage_by_table', { p_tenant_id: tenantId, p_platform_id: platformId });
   if (rpcError) {
     throw new Error(`Tenant DB Error fetching storage usage breakdown: ${rpcError.message}`);
   }
@@ -554,7 +554,7 @@ serve(async (req) => {
     switch (action) {
       case 'get_tenant_storage_usage': {
         // tenantId is available from JWT
-        responseData = await _getCoreStorageUsage(coreSupabase, supabaseAdmin, tenantId);
+        responseData = await _getCoreStorageUsage(coreSupabase, supabaseAdmin, tenantId, platformId);
         break;
       }
 
@@ -1323,22 +1323,22 @@ serve(async (req) => {
 
       // --- CONSENT TEMPLATE ACTIONS ---
       case 'list_consent_templates': {
-        responseData = await callRpc(supabaseAdmin, 'list_consent_templates', { p_tenant_id: tenantId });
+        responseData = await callRpc(supabaseAdmin, 'list_consent_templates', { p_tenant_id: tenantId, p_platform_id: platformId });
         break;
       }
 
       case 'get_consent_template': {
         const { id } = payload;
         if (!id) throw new Error('Template ID is required.');
-        responseData = await callRpc(supabaseAdmin, 'get_consent_template', { p_tenant_id: tenantId, p_id: id });
+        responseData = await callRpc(supabaseAdmin, 'get_consent_template', { p_tenant_id: tenantId, p_platform_id: platformId, p_id: id });
         break;
       }
 
       case 'create_consent_template': {
         const { name, content, fields } = payload;
         if (!name) throw new Error('Template name is required.');
-        responseData = await callRpc(supabaseAdmin, 'create_consent_template', {
-          p_tenant_id: tenantId,
+        responseData = await callRpc(supabaseAdmin, 'create_consent_template', { p_platform_id: platformId,
+          p_tenant_id: tenantId, p_platform_id: platformId,
           p_name: name,
           p_content: content,
           p_fields: fields,
@@ -1349,8 +1349,8 @@ serve(async (req) => {
       case 'update_consent_template': {
         const { id, name, content, fields, is_active } = payload;
         if (!id || !name) throw new Error('Template ID and name are required.');
-        responseData = await callRpc(supabaseAdmin, 'update_consent_template', {
-          p_tenant_id: tenantId,
+        responseData = await callRpc(supabaseAdmin, 'update_consent_template', { p_platform_id: platformId,
+          p_tenant_id: tenantId, p_platform_id: platformId,
           p_id: id,
           p_name: name,
           p_content: content,
@@ -1363,7 +1363,7 @@ serve(async (req) => {
       case 'toggle_consent_template_status': {
         const { id } = payload;
         if (!id) throw new Error('Template ID is required.');
-        responseData = await callRpc(supabaseAdmin, 'toggle_consent_template_status', { p_tenant_id: tenantId, p_id: id });
+        responseData = await callRpc(supabaseAdmin, 'toggle_consent_template_status', { p_tenant_id: tenantId, p_platform_id: platformId, p_id: id });
         break;
       }
 
@@ -1378,7 +1378,7 @@ serve(async (req) => {
             case 'assign_consent_to_service': {
               const { attention_id, template_id, attention_service_id, professional_observations } = payload;
               if (!attention_id || !template_id || !attention_service_id) throw new Error('Attention ID, Template ID, and Attention Service ID are required.');
-              responseData = await callRpc(supabaseAdmin, 'assign_consent_to_service', {
+              responseData = await callRpc(supabaseAdmin, 'assign_consent_to_service', { p_platform_id: platformId,
                 p_tenant_id: tenantId,
                 p_platform_id: platformId,
                 p_attention_id: attention_id,
@@ -1668,9 +1668,22 @@ serve(async (req) => {
         const { slug } = payload;
         // The tenantId is already available from the authenticated user context
         responseData = await callRpc(supabaseAdmin, 'update_tenant_slug', {
-          p_tenant_id: tenantId,
+          p_tenant_id: tenantId, p_platform_id: platformId,
           p_slug: slug,
         });
+
+        // Sync to Core DB
+        try {
+          const coreSupabase = getCoreSupabaseClient();
+          const { error: coreError } = await coreSupabase
+            .from('tenants')
+            .update({ slug })
+            .eq('id', tenantId)
+            .eq('platform_id', platformId);
+          if (coreError) console.error("Failed to sync tenant slug to Core DB:", coreError);
+        } catch (e) {
+          console.error("Exception syncing tenant slug to Core DB:", e);
+        }
         break;
       }
 
@@ -1678,7 +1691,7 @@ serve(async (req) => {
         const { description } = payload;
         if (description === undefined) throw new Error('Description is required.');
         responseData = await callRpc(supabaseAdmin, 'update_tenant_description', {
-          p_tenant_id: tenantId,
+          p_tenant_id: tenantId, p_platform_id: platformId,
           p_description: description,
         });
         break;
@@ -1691,7 +1704,7 @@ serve(async (req) => {
         responseData = await callRpc(supabaseAdmin, 'check_slug_availability', {
           p_slug: slug,
           p_country_id: countryId,
-          p_tenant_id: tenantId,
+          p_tenant_id: tenantId || null,
           p_platform_id: platformId,
         });
         break;
@@ -2249,9 +2262,9 @@ serve(async (req) => {
           .from('purchases')
           .select(`
             *,
-            supplier:supplier_id (name),
-            branch:branch_id (name),
-            items:purchase_items(*, product:product_id(name))
+            supplier:suppliers (name),
+            branch:branches (name),
+            items:purchase_items(*, product:products(name))
           `)
           .eq('tenant_id', requestedTenantId)
           .eq('platform_id', platformId)
@@ -2383,8 +2396,8 @@ serve(async (req) => {
           .from('product_transfers')
           .select(`
             *,
-            origin_branch:origin_branch_id (name),
-            destination_branch:destination_branch_id (name),
+            origin_branch:branches!product_transfers_from_branch_id_fkey (name),
+            destination_branch:branches!product_transfers_to_branch_id_fkey (name),
             items:product_transfer_items(*, product:products(name))
           `)
           .eq('tenant_id', tenantId)
@@ -2828,7 +2841,7 @@ serve(async (req) => {
             tenant_id: tenantId, 
             platform_id: platformId, 
             settings_data: newSettingsData 
-          }, { onConflict: 'tenant_id, platform_id' })
+          }, { onConflict: 'tenant_id' })
           .select()
           .single();
 
@@ -3513,19 +3526,21 @@ serve(async (req) => {
             { onConflict: 'tenant_id, platform_id' }
           )
           .select('settings_data')
-          .single();
+
+
+;
 
         if (error) throw error;
-        responseData = { settings_data: data?.settings_data };
+        responseData = data;
         break;
       }
-
+      
       case 'update_tenant_settings': {
         const { tenantId: queryTenantId, platformId: queryPlatformId, newSettings } = payload;
         if (!queryTenantId) throw new Error('Tenant ID is required for update_tenant_settings.');
         if (!queryPlatformId) throw new Error('Platform ID is required for update_tenant_settings.');
         if (!newSettings) throw new Error('New settings are required for update_tenant_settings.');
-        
+
         const { data: currentSettings, error: fetchError } = await supabaseAdmin
           .from('tenant_settings')
           .select('settings_data')
@@ -3537,35 +3552,22 @@ serve(async (req) => {
           throw fetchError;
         }
 
-        const mergedSettings = { ...currentSettings?.settings_data, ...newSettings };
-        
-        const { data, error } = await supabaseAdmin
+        const existing = (currentSettings && currentSettings.settings_data) || {};
+        const mergedSettings = { ...existing, ...newSettings };
+
+        const { error: upsertError } = await supabaseAdmin
           .from('tenant_settings')
-          .upsert({ 
-            tenant_id: queryTenantId, 
-            platform_id: queryPlatformId, 
-            settings_data: mergedSettings 
-          }, { onConflict: 'tenant_id, platform_id' })
-          .select('settings_data')
-          .single();
+          .upsert(
+            { tenant_id: queryTenantId, platform_id: queryPlatformId, settings_data: mergedSettings },
+            { onConflict: 'tenant_id, platform_id' }
+          )
+          .select();
 
-        if (error) throw error;
-        responseData = { settings_data: data?.settings_data };
+        if (upsertError) throw upsertError;
+        responseData = { settings_data: mergedSettings };
         break;
       }
 
-      case 'get_notification_settings': {
-        if (!tenantId) throw new Error('Tenant ID is required.');
-        const { data, error } = await supabaseAdmin
-            .from('tenant_template_settings')
-            .select('template_type, is_active')
-            .eq('tenant_id', tenantId)
-            .eq('platform_id', platformId);
-
-        if (error) throw error;
-        responseData = data;
-        break;
-      }
 
       case 'update_notification_settings': {
         const { settings } = payload;
@@ -3591,7 +3593,33 @@ serve(async (req) => {
         break;
       }
 
-      case 'get_suppliers': {
+        case 'update_sales_settings': {
+    const { settings } = payload;
+    if (!settings) throw new Error('Settings payload is required.');
+
+    const { data: currentSettings, error: fetchError } = await supabaseAdmin
+      .from('tenant_settings')
+      .select('settings_data')
+      .eq('tenant_id', tenantId)
+      .eq('platform_id', platformId)
+      .single();
+    if (fetchError && fetchError.code !== 'PGRST116') {
+      throw fetchError;
+    }
+    const existing = (currentSettings && currentSettings.settings_data) || {};
+    const mergedSettings = { ...existing, ...settings };
+    const { error: upsertError } = await supabaseAdmin
+      .from('tenant_settings')
+      .upsert(
+        { tenant_id: tenantId, platform_id: platformId, settings_data: mergedSettings },
+        { onConflict: 'tenant_id, platform_id' }
+      )
+      .select();
+    if (upsertError) throw upsertError;
+    responseData = { settings_data: mergedSettings };
+    break;
+  }
+  case 'get_suppliers': {
         const { data, error } = await supabaseAdmin
           .from('suppliers')
           .select('*, document_types(name)')
@@ -4271,8 +4299,8 @@ serve(async (req) => {
           .from('supplier_products')
           .select(`
             *,
-            products:product_id (*),
-            suppliers:supplier_id (*)
+            products:products (*),
+            suppliers:suppliers (*)
           `);
         query = query.eq('tenant_id', tenantId).eq('platform_id', platformId);
         if (supplierId) {
@@ -4516,7 +4544,7 @@ serve(async (req) => {
           .from('branch_services')
           .select(`
             *,
-            service:service_id (*)
+            service:services (*)
           `)
           .eq('tenant_id', tenantId)
           .eq('platform_id', platformId)
@@ -4832,7 +4860,7 @@ serve(async (req) => {
             if (!uomData || !uomData.name || !uomData.abbreviation) {
               throw new Error('Name and abbreviation are required to create a unit of measure.');
             }
-            responseData = await callRpc(supabaseAdmin, 'create_unit_of_measure', {
+            responseData = await callRpc(supabaseAdmin, 'create_unit_of_measure', { p_platform_id: platformId,
               p_tenant_id: tenantId,
               p_platform_id: platformId,
               p_name: uomData.name,
@@ -4843,7 +4871,7 @@ serve(async (req) => {
             if (!uomData || !uomData.id || !uomData.name || !uomData.abbreviation) {
               throw new Error('ID, name, and abbreviation are required to update a unit of measure.');
             }
-            responseData = await callRpc(supabaseAdmin, 'update_unit_of_measure', {
+            responseData = await callRpc(supabaseAdmin, 'update_unit_of_measure', { p_platform_id: platformId,
               p_id: uomData.id,
               p_tenant_id: tenantId,
               p_platform_id: platformId,
@@ -4855,7 +4883,7 @@ serve(async (req) => {
             if (!uomData || !uomData.id) {
               throw new Error('ID is required to delete a unit of measure.');
             }
-            responseData = await callRpc(supabaseAdmin, 'delete_unit_of_measure', {
+            responseData = await callRpc(supabaseAdmin, 'delete_unit_of_measure', { p_platform_id: platformId,
               p_id: uomData.id,
               p_tenant_id: tenantId,
               p_platform_id: platformId,
@@ -4888,7 +4916,7 @@ serve(async (req) => {
 
         const { data, error } = await supabaseAdmin
           .from('tenant_client_settings')
-          .upsert({ ...settings, tenant_id: tenantId, platform_id: platformId }, { onConflict: 'tenant_id, platform_id' })
+          .upsert({ ...settings, tenant_id: tenantId, platform_id: platformId }, { onConflict: 'tenant_id' })
           .select()
           .single();
 
@@ -4989,7 +5017,7 @@ serve(async (req) => {
       
               let query = supabaseAdmin
                 .from('client_document_instances')
-                .select('*, template:template_id(name, description, version, schema)')
+                .select('*, template:client_document_templates(name, description, version, schema)')
                 .eq('tenant_id', tenantId)
                 .eq('platform_id', platformId)
                 .order('created_at', { ascending: false });
@@ -5149,7 +5177,7 @@ serve(async (req) => {
       case 'create_equipment_type': {
         const { name, description } = payload;
         if (!name) throw new Error('Equipment type name is required.');
-        responseData = await callRpc(supabaseAdmin, 'create_equipment_type', {
+        responseData = await callRpc(supabaseAdmin, 'create_equipment_type', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_name: name,
@@ -5161,7 +5189,7 @@ serve(async (req) => {
       case 'update_equipment_type': {
         const { id, name, description, is_active } = payload;
         if (!id || !name) throw new Error('Equipment type ID and name are required.');
-        responseData = await callRpc(supabaseAdmin, 'update_equipment_type', {
+        responseData = await callRpc(supabaseAdmin, 'update_equipment_type', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_type_id: id,
@@ -5175,7 +5203,7 @@ serve(async (req) => {
       case 'delete_equipment_type': {
         const { id } = payload;
         if (!id) throw new Error('Equipment type ID is required.');
-        responseData = await callRpc(supabaseAdmin, 'delete_equipment_type', {
+        responseData = await callRpc(supabaseAdmin, 'delete_equipment_type', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_type_id: id,
@@ -5186,7 +5214,7 @@ serve(async (req) => {
       // --- EQUIPMENT ACTIONS ---
       case 'get_equipment': {
         const { searchTerm, showInactive, typeId, brandId } = payload;
-        responseData = await callRpc(supabaseAdmin, 'get_equipment', {
+        responseData = await callRpc(supabaseAdmin, 'get_equipment', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_search_term: searchTerm || null,
@@ -5502,8 +5530,8 @@ serve(async (req) => {
                   .from('sales')
                   .select(`
                     *,
-                    client:client_id (*),
-                    branch:branch_id (*),
+                    client:clients (*),
+                    branch:branches (*),
                     items:sales_items!left(*)
                   `)
                   .eq('id', saleId)
@@ -5607,7 +5635,7 @@ serve(async (req) => {
         if (!productId || !google_drive_file_id) {
           throw new Error('productId and google_drive_file_id are required.');
         }
-        responseData = await callRpc(supabaseAdmin, 'associate_product_image', { 
+        responseData = await callRpc(supabaseAdmin, 'associate_product_image', { p_platform_id: platformId, 
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_product_id: productId, 
@@ -5626,7 +5654,7 @@ serve(async (req) => {
       case 'set_primary_product_image': {
         const { productId, imageId } = payload;
         if (!productId || !imageId) throw new Error('Product ID and Image ID are required.');
-        responseData = await callRpc(supabaseAdmin, 'set_primary_product_image', {
+        responseData = await callRpc(supabaseAdmin, 'set_primary_product_image', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_product_id: productId,
@@ -5648,7 +5676,7 @@ serve(async (req) => {
         if (!comboId || !google_drive_file_id) {
           throw new Error('comboId and google_drive_file_id are required.');
         }
-        responseData = await callRpc(supabaseAdmin, 'associate_combo_image', { 
+        responseData = await callRpc(supabaseAdmin, 'associate_combo_image', { p_platform_id: platformId, 
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_combo_id: comboId, 
@@ -5667,7 +5695,7 @@ serve(async (req) => {
       case 'set_primary_combo_image': {
         const { comboId, imageId } = payload;
         if (!comboId || !imageId) throw new Error('Combo ID and Image ID are required.');
-        responseData = await callRpc(supabaseAdmin, 'set_primary_combo_image', {
+        responseData = await callRpc(supabaseAdmin, 'set_primary_combo_image', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_combo_id: comboId,
@@ -5689,7 +5717,7 @@ serve(async (req) => {
         if (!treatmentId || !google_drive_file_id) {
           throw new Error('treatmentId and google_drive_file_id are required.');
         }
-        responseData = await callRpc(supabaseAdmin, 'associate_treatment_image', { 
+        responseData = await callRpc(supabaseAdmin, 'associate_treatment_image', { p_platform_id: platformId, 
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_treatment_id: treatmentId, 
@@ -5708,7 +5736,7 @@ serve(async (req) => {
       case 'set_primary_treatment_image': {
         const { treatmentId, imageId } = payload;
         if (!treatmentId || !imageId) throw new Error('Treatment ID and Image ID are required.');
-        responseData = await callRpc(supabaseAdmin, 'set_primary_treatment_image', {
+        responseData = await callRpc(supabaseAdmin, 'set_primary_treatment_image', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_treatment_id: treatmentId,
@@ -5730,7 +5758,7 @@ serve(async (req) => {
         if (!projectId || !google_drive_file_id) {
           throw new Error('projectId and google_drive_file_id are required.');
         }
-        responseData = await callRpc(supabaseAdmin, 'associate_project_image', { 
+        responseData = await callRpc(supabaseAdmin, 'associate_project_image', { p_platform_id: platformId, 
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_project_id: projectId, 
@@ -5749,7 +5777,7 @@ serve(async (req) => {
       case 'set_primary_project_image': {
         const { projectId, imageId } = payload;
         if (!projectId || !imageId) throw new Error('Project ID and Image ID are required.');
-        responseData = await callRpc(supabaseAdmin, 'set_primary_project_image', {
+        responseData = await callRpc(supabaseAdmin, 'set_primary_project_image', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_project_id: projectId,
@@ -5934,7 +5962,7 @@ serve(async (req) => {
             tenant_id: tenantId,
             platform_id: platformId,
             is_active: is_active ?? true,
-          }, { onConflict: 'branch_id, combo_id, platform_id' })
+          }, { onConflict: 'branch_id, combo_id' })
           .select()
           .single();
 
@@ -6591,8 +6619,8 @@ serve(async (req) => {
           .from('invoices')
           .select(`
             *,
-            client:billed_to_client_id (*),
-            branch:attentions!inner(branch_id(name, address)),
+            client:clients (*),
+            branch:attentions!inner(branches(name, address)),
             items:invoice_items(*)
           `)
           .eq('id', invoiceId)
@@ -6605,7 +6633,7 @@ serve(async (req) => {
         // 3. (Platzhalter für die Zukunft) Überprüfen Sie die E-Invoicing-Konfiguration
         const { data: tenantSettings } = await supabaseAdmin
             .from('tenant_settings')
-            .select('settings_data')
+            .select()
             .eq('tenant_id', tenantId)
             .single();
 
@@ -6724,7 +6752,7 @@ serve(async (req) => {
 
         let query = supabaseAdmin
           .from('earned_commissions')
-          .select(`*, branch:branch_id ( name )`) // Select branch name directly
+          .select(`*, branch:branches ( name )`) // Select branch name directly
           .eq('tenant_id', tenantId)
           .eq('platform_id', platformId);
 
@@ -6798,7 +6826,7 @@ serve(async (req) => {
 
         let query = supabaseAdmin
           .from('payslips')
-          .select(`*, branch:branch_id ( name )`) // Select branch name directly
+          .select(`*, branch:branches ( name )`) // Select branch name directly
           .eq('tenant_id', tenantId)
           .eq('platform_id', platformId);
 
@@ -7234,7 +7262,7 @@ serve(async (req) => {
                 commission_rate: commission_rate,
               },
               {
-                onConflict: 'product_id, user_id, branch_id, tenant_id, platform_id',
+                onConflict: 'product_id, user_id, branch_id',
               }
             )
             .select()
@@ -7253,7 +7281,7 @@ serve(async (req) => {
                 can_perform: can_perform ?? false,
               },
               {
-                onConflict: 'service_id, user_id, branch_id, tenant_id, platform_id',
+                onConflict: 'service_id, user_id, branch_id',
               }
             )
             .select()
@@ -7269,7 +7297,7 @@ serve(async (req) => {
 
       case 'create_product_transfer_request': {
         const { requesting_branch_id, origin_branch_id, notes, items } = payload;
-        responseData = await callRpc(supabaseAdmin, 'create_product_transfer_request', {
+        responseData = await callRpc(supabaseAdmin, 'create_product_transfer_request', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_requesting_branch_id: requesting_branch_id,
@@ -7282,7 +7310,7 @@ serve(async (req) => {
 
       case 'approve_product_transfer': {
         const { transfer_id, adjusted_items } = payload;
-        responseData = await callRpc(supabaseAdmin, 'approve_product_transfer', {
+        responseData = await callRpc(supabaseAdmin, 'approve_product_transfer', { p_platform_id: platformId,
           p_transfer_id: transfer_id,
           p_adjusted_items: adjusted_items,
           p_tenant_id: tenantId,
@@ -7294,7 +7322,7 @@ serve(async (req) => {
 
       case 'reject_product_transfer': {
         const { transfer_id } = payload;
-        responseData = await callRpc(supabaseAdmin, 'reject_product_transfer', {
+        responseData = await callRpc(supabaseAdmin, 'reject_product_transfer', { p_platform_id: platformId,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_transfer_id: transfer_id,
@@ -7304,7 +7332,7 @@ serve(async (req) => {
 
       case 'ship_product_transfer': {
         const { transfer_id } = payload;
-        responseData = await callRpc(supabaseAdmin, 'ship_product_transfer', {
+        responseData = await callRpc(supabaseAdmin, 'ship_product_transfer', { p_platform_id: platformId,
           p_transfer_id: transfer_id,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
@@ -7315,7 +7343,7 @@ serve(async (req) => {
 
       case 'receive_product_transfer': {
         const { transfer_id, reception_notes, received_items } = payload;
-        responseData = await callRpc(supabaseAdmin, 'receive_product_transfer', {
+        responseData = await callRpc(supabaseAdmin, 'receive_product_transfer', { p_platform_id: platformId,
           p_transfer_id: transfer_id,
           p_reception_notes: reception_notes,
           p_received_items: received_items,
@@ -7328,7 +7356,7 @@ serve(async (req) => {
 
       case 'cancel_product_transfer': {
         const { transfer_id } = payload;
-        responseData = await callRpc(supabaseAdmin, 'cancel_product_transfer', {
+        responseData = await callRpc(supabaseAdmin, 'cancel_product_transfer', { p_platform_id: platformId,
           p_transfer_id: transfer_id,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
@@ -7339,7 +7367,7 @@ serve(async (req) => {
 
       case 'get_transfer_details': {
         const { transfer_id } = payload;
-        responseData = await callRpc(supabaseAdmin, 'get_transfer_details', {
+        responseData = await callRpc(supabaseAdmin, 'get_transfer_details', { p_platform_id: platformId,
           p_transfer_id: transfer_id,
           p_tenant_id: tenantId,
           p_platform_id: platformId,
@@ -7355,7 +7383,7 @@ serve(async (req) => {
         
         const { data, error } = await supabaseAdmin.rpc('get_branch_commission_matrix', {
           tenant_id_param: tenantId,
-          platform_id_param: platformId,
+          p_platform_id: platformId,
           branch_id_param: branchId,
         });
 
@@ -8200,7 +8228,7 @@ serve(async (req) => {
         if (!treatmentId || !google_drive_file_id) {
           throw new Error('treatmentId and google_drive_file_id are required.');
         }
-        responseData = await callRpc(supabaseAdmin, 'associate_treatment_image', { 
+        responseData = await callRpc(supabaseAdmin, 'associate_treatment_image', { p_platform_id: platformId, 
           p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_treatment_id: treatmentId, 

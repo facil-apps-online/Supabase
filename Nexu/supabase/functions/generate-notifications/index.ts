@@ -20,6 +20,28 @@ interface AlertSettings {
   evaluacionesPendientes: AlertConfig;
 }
 
+interface EmailTemplateConfig {
+  enabled: boolean;
+  daysBeforeExpiry: number;
+  subject: string;
+  body: string;
+}
+
+interface EmailTemplates {
+  examenesVencer: EmailTemplateConfig;
+  cursosVencer: EmailTemplateConfig;
+  firmasPendientes: EmailTemplateConfig;
+  comitesVencer: EmailTemplateConfig;
+  dotacionEntrega: EmailTemplateConfig;
+  evaluacionesPendientes: EmailTemplateConfig;
+  vigilanciaSeguimiento: EmailTemplateConfig;
+  comunicacionEnviada: EmailTemplateConfig;
+}
+
+function applyTemplate(template: string, vars: Record<string, string>): string {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, key) => vars[key] ?? `{{${key}}}`);
+}
+
 interface UserPreferences {
   receive_summary: boolean;
   summary_frequency: string;
@@ -42,7 +64,7 @@ Deno.serve(async (req) => {
     if (!authHeader?.startsWith('Bearer ')) {
       console.log('No authorization header provided')
       return new Response(
-        JSON.stringify({ error: 'Unauthorized - No authorization header' }), 
+        JSON.stringify({ error: 'Unauthorized - No authorization header' }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -54,11 +76,11 @@ Deno.serve(async (req) => {
 
     const token = authHeader.replace('Bearer ', '')
     const { data: claimsData, error: claimsError } = await supabaseAuth.auth.getClaims(token)
-    
+
     if (claimsError || !claimsData?.claims) {
       console.log('Invalid token:', claimsError?.message)
       return new Response(
-        JSON.stringify({ error: 'Unauthorized - Invalid token' }), 
+        JSON.stringify({ error: 'Unauthorized - Invalid token' }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -67,7 +89,7 @@ Deno.serve(async (req) => {
 
     // 3. Check if user is super admin (using service role for elevated query)
     const supabaseService = createClient(supabaseUrl, supabaseServiceKey)
-    
+
     const { data: profile, error: profileError } = await supabaseService
       .from('profiles')
       .select('is_super_admin, tenant_id')
@@ -77,7 +99,7 @@ Deno.serve(async (req) => {
     if (profileError || !profile?.is_super_admin) {
       console.log('User is not super admin:', userId)
       return new Response(
-        JSON.stringify({ error: 'Forbidden - Admin access required' }), 
+        JSON.stringify({ error: 'Forbidden - Admin access required' }),
         { status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -100,8 +122,18 @@ Deno.serve(async (req) => {
     for (const tenant of tenants || []) {
       const tenantId = tenant.id
       const settings = (tenant.settings as any)?.alerts as AlertSettings
-      
+
       if (!settings) continue
+
+      // Cargar templates de email configurables
+      const { data: templateSetting } = await supabase
+        .from('tenant_settings')
+        .select('settings_data')
+        .eq('tenant_id', tenantId)
+        .eq('setting_key', 'email-templates')
+        .maybeSingle()
+
+      const templates: Partial<EmailTemplates> = (templateSetting?.settings_data as any) || {}
 
       // Obtener empleados activos del tenant
       const { data: employees } = await supabase
@@ -141,17 +173,18 @@ Deno.serve(async (req) => {
           .lte('expiry_date', limitDate.toISOString().split('T')[0])
           .gte('expiry_date', today.toISOString().split('T')[0])
 
+        const tmplExam = templates.examenesVencer
         for (const exam of exams || []) {
           const employee = exam.employees as any
           const employeeName = `${employee?.first_name} ${employee?.last_name}`
-          
-          // Notificación para administradores
+          const vars = { nombre_empleado: employeeName, tipo_examen: exam.exam_type, fecha_vencimiento: exam.expiry_date, nombre_empresa: tenant.name }
+
           for (const admin of adminUsers || []) {
             notifications.push({
               userId: admin.user_id,
               type: 'examen_vencer',
-              title: 'Examen próximo a vencer',
-              message: `El examen "${exam.exam_type}" de ${employeeName} vence el ${exam.expiry_date}`,
+              title: tmplExam ? applyTemplate(tmplExam.subject, vars) : 'Examen próximo a vencer',
+              message: tmplExam ? applyTemplate(tmplExam.body, vars) : `El examen "${exam.exam_type}" de ${employeeName} vence el ${exam.expiry_date}`,
               link: '/examenes',
               entityId: exam.id,
               isAdmin: true
@@ -173,16 +206,18 @@ Deno.serve(async (req) => {
           .lte('expiry_date', limitDate.toISOString().split('T')[0])
           .gte('expiry_date', today.toISOString().split('T')[0])
 
+        const tmplCourse = templates.cursosVencer
         for (const course of courses || []) {
           const employee = course.employees as any
           const employeeName = `${employee?.first_name} ${employee?.last_name}`
-          
+          const vars = { nombre_empleado: employeeName, nombre_curso: course.course_name, fecha_vencimiento: course.expiry_date, nombre_empresa: tenant.name }
+
           for (const admin of adminUsers || []) {
             notifications.push({
               userId: admin.user_id,
               type: 'curso_vencer',
-              title: 'Curso próximo a vencer',
-              message: `El curso "${course.course_name}" de ${employeeName} vence el ${course.expiry_date}`,
+              title: tmplCourse ? applyTemplate(tmplCourse.subject, vars) : 'Curso próximo a vencer',
+              message: tmplCourse ? applyTemplate(tmplCourse.body, vars) : `El curso "${course.course_name}" de ${employeeName} vence el ${course.expiry_date}`,
               link: '/cursos',
               entityId: course.id,
               isAdmin: true
@@ -204,16 +239,18 @@ Deno.serve(async (req) => {
           .lte('expiry_date', limitDate.toISOString().split('T')[0])
           .gte('expiry_date', today.toISOString().split('T')[0])
 
+        const tmplDotacion = templates.dotacionEntrega
         for (const item of dotacion || []) {
           const employee = item.employees as any
           const employeeName = `${employee?.first_name} ${employee?.last_name}`
-          
+          const vars = { nombre_empleado: employeeName, item_dotacion: item.item_name, fecha_entrega: item.expiry_date, nombre_empresa: tenant.name }
+
           for (const admin of adminUsers || []) {
             notifications.push({
               userId: admin.user_id,
               type: 'dotacion_vencer',
-              title: 'Dotación próxima a vencer',
-              message: `La dotación "${item.item_name}" de ${employeeName} vence el ${item.expiry_date}`,
+              title: tmplDotacion ? applyTemplate(tmplDotacion.subject, vars) : 'Dotación próxima a vencer',
+              message: tmplDotacion ? applyTemplate(tmplDotacion.body, vars) : `La dotación "${item.item_name}" de ${employeeName} vence el ${item.expiry_date}`,
               link: '/dotacion',
               entityId: item.id,
               isAdmin: true
@@ -236,16 +273,18 @@ Deno.serve(async (req) => {
           .lte('follow_up_date', limitDate.toISOString().split('T')[0])
           .gte('follow_up_date', today.toISOString().split('T')[0])
 
+        const tmplVig = templates.vigilanciaSeguimiento
         for (const vig of vigilancias || []) {
           const employee = vig.employees as any
           const employeeName = `${employee?.first_name} ${employee?.last_name}`
-          
+          const vars = { nombre_empleado: employeeName, tipo_vigilancia: vig.vigilancia_type, fecha_seguimiento: vig.follow_up_date, nombre_empresa: tenant.name }
+
           for (const admin of adminUsers || []) {
             notifications.push({
               userId: admin.user_id,
               type: 'vigilancia_seguimiento',
-              title: 'Seguimiento de vigilancia pendiente',
-              message: `Vigilancia "${vig.vigilancia_type}" de ${employeeName} requiere seguimiento el ${vig.follow_up_date}`,
+              title: tmplVig ? applyTemplate(tmplVig.subject, vars) : 'Seguimiento de vigilancia pendiente',
+              message: tmplVig ? applyTemplate(tmplVig.body, vars) : `Vigilancia "${vig.vigilancia_type}" de ${employeeName} requiere seguimiento el ${vig.follow_up_date}`,
               link: '/vigilancias',
               entityId: vig.id,
               isAdmin: true
@@ -266,16 +305,19 @@ Deno.serve(async (req) => {
           .gte('meeting_date', today.toISOString())
           .lte('meeting_date', limitDate.toISOString())
 
+        const tmplComite = templates.comitesVencer
         for (const meeting of meetings || []) {
           const committee = meeting.committees as any
           if (committee?.tenant_id !== tenantId) continue
-          
+          const meetingDate = new Date(meeting.meeting_date).toLocaleDateString()
+          const vars = { nombre_empleado: '(Comité)', nombre_comite: committee.name, fecha_vencimiento: meetingDate, nombre_empresa: tenant.name }
+
           for (const admin of adminUsers || []) {
             notifications.push({
               userId: admin.user_id,
               type: 'comite_reunion',
-              title: 'Reunión de comité próxima',
-              message: `Reunión del comité "${committee.name}" programada para ${new Date(meeting.meeting_date).toLocaleDateString()}`,
+              title: tmplComite ? applyTemplate(tmplComite.subject, vars) : 'Reunión de comité próxima',
+              message: tmplComite ? applyTemplate(tmplComite.body, vars) : `Reunión del comité "${committee.name}" programada para ${meetingDate}`,
               link: '/comites',
               entityId: meeting.id,
               isAdmin: true
@@ -292,16 +334,18 @@ Deno.serve(async (req) => {
           .eq('tenant_id', tenantId)
           .eq('status', 'pendiente')
 
+        const tmplEval = templates.evaluacionesPendientes
         for (const evaluation of evaluations || []) {
           const employee = evaluation.employees as any
           const employeeName = `${employee?.first_name} ${employee?.last_name}`
-          
+          const vars = { nombre_empleado: employeeName, periodo: evaluation.period, fecha_limite: evaluation.evaluation_date || 'N/A', nombre_empresa: tenant.name }
+
           for (const admin of adminUsers || []) {
             notifications.push({
               userId: admin.user_id,
               type: 'evaluacion_pendiente',
-              title: 'Evaluación de desempeño pendiente',
-              message: `Evaluación de ${employeeName} (${evaluation.period}) pendiente de completar`,
+              title: tmplEval ? applyTemplate(tmplEval.subject, vars) : 'Evaluación de desempeño pendiente',
+              message: tmplEval ? applyTemplate(tmplEval.body, vars) : `Evaluación de ${employeeName} (${evaluation.period}) pendiente de completar`,
               link: '/evaluaciones-desempeno',
               entityId: evaluation.id,
               isAdmin: true
@@ -312,7 +356,7 @@ Deno.serve(async (req) => {
 
       // Procesar notificaciones según preferencias de usuario
       const userNotificationsMap = new Map<string, typeof notifications>()
-      
+
       for (const notification of notifications) {
         const existing = userNotificationsMap.get(notification.userId) || []
         existing.push(notification)

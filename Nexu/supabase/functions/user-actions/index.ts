@@ -33,6 +33,61 @@ interface RequestBody {
   payload: any;
 }
 
+// -------------------------------------------------------------------------
+// Helper: ensures the user has a profile row and syncs the provided fields.
+// User lists and tenant association read from public.profiles.
+//  - If no profile exists: creates it (with tenant_id if provided).
+//  - If it exists: updates only the provided fields and NEVER overwrites
+//    an already-assigned tenant_id (prevents "stealing" users from another tenant).
+// -------------------------------------------------------------------------
+async function syncProfile(
+  admin: any,
+  params: {
+    userId: string;
+    email?: string | null;
+    tenantId?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+    avatarUrl?: string | null;
+  }
+): Promise<void> {
+  const { data: existing, error: fetchError } = await admin
+    .from('profiles')
+    .select('id, tenant_id')
+    .eq('user_id', params.userId)
+    .maybeSingle();
+
+  if (fetchError) throw new Error(`Error al verificar profile: ${fetchError.message}`);
+
+  if (existing) {
+    const update: Record<string, any> = {};
+    if (params.firstName) update.first_name = params.firstName;
+    if (params.lastName) update.last_name = params.lastName;
+    if (params.avatarUrl) update.avatar_url = params.avatarUrl;
+    if (!existing.tenant_id && params.tenantId) update.tenant_id = params.tenantId;
+
+    if (Object.keys(update).length > 0) {
+      const { error: updateError } = await admin
+        .from('profiles')
+        .update(update)
+        .eq('id', existing.id);
+      if (updateError) throw new Error(`Error al actualizar profile: ${updateError.message}`);
+    }
+  } else {
+    const { error: insertError } = await admin
+      .from('profiles')
+      .insert({
+        user_id: params.userId,
+        email: params.email || '',
+        tenant_id: params.tenantId || null,
+        first_name: params.firstName || null,
+        last_name: params.lastName || null,
+        avatar_url: params.avatarUrl || null,
+      });
+    if (insertError) throw new Error(`Error al crear profile: ${insertError.message}`);
+  }
+}
+
 Deno.serve(async (req) => {
   console.log('--- Nueva Invocación a user-actions [NexuHR] ---');
   console.log('Método:', req.method);
@@ -129,21 +184,54 @@ Deno.serve(async (req) => {
 
         if (rError) throw new Error(`Error en roles: ${rError.message}`);
 
-        const tenantIds = roles?.map(r => r.tenant_id) || [];
+        // Get user's profile tenant_id for global roles
+        const { data: profile, error: profileError } = await supabaseAdmin
+          .from('profiles')
+          .select('tenant_id')
+          .eq('user_id', userId)
+          .single();
 
-        // 3. Consultar tenants
-        const { data: tenants, error: tError } = await supabaseAdmin
-          .from('tenants')
-          .select('id, name, platform_id')
-          .in('id', tenantIds)
-          .eq('platform_id', platformId);
+        console.log('[refresh-user-metadata] Profile lookup:', { profile, profileError });
 
-        if (tError) throw new Error(`Error en tenants: ${tError.message}`);
+        const tenantIds = (roles?.map(r => r.tenant_id).filter((id): id is string => id !== null) || []);
 
-        // 4. Mapear
+        // 3. Consultar tenants (solo los que tienen tenant_id, no globales)
+        let tenants: any[] = [];
+        if (tenantIds.length > 0) {
+          const { data, error: tError } = await supabaseAdmin
+            .from('tenants')
+            .select('id, name, platform_id')
+            .in('id', tenantIds)
+            .eq('platform_id', platformId);
+          if (tError) throw new Error(`Error en tenants: ${tError.message}`);
+          tenants = data || [];
+        }
+        
+        // 3b. Si hay roles globales y profile tiene tenant_id, consultar ese tenant también
+        const hasGlobalRoles = roles?.some(r => r.tenant_id === null) || false;
+        if (hasGlobalRoles && profile?.tenant_id && !tenants.some(t => t.id === profile.tenant_id)) {
+          const { data, error: tError } = await supabaseAdmin
+            .from('tenants')
+            .select('id, name, platform_id')
+            .eq('id', profile.tenant_id)
+            .eq('platform_id', platformId)
+            .single();
+          if (!tError && data) {
+            tenants.push(data);
+          }
+        }
+
+        // 4. Mapear - incluye roles globales usando profile.tenant_id
         const mappedAssignments = userRoles.map(ur => {
           const role = roles?.find(r => r.id === ur.role_id);
-          const tenant = tenants?.find(t => t.id === role?.tenant_id);
+          let tenant = tenants?.find(t => t.id === role?.tenant_id);
+          
+          // Si el rol es global (tenant_id = NULL), usar el tenant del perfil del usuario
+          if (!tenant && role?.tenant_id === null && profile?.tenant_id) {
+            tenant = tenants?.find(t => t.id === profile.tenant_id);
+          }
+          
+          console.log('[refresh-user-metadata] Mapping:', { ur, role, tenant, profile });
           
           if (!tenant) return null; // Filtramos si el tenant no coincide con la plataforma
 
@@ -160,6 +248,8 @@ Deno.serve(async (req) => {
             status: 'active',
           };
         }).filter(Boolean);
+
+        console.log('[refresh-user-metadata] Final mappedAssignments:', mappedAssignments);
 
         // 3. Actualizar app_metadata del usuario
         const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(
@@ -223,6 +313,9 @@ Deno.serve(async (req) => {
         );
 
         if (updateError) throw new Error(`Error al actualizar metadatos: ${updateError.message}`);
+
+        // Nota: no se escribe en public.profiles aquí — la RPC get_tenant_users
+        // resuelve nombre/avatar desde esta metadata al momento de leer (sin doble escritura).
 
         responseData = {
           success: true,
@@ -351,10 +444,10 @@ Deno.serve(async (req) => {
       // -----------------------------------------------------------------------
       case 'invite_or_assign_user_to_tenant': {
         console.log('Iniciando acción: invite_or_assign_user_to_tenant');
-        const { email, password, tenantId, roleName, branchName, platformId, firstName, lastName, tenantData } = payload;
+        const { email, password, tenantId, roleId, branchId, platformId, firstName, lastName, tenantData } = payload;
 
-        if (!email || !tenantId || !roleName || !platformId) {
-          throw new Error('Los campos email, tenantId, roleName y platformId son obligatorios.');
+        if (!email || !tenantId || !roleId || !platformId) {
+          throw new Error('Los campos email, tenantId, roleId y platformId son obligatorios.');
         }
 
         const synthetic_email = `${platformId}_${email}`;
@@ -383,40 +476,106 @@ Deno.serve(async (req) => {
           console.log(`Nuevo usuario creado: ${userToAssign.id}`);
         }
 
-        // Delegar la lógica de BD a la RPC
-        const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc('create_tenant_with_admin', {
-          p_tenant_id: tenantId,
-          p_user_id: userToAssign.id,
-          p_platform_id: platformId,
-          p_tenant_name: tenantData?.name || 'Nueva Empresa',
-          p_country_id: tenantData?.country_id || null,
-          p_email: email,
-          p_currency_id: tenantData?.default_currency_id || null,
-          p_timezone: tenantData?.default_timezone || 'UTC',
-          p_phone: tenantData?.contact_phone || null,
-          p_address: tenantData?.address || null,
-          p_website: tenantData?.website || null,
-          p_latitude: tenantData?.latitude || 0,
-          p_longitude: tenantData?.longitude || 0,
-          p_whatsapp_phone: tenantData?.whatsapp_phone || null,
-          p_legal_name: tenantData?.legal_name || null,
-          p_tax_id: tenantData?.tax_id || null,
-          p_physical_address_line1: tenantData?.physical_address_line1 || null,
-          p_physical_address_line2: tenantData?.physical_address_line2 || null,
-          p_physical_city: tenantData?.physical_city || null,
-          p_physical_state: tenantData?.physical_state || null,
-          p_physical_postal_code: tenantData?.physical_postal_code || null,
-          p_default_language_code: tenantData?.default_language_code || 'es',
-        });
+        // Verificar si el tenant ya existe
+        const { data: tenantExists, error: tenantCheckError } = await supabaseAdmin
+          .from('tenants')
+          .select('id')
+          .eq('id', tenantId)
+          .eq('platform_id', platformId)
+          .single();
+
+        if (tenantCheckError && tenantCheckError.code !== 'PGRST116') {
+          throw new Error(`Error al verificar tenant: ${tenantCheckError.message}`);
+        }
+
+        console.log('[DEBUG] tenantExists:', tenantExists, 'tenantCheckError:', tenantCheckError);
+
+        let rpcResult;
+        let rpcError;
+
+        if (tenantExists) {
+          // TENANT EXISTE: ensure profile (user <-> tenant association) and assign the role
+          console.log(`Tenant ${tenantId} existe. Asegurando profile y asignando roleId: ${roleId}`);
+
+          // 1. Create/update the profile — without this the user is invisible
+          //    in the tenant user lists (the on_auth_user_created trigger was removed).
+          await syncProfile(supabaseAdmin, {
+            userId: userToAssign.id,
+            email,
+            tenantId,
+            firstName,
+            lastName,
+          });
+
+          // 2. Assign the role — idempotent (UNIQUE(user_id, role_id) on user_roles):
+          //    re-inviting the same user with the same role no longer fails with duplicate key.
+          const { error: insertError } = await supabaseAdmin
+            .from('user_roles')
+            .upsert(
+              { user_id: userToAssign.id, role_id: roleId },
+              { onConflict: 'user_id,role_id', ignoreDuplicates: true }
+            );
+          if (insertError) {
+            rpcError = insertError;
+          } else {
+            rpcResult = { success: true };
+          }
+        } else {
+          // TENANT NO EXISTE: Crear tenant + asignar super_admin (flujo registro inicial)
+          console.log(`Tenant ${tenantId} NO existe. Creando tenant y asignando super_admin...`);
+          const result = await supabaseAdmin.rpc('create_tenant_with_admin', {
+            p_tenant_id: tenantId,
+            p_user_id: userToAssign.id,
+            p_platform_id: platformId,
+            p_tenant_name: tenantData?.name || 'Nueva Empresa',
+            p_country_id: tenantData?.country_id || null,
+            p_email: email,
+            p_currency_id: tenantData?.default_currency_id || null,
+            p_timezone: tenantData?.default_timezone || 'UTC',
+            p_phone: tenantData?.contact_phone || null,
+            p_address: tenantData?.address || null,
+            p_website: tenantData?.website || null,
+            p_latitude: tenantData?.latitude || 0,
+            p_longitude: tenantData?.longitude || 0,
+            p_whatsapp_phone: tenantData?.whatsapp_phone || null,
+            p_legal_name: tenantData?.legal_name || null,
+            p_tax_id: tenantData?.tax_id || null,
+            p_physical_address_line1: tenantData?.physical_address_line1 || null,
+            p_physical_address_line2: tenantData?.physical_address_line2 || null,
+            p_physical_city: tenantData?.physical_city || null,
+            p_physical_state: tenantData?.physical_state || null,
+            p_physical_postal_code: tenantData?.physical_postal_code || null,
+            p_default_language_code: tenantData?.default_language_code || 'es',
+          });
+          rpcResult = result.data;
+          rpcError = result.error;
+
+          // The RPC creates the profile WITHOUT first/last name (it does not receive
+          // them) — complete them with the invite data so user lists can show them.
+          if (!rpcError) {
+            try {
+              await syncProfile(supabaseAdmin, {
+                userId: userToAssign.id,
+                email,
+                tenantId,
+                firstName,
+                lastName,
+              });
+            } catch (profileError: any) {
+              // Do not block: the tenant and the role were already created correctly.
+              console.error('Error al completar nombres del profile:', profileError.message);
+            }
+          }
+        }
 
         if (rpcError) {
-          console.error('Error en RPC create_tenant_with_admin:', rpcError);
+          console.error('Error en RPC:', rpcError);
           throw new Error(`Error en base de datos: ${rpcError.message}`);
         }
 
         responseData = {
           success: true,
-          message: 'Usuario y Tenant procesados exitosamente.',
+          message: tenantExists ? 'Usuario asignado al tenant exitosamente.' : 'Usuario y Tenant creados exitosamente.',
           user: userToAssign,
           db_details: rpcResult,
         };
