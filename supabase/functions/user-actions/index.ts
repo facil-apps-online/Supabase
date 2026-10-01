@@ -566,9 +566,24 @@ Deno.serve(async (req) => {
           throw new Error('userId, tenantId y assignments son obligatorios.');
         }
 
+        // update_user_assignments exige p_platform_id: se toma del payload o del tenant.
+        let assignmentsPlatformId = payload.platformId || payload.platform_id;
+        if (!assignmentsPlatformId) {
+          const { data: tenantRow, error: tenantRowError } = await supabaseAdmin
+            .from('tenants')
+            .select('platform_id')
+            .eq('id', tenantId)
+            .single();
+          if (tenantRowError || !tenantRow?.platform_id) {
+            throw new Error('No se pudo determinar el platform_id del tenant.');
+          }
+          assignmentsPlatformId = tenantRow.platform_id;
+        }
+
         const { error } = await supabaseAdmin.rpc('update_user_assignments', {
           p_user_id: userId,
           p_tenant_id: tenantId,
+          p_platform_id: assignmentsPlatformId,
           p_new_assignments: assignments
         });
 

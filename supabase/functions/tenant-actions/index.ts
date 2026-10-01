@@ -68,6 +68,7 @@ const queueClientNotification = async (
 const createUserNotification = async (
   supabaseAdmin: any,
   tenantId: string,
+  platformId: string,
   userId: string,
   type: string,
   title: string,
@@ -77,6 +78,7 @@ const createUserNotification = async (
   try {
     const { error } = await supabaseAdmin.rpc('create_notification', {
       p_tenant_id: tenantId,
+      p_platform_id: platformId,
       p_user_id: userId,
       p_type: type,
       p_title: title,
@@ -381,7 +383,7 @@ serve(async (req) => {
   const coreSupabase = getCoreSupabaseClient(); // Available for future steps
 
   // Helper function to get staff gallery images
-  const _getStaffGallery = async (supabaseAdmin: any, tenantId: string, staffId: string) => {
+  const _getStaffGallery = async (supabaseAdmin: any, tenantId: string, platformId: string, staffId: string) => {
     // 1. Get all attention_service_evidences associated with services performed by the staffId in the given tenantId
     // This requires joining attention_services to attention_service_evidences.
     const { data: servicesWithEvidences, error: evidencesError } = await supabaseAdmin
@@ -470,7 +472,7 @@ serve(async (req) => {
   };
 
   // Helper function to update staff gallery images (favorites and order)
-  const _updateStaffGallery = async (supabaseAdmin: any, tenantId: string, staffId: string, galleryItems: Array<{ evidence_id: string; display_order: number; is_favorite: boolean }>) => {
+  const _updateStaffGallery = async (supabaseAdmin: any, tenantId: string, platformId: string, staffId: string, galleryItems: Array<{ evidence_id: string; display_order: number; is_favorite: boolean }>) => {
     // 1. Validate the number of favorites
     const favoriteCount = galleryItems.filter(item => item.is_favorite).length;
     if (favoriteCount > 10) {
@@ -486,6 +488,7 @@ serve(async (req) => {
     // 3. Call the new RPC function
     const { error } = await supabaseAdmin.rpc('update_staff_gallery_settings', {
       p_tenant_id: tenantId,
+      p_platform_id: platformId,
       p_user_id: staffId,
       p_gallery_items: rpcItems,
     });
@@ -1562,7 +1565,8 @@ serve(async (req) => {
       case 'get-dashboard-stats': {
         const { p_tenant_id, p_branch_id, p_user_id, p_timezone } = payload;
         const { data, error } = await supabaseAdmin.rpc('get_dashboard_stats', {
-          p_tenant_id,
+          p_tenant_id: tenantId, // siempre del JWT, nunca del payload
+          p_platform_id: platformId,
           p_branch_id,
           p_user_id,
           p_timezone,
@@ -1575,7 +1579,8 @@ serve(async (req) => {
       case 'get-today-attentions': {
         const { p_tenant_id, p_branch_id, p_user_id, p_timezone } = payload;
         const { data, error } = await supabaseAdmin.rpc('get_today_attentions', {
-          p_tenant_id,
+          p_tenant_id: tenantId, // siempre del JWT, nunca del payload
+          p_platform_id: platformId,
           p_branch_id,
           p_user_id,
           p_timezone,
@@ -2314,7 +2319,6 @@ serve(async (req) => {
           throw new Error('Purchase ID and payment status are required.');
         }
         const { data, error } = await supabaseAdmin.rpc('update_purchase_payment_status', {
-          p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_purchase_id: purchase_id,
           p_payment_status: payment_status,
@@ -2345,7 +2349,6 @@ serve(async (req) => {
           throw new Error('Purchase ID is required.');
         }
         const { data, error } = await supabaseAdmin.rpc('get_purchase_reception_details', {
-          p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_purchase_id: purchase_id,
         });
@@ -2965,7 +2968,6 @@ serve(async (req) => {
         }
 
         const { error: rpcError } = await supabaseAdmin.rpc('update_playlist_items_order', { 
-          p_tenant_id: tenantId, 
           p_platform_id: platformId, 
           items_to_update 
         });
@@ -3371,7 +3373,7 @@ serve(async (req) => {
         const notificationPromises = mentioned_user_ids.map((userId: string) => {
           return createUserNotification(
             supabaseAdmin,
-            tenantId,
+            tenantId, platformId,
             userId,
             'mention',
             `${actor_name} te ha mencionado en un comentario.`,
@@ -4320,7 +4322,7 @@ serve(async (req) => {
           throw new Error(`Error fetching countries: ${countriesError.message}`);
         }
 
-        const { data: localizationsData, error: localizationsError } = await supabaseAdmin
+        const { data: localizationsData, error: localizationsError } = await coreSupabase // languages vive en Core
           .from('languages')
           .select('*')
           .order('name');
@@ -4329,7 +4331,7 @@ serve(async (req) => {
           throw new Error(`Error fetching localizations: ${localizationsError.message}`);
         }
 
-        const { data: currenciesData, error: currenciesError } = await supabaseAdmin
+        const { data: currenciesData, error: currenciesError } = await coreSupabase // currencies vive en Core
           .from('currencies')
           .select('*')
           .order('name');
@@ -5228,7 +5230,6 @@ serve(async (req) => {
       case 'create_equipment': {
         const { equipmentData } = payload;
         const { data, error } = await supabaseAdmin.rpc('create_equipment', {
-          p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_equipment_data: equipmentData,
         });
@@ -5794,6 +5795,105 @@ serve(async (req) => {
         break;
       }
 
+      case 'associate_service_image': {
+        const { serviceId, google_drive_file_id } = payload;
+        if (!serviceId || !google_drive_file_id) {
+          throw new Error('serviceId and google_drive_file_id are required.');
+        }
+        responseData = await callRpc(supabaseAdmin, 'associate_service_image', {
+          p_tenant_id: tenantId,
+          p_platform_id: platformId,
+          p_service_id: serviceId,
+          p_google_drive_file_id: google_drive_file_id,
+        });
+        break;
+      }
+
+      case 'delete_service_image': {
+        const { imageId } = payload;
+        if (!imageId) throw new Error('Image ID is required.');
+        responseData = await callRpc(supabaseAdmin, 'delete_service_image', { p_tenant_id: tenantId, p_platform_id: platformId, p_image_id: imageId });
+        break;
+      }
+
+      case 'set_primary_service_image': {
+        const { serviceId, imageId } = payload;
+        if (!serviceId || !imageId) throw new Error('Service ID and Image ID are required.');
+        responseData = await callRpc(supabaseAdmin, 'set_primary_service_image', {
+          p_tenant_id: tenantId,
+          p_platform_id: platformId,
+          p_service_id: serviceId,
+          p_image_id: imageId,
+        });
+        break;
+      }
+
+      case 'update_service_images_order': {
+        const { images_data } = payload;
+        if (!images_data) throw new Error('images_data is required for update_service_images_order.');
+        const { error } = await supabaseAdmin.rpc('update_service_images_order', {
+          p_tenant_id: tenantId,
+          p_platform_id: platformId,
+          p_images_data: images_data,
+        });
+        if (error) throw error;
+        responseData = { success: true };
+        break;
+      }
+
+      case 'get_notification_settings': {
+        const { data, error } = await supabaseAdmin
+          .from('tenant_template_settings')
+          .select('template_type, is_active')
+          .eq('tenant_id', tenantId)
+          .eq('platform_id', platformId);
+        if (error) throw error;
+        responseData = data;
+        break;
+      }
+
+      case 'delete_master_product': {
+        const { id } = payload;
+        if (!id) throw new Error('Product ID is required.');
+        const { error } = await supabaseAdmin
+          .from('products')
+          .delete()
+          .eq('id', id)
+          .eq('tenant_id', tenantId)
+          .eq('platform_id', platformId);
+        if (error) throw error;
+        responseData = { success: true };
+        break;
+      }
+
+      case 'delete_master_service': {
+        const { id } = payload;
+        if (!id) throw new Error('Service ID is required.');
+        const { error } = await supabaseAdmin
+          .from('services')
+          .delete()
+          .eq('id', id)
+          .eq('tenant_id', tenantId)
+          .eq('platform_id', platformId);
+        if (error) throw error;
+        responseData = { success: true };
+        break;
+      }
+
+      case 'delete_supplier': {
+        const { id } = payload;
+        if (!id) throw new Error('Supplier ID is required.');
+        const { error } = await supabaseAdmin
+          .from('suppliers')
+          .delete()
+          .eq('id', id)
+          .eq('tenant_id', tenantId)
+          .eq('platform_id', platformId);
+        if (error) throw error;
+        responseData = { id };
+        break;
+      }
+
       case 'update_product_images_order': {
         const { images_data } = payload;
         if (!images_data) {
@@ -6237,7 +6337,7 @@ serve(async (req) => {
 
                 await createUserNotification(
                   supabaseAdmin,
-                  tenantId, // tenantId del token
+                  tenantId, platformId, // tenantId del token
                   staffUserId,
                   'new_appointment', // tipo de notificación
                   'Nueva Cita Asignada', // título
@@ -6264,7 +6364,6 @@ serve(async (req) => {
         }
         // This RPC handles the status update and the notification
         const { error } = await supabaseAdmin.rpc('cancel_attention_and_notify', {
-          p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_attention_id: attentionId,
         });
@@ -6345,7 +6444,7 @@ serve(async (req) => {
 
         if (wompiPaymentMethod) {
           // Si se incluye 'wompi', verificar si el tenant tiene la integración activa
-          const { data: wompiIntegration, error: integrationError } = await supabaseAdmin
+          const { data: wompiIntegration, error: integrationError } = await coreSupabase // tenant_integrations vive en Core
             .from('tenant_integrations')
             .select('id')
             .eq('tenant_id', tenantId)
@@ -6484,7 +6583,6 @@ serve(async (req) => {
                         try {
                             // 1. Generar la factura interna si no existe (o obtener su ID si ya existe)
                             const { data: generatedInvoiceId, error: invoiceGenError } = await supabaseAdmin.rpc('generate_invoice_for_attention', {
-                                p_tenant_id: tenantId,
                                 p_platform_id: platformId,
                                 p_attention_id: attention.id
                             });
@@ -6551,7 +6649,7 @@ serve(async (req) => {
             
                             await createUserNotification(
                               supabaseAdmin,
-                              tenantId,
+                              tenantId, platformId,
                               commission.user_id,
                               'commission_earned',
                               '¡Comisión Ganada!',
@@ -6966,7 +7064,7 @@ serve(async (req) => {
 
         await createUserNotification(
           supabaseAdmin,
-          tenantId,
+          tenantId, platformId,
           payslip_user_id,
           'payslip_pending_signature',
           'Liquidación de comisiones lista para firmar',
@@ -7060,7 +7158,7 @@ serve(async (req) => {
 
         await createUserNotification(
           supabaseAdmin,
-          tenantId,
+          tenantId, platformId,
           updatedPayslip.user_id,
           'payslip_paid',
           'Comprobante de pago firmado',
@@ -7093,7 +7191,7 @@ serve(async (req) => {
         const { payslip_id } = payload;
         if (!payslip_id) throw new Error('Payslip ID is required.');
 
-        const { data: payslipDetails, error: rpcError } = await supabaseAdmin.rpc('get_payslip_details', { p_tenant_id: tenantId, p_platform_id: platformId, p_payslip_id: payslip_id });
+        const { data: payslipDetails, error: rpcError } = await supabaseAdmin.rpc('get_payslip_details', { p_platform_id: platformId, p_payslip_id: payslip_id });
 
         if (rpcError) throw rpcError;
 
@@ -7158,7 +7256,7 @@ serve(async (req) => {
 
         await createUserNotification(
           supabaseAdmin,
-          tenantId,
+          tenantId, platformId,
           commission.user_id,
           'commission_voided',
           'Comisión Anulada',
@@ -7322,9 +7420,10 @@ serve(async (req) => {
 
       case 'reject_product_transfer': {
         const { transfer_id } = payload;
-        responseData = await callRpc(supabaseAdmin, 'reject_product_transfer', { p_platform_id: platformId,
+        responseData = await callRpc(supabaseAdmin, 'reject_product_transfer', {
           p_tenant_id: tenantId,
           p_platform_id: platformId,
+          p_user_id: userId,
           p_transfer_id: transfer_id,
         });
         break;
@@ -7463,7 +7562,6 @@ serve(async (req) => {
 
         // Llama a la función RPC que ya existe en la base de datos
         const { error } = await supabaseAdmin.rpc('start_service', {
-          p_tenant_id: tenantId,
           p_platform_id: platformId,
           p_attention_service_id: serviceId
         });
@@ -7485,8 +7583,6 @@ serve(async (req) => {
 
         // Llama a la función RPC que ya existe en la base de datos
         const { error } = await supabaseAdmin.rpc('end_service', {
-          p_tenant_id: tenantId,
-          p_platform_id: platformId,
           p_attention_service_id: serviceId
         });
 
@@ -7850,7 +7946,7 @@ serve(async (req) => {
         if (!platform_id || !type || !message) {
           throw new Error('Platform ID, type, and message are required for inserting a system alert.');
         }
-        const { data, error } = await supabaseAdmin
+        const { data, error } = await coreSupabase // system_alerts vive en Core
           .from('system_alerts')
           .insert({ platform_id: platform_id || platformId, type, message, details })
           .select()
@@ -8041,7 +8137,6 @@ serve(async (req) => {
         // Call the RPC to update the attention status
         const { error } = await supabaseAdmin.rpc('confirm_attention', {
           p_attention_id,
-          p_tenant_id: tenantId,
           p_platform_id: platformId
         });
 
@@ -8495,7 +8590,6 @@ serve(async (req) => {
       const coreSupabase = getCoreSupabaseClient();
       const { error } = await coreSupabase.rpc('log_api_metric', {
         p_tenant_id: tenantId,
-        p_platform_id: platformId,
         p_path: `edge/tenant-actions/${action}`,
         p_method: 'POST',
         p_status_code: status,

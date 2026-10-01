@@ -90,7 +90,7 @@ serve(async (req) => {
         case 'public_get_current_turns': {
           const { p_branch_id } = payload;
           if (!p_branch_id) throw new Error('Branch ID is required.');
-          const { data, error } = await tenantSupabase.rpc('get_current_turns_for_branch', { p_branch_id: p_branch_id, p_platform_id: payload.platform_id || payload.platformId });
+          const { data, error } = await tenantSupabase.rpc('get_current_turns_for_branch', { p_branch_id: p_branch_id });
           if (error) throw error;
           responseData = data;
           break;

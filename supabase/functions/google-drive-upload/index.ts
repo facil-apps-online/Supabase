@@ -1,5 +1,6 @@
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { getCoreSupabaseClient } from '../_shared/supabaseClients.ts';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*', 
@@ -102,113 +103,48 @@ serve(async (req) => {
       });
     }
 
-    // 2. Create Supabase admin client
+    // 2. Cliente admin de esta base (Services)
     const supabaseAdmin = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     );
 
-    // Get platform name from tenantId
+    // 3. platform_id del tenant (la columna vive en Services.tenants)
     const { data: tenantData, error: tenantError } = await supabaseAdmin
       .from('tenants')
       .select('platform_id')
       .eq('id', tenantId)
       .single();
-
     if (tenantError) throw new Error(`Failed to fetch tenant to get platform_id: ${tenantError.message}`);
     if (!tenantData) throw new Error(`Tenant with id ${tenantId} not found.`);
-
     const platformId = tenantData.platform_id;
 
-    const { data: platformData, error: platformError } = await supabaseAdmin
-      .from('platforms')
-      .select('name')
-      .eq('id', platformId)
-      .single();
-
-    if (platformError) throw new Error(`Failed to fetch platform name: ${platformError.message}`);
-    if (!platformData) throw new Error(`Platform with id ${platformId} not found.`);
-
-    const platformName = platformData.name;
-
-    // 3. Determine the correct tenantId for the integration lookup
-    let integrationTenantId = tenantId;
-    if (uploadContext === 'Avatars') {
-      const { data: ownerId, error: rpcError } = await supabaseAdmin.rpc('get_system_owner_tenant_id');
-      if (rpcError) throw new Error(`Could not get system owner tenant ID: ${rpcError.message}`);
-      if (!ownerId) throw new Error('System owner tenant ID not found.');
-      integrationTenantId = ownerId;
-    }
-
-    // 4. Fetch the Google Drive integration using the determined tenantId
-    const { data: googleDriveIntegration, error: fetchIntegrationError } = await supabaseAdmin
-      .from('tenant_integrations')
-      .select('*')
-      .eq('tenant_id', integrationTenantId)
-      .eq('provider', 'google_drive')
-      .single();
-
-    if (fetchIntegrationError) throw new Error(`Failed to fetch Google Drive integration for tenant ${integrationTenantId}: ${fetchIntegrationError.message}`);
-    if (!googleDriveIntegration.encrypted_credentials || !googleDriveIntegration.nonce) {
-      throw new Error('La integración de Google Drive no tiene las credenciales encriptadas.');
-    }
-
-    // 5. Decrypt the refresh_token
-    const { data: decryptedResponse, error: decryptError } = await supabaseAdmin.functions.invoke(
-      'decrypt-secret',
-      { body: { encryptedData: googleDriveIntegration.encrypted_credentials, iv: googleDriveIntegration.nonce } }
-    );
-
-    if (decryptError) throw new Error(`Failed to invoke decrypt-secret function: ${decryptError.message}`);
-    
-    const refreshToken = decryptedResponse.decryptedText;
-    if (!refreshToken) throw new Error('La respuesta de descifrado no contenía "decryptedText".');
-
-    // 5. Use the refresh_token to get a new access_token
-    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: Deno.env.get('GOOGLE_CLIENT_ID'),
-        client_secret: Deno.env.get('GOOGLE_CLIENT_SECRET'),
-        refresh_token: refreshToken,
-        grant_type: 'refresh_token',
-      }),
+    // 4. La subida real a Google Drive vive en Core (tenant_integrations, platforms y las credenciales
+    //    ya no existen en Services). Se delega en la edge function Core 'google-drive-upload', que
+    //    solo sube el archivo y devuelve sus metadatos. Los registros en BD se hacen abajo (Services).
+    const coreSupabase = getCoreSupabaseClient();
+    const { data: coreUpload, error: coreUploadError } = await coreSupabase.functions.invoke('google-drive-upload', {
+      body: {
+        platform_id: platformId,
+        tenantId,
+        fileBase64,
+        mimeType,
+        fileName,
+        path_components: [uploadContext, contextId],
+        // Avatars usa la integración del dueño del sistema (Core la resuelve por plataforma).
+        ...(uploadContext === 'Avatars' ? {} : { integration_owner_tenant_id: tenantId }),
+      },
     });
-
-    if (!tokenResponse.ok) {
-      const errorBody = await tokenResponse.json();
-
-      if (errorBody.error === 'invalid_grant') {
-        console.error(`invalid_grant error for integration ID: ${googleDriveIntegration.id}. Deactivating integration.`);
-        await supabaseAdmin
-          .from('tenant_integrations')
-          .update({ is_active: false, updated_at: new Date().toISOString() })
-          .eq('id', googleDriveIntegration.id);
-        
-        throw new Error('La conexión con Google ha expirado. Por favor, vuelve a conectar tu cuenta desde la configuración.');
-      }
-
-      throw new Error(`Google token refresh failed: ${JSON.stringify(errorBody)}`);
+    if (coreUploadError) {
+      let detail = coreUploadError.message;
+      try { const j = await coreUploadError.context?.json?.(); if (j?.error) detail = j.error; } catch (_) { /* noop */ }
+      throw new Error(detail);
     }
-
-    const tokens = await tokenResponse.json();
-    accessToken = tokens.access_token; // Assign to higher-scoped variable
-
-    // ... (rest of the code) ...
-
-    const driveFile = await uploadResponse.json();
-    fileId = driveFile.id; // Assign to higher-scoped variable
-
-    // 8. Make the file public
-    await fetch(
-      `https://www.googleapis.com/drive/v3/files/${fileId}/permissions`,
-      {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: 'reader', type: 'anyone' }),
-      }
-    );
+    if (!coreUpload?.success || !coreUpload?.fileId) {
+      throw new Error(coreUpload?.error || 'La subida a Google Drive (Core) no devolvió fileId.');
+    }
+    fileId = coreUpload.fileId;
+    const newFileName: string = coreUpload.fileName ?? fileName;
 
     // 9. Post-upload processing based on context
     let oldFileId: string | null = null;
@@ -257,6 +193,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize, // Añadido
             tenant_id: tenantId,
+            platform_id: platformId,
             branch_id: branchId,
             user_id: userId,
           });
@@ -283,6 +220,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize,
             tenant_id: tenantId,
+            platform_id: platformId,
             branch_id: branchId,
             user_id: userId,
           });
@@ -306,6 +244,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize,
             tenant_id: tenantId,
+            platform_id: platformId,
           });
         if (dbError) {
           throw new Error(`Failed to save treatment image record to database: ${dbError.message}`);
@@ -326,6 +265,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize, // Añadido
             tenant_id: tenantId,
+            platform_id: platformId,
           });
         if (dbError) {
           // TODO: Consider deleting the file from Google Drive if DB insert fails
@@ -347,6 +287,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize,
             tenant_id: tenantId,
+            platform_id: platformId,
           });
         if (dbError) {
           // TODO: Consider deleting the file from Google Drive if DB insert fails
@@ -368,6 +309,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize,
             tenant_id: tenantId,
+            platform_id: platformId,
           });
         if (dbError) {
           // TODO: Consider deleting the file from Google Drive if DB insert fails
@@ -401,6 +343,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize,
             tenant_id: tenantId,
+            platform_id: platformId,
             is_primary: isFirstPhoto,
           });
         if (dbError) {
@@ -426,6 +369,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize,
             tenant_id: tenantId,
+            platform_id: platformId,
             user_id: userId,
           });
         if (dbError) {
@@ -451,6 +395,7 @@ serve(async (req) => {
             mime_type: mimeType,
             file_size: fileSize,
             tenant_id: tenantId,
+            platform_id: platformId,
             branch_id: branchId,
             user_id: userId,
           });
