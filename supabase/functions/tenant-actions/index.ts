@@ -1618,6 +1618,62 @@ serve(async (req) => {
         break;
       }
 
+      // Horarios por usuario. Antes el front escribía directo en la tabla user_schedules (con RLS abierta);
+      // ahora tenant y plataforma salen del JWT.
+      case 'get_user_schedules': {
+        const { userId: scheduleUserId } = payload;
+        if (!scheduleUserId) throw new Error('userId is required.');
+        const { data, error } = await supabaseAdmin
+          .from('user_schedules')
+          .select('*')
+          .eq('user_id', scheduleUserId)
+          .eq('tenant_id', tenantId)
+          .eq('platform_id', platformId);
+        if (error) throw error;
+        responseData = data || [];
+        break;
+      }
+
+      case 'upsert_user_schedule': {
+        const { user_id, branch_id, day_of_week, start_time, end_time, is_active } = payload;
+        if (!user_id || day_of_week === undefined || day_of_week === null || !start_time || !end_time) {
+          throw new Error('user_id, day_of_week, start_time and end_time are required.');
+        }
+        const branchId = branch_id ?? null;
+
+        let existingQuery = supabaseAdmin
+          .from('user_schedules')
+          .select('id')
+          .eq('user_id', user_id)
+          .eq('day_of_week', day_of_week)
+          .eq('tenant_id', tenantId)
+          .eq('platform_id', platformId);
+        existingQuery = branchId ? existingQuery.eq('branch_id', branchId) : existingQuery.is('branch_id', null);
+        const { data: existing, error: existingError } = await existingQuery.maybeSingle();
+        if (existingError) throw existingError;
+
+        const values = { start_time, end_time, is_active: is_active ?? true, updated_at: new Date().toISOString() };
+        if (existing) {
+          const { data, error } = await supabaseAdmin
+            .from('user_schedules')
+            .update(values)
+            .eq('id', existing.id)
+            .eq('tenant_id', tenantId)
+            .eq('platform_id', platformId)
+            .select();
+          if (error) throw error;
+          responseData = data;
+        } else {
+          const { data, error } = await supabaseAdmin
+            .from('user_schedules')
+            .insert({ user_id, day_of_week, branch_id: branchId, tenant_id: tenantId, platform_id: platformId, ...values })
+            .select();
+          if (error) throw error;
+          responseData = data;
+        }
+        break;
+      }
+
       case 'get_schedules_for_branch': {
         const { branchId } = payload;
         if (!branchId) throw new Error('Branch ID is required.');
