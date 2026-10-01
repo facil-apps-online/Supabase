@@ -128,6 +128,65 @@ serve(async (req) => {
           break;
         }
 
+        case 'GET_SURVEY_DETAILS_BY_TOKEN': {
+          const { survey_token, platform_id } = payload;
+          if (!survey_token) throw new Error('survey_token is required.');
+
+          // 1. Encuesta + atención (todo se resuelve desde el id de la atención)
+          let surveyQuery = tenantSupabase
+            .from('satisfaction_surveys')
+            .select('id, attention_id, client_id, tenant_id, branch_id, platform_id, status')
+            .eq('survey_token', survey_token);
+          if (platform_id) surveyQuery = surveyQuery.eq('platform_id', platform_id);
+          const { data: survey, error: surveyError } = await surveyQuery.single();
+          if (surveyError || !survey) throw new Error('Survey not found or invalid token.');
+
+          const { data: attention, error: attentionError } = await tenantSupabase
+            .from('attentions')
+            .select('id, attention_datetime, status')
+            .eq('id', survey.attention_id)
+            .single();
+          if (attentionError) throw new Error(`Error fetching attention: ${attentionError.message}`);
+
+          const { data: client } = await tenantSupabase.from('clients').select('name').eq('id', survey.client_id).single();
+          const { data: branch } = await tenantSupabase.from('branches').select('name, address, google_place_id').eq('id', survey.branch_id).single();
+
+          // 2. Servicios de la atención y sus profesionales
+          const { data: attentionServices, error: servicesError } = await tenantSupabase
+            .from('attention_services')
+            .select('id, user_id, services(name)')
+            .eq('attention_id', survey.attention_id);
+          if (servicesError) throw new Error(`Error fetching services: ${servicesError.message}`);
+
+          const services = (attentionServices || []).map((s: any) => ({
+            id: s.id,
+            user_id: s.user_id,
+            service_name: s.services?.name ?? 'Servicio',
+          }));
+
+          const professionals: Record<string, { name: string }> = {};
+          for (const userId of [...new Set(services.map((s) => s.user_id).filter(Boolean))]) {
+            const { data: userData } = await tenantSupabase.auth.admin.getUserById(userId as string);
+            const meta = userData?.user?.user_metadata || {};
+            const fullName = [meta.first_name, meta.last_name].filter(Boolean).join(' ') || meta.full_name || meta.name;
+            professionals[userId as string] = { name: fullName || 'Profesional' };
+          }
+
+          // 3. Datos del tenant (viven en Core)
+          const { data: tenant } = await coreSupabase.from('tenants').select('name, logo_url').eq('id', survey.tenant_id).single();
+
+          responseData = {
+            survey_status: survey.status,
+            attention,
+            client: client || null,
+            branch: branch || null,
+            tenant: tenant ? { name: tenant.name, logo_url: tenant.logo_url, logo_base64: null } : null,
+            services,
+            professionals,
+          };
+          break;
+        }
+
         case 'SUBMIT_SURVEY': {
           const { survey_token, ratings } = payload;
           if (!survey_token || !ratings || !Array.isArray(ratings)) throw new Error('Survey token and a ratings array are required.');

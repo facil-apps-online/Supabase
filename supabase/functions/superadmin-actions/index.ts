@@ -715,9 +715,19 @@ Deno.serve(async (req) => {
         case 'get_tenant_integrations': {
           const { tenantId } = payload;
           if (!tenantId) throw new Error('tenantId is required.');
-          const { data, error } = await tenantSupabase.rpc('get_tenant_integrations', { p_tenant_id: tenantId });
-          if (error) throw error;
-          responseData = data;
+          // tenant_integrations vive en Core (la RPC de Services ya no puede leerla)
+          const { data: tenantIntegrations, error: tiError } = await coreSupabase
+            .from('tenant_integrations')
+            .select('*')
+            .eq('tenant_id', tenantId);
+          if (tiError) throw tiError;
+          const { data: allProviders, error: pError } = await coreSupabase.from('integration_providers').select('name, slug');
+          if (pError) throw pError;
+          const providerMap = new Map((allProviders || []).map((p: any) => [p.slug, p]));
+          responseData = (tenantIntegrations || []).map((integration: any) => {
+            const providerDetails: any = providerMap.get(integration.provider);
+            return { ...integration, integration_providers: providerDetails ? { name: providerDetails.name, slug: providerDetails.slug } : null };
+          });
           break;
         }
 
@@ -727,7 +737,7 @@ Deno.serve(async (req) => {
             const { access_token, account_id, phone_number_id } = credentials;
             if (!access_token || !account_id || !phone_number_id) throw new Error('credentials must include access_token, account_id, and phone_number_id.');
             const { encrypted, nonce } = await encrypt(JSON.stringify(credentials));
-            const { data, error } = await tenantSupabase
+            const { data, error } = await coreSupabase
                 .from('tenant_integrations')
                 .upsert({ tenant_id: tenant_id, provider: 'meta_whatsapp', environment: 'production', encrypted_credentials: encrypted, nonce: nonce, is_active: true }, { onConflict: 'tenant_id, provider, environment' })
                 .select()
@@ -740,7 +750,7 @@ Deno.serve(async (req) => {
         case 'delete_tenant_integration': {
           const { integrationId } = payload;
           if (!integrationId) throw new Error('integrationId is required.');
-          const { error } = await tenantSupabase.from('tenant_integrations').delete().eq('id', integrationId);
+          const { error } = await coreSupabase.from('tenant_integrations').delete().eq('id', integrationId);
           if (error) throw error;
           responseData = { success: true };
           break;
@@ -749,14 +759,19 @@ Deno.serve(async (req) => {
         case 'get_tenant_users': {
           const { tenantId } = payload;
           if (!tenantId) throw new Error('tenantId is required.');
-          const { data, error } = await tenantSupabase.rpc('get_tenant_users', { target_tenant_id: tenantId });
+          let usersPlatformId = payload.platformId || payload.platform_id;
+          if (!usersPlatformId) {
+            const { data: tenantRow } = await coreSupabase.from('tenants').select('platform_id').eq('id', tenantId).single();
+            usersPlatformId = tenantRow?.platform_id;
+          }
+          const { data, error } = await tenantSupabase.rpc('get_tenant_users', { p_target_tenant_id: tenantId, p_platform_id: usersPlatformId });
           if (error) throw error;
           responseData = data;
           break;
         }
 
         case 'get_platform_level_assignments': {
-          const { data, error } = await tenantSupabase.rpc('get_platform_level_assignments');
+          const { data, error } = await coreSupabase.rpc('get_platform_level_assignments');
           if (error) throw error;
           responseData = data;
           break;
@@ -773,7 +788,7 @@ Deno.serve(async (req) => {
             const investorData = assignments.map((a: any) => ({
               user_id: userId, platform_id: a.platformId, investment_share: a.stake / 100,
             }));
-            const { error } = await tenantSupabase.from('investor_platform_shares').upsert(investorData);
+            const { error } = await coreSupabase.from('investor_platform_shares').upsert(investorData);
             if (error) throw error;
             const newAssignment = assignments.map((a: any) => ({
               assignment_id: crypto.randomUUID(), tenant_id: null, tenant_name: null, role_id: null, role: 'investor', platform_id: a.platformId, platform_name: a.platform_name, branch_id: null, branch_name: null, status: 'active', stake_percentage: a.stake,
@@ -781,13 +796,13 @@ Deno.serve(async (req) => {
             existingAssignments = existingAssignments.filter((ea: any) => !(ea.role === 'investor' && newAssignment.some((na: any) => na.platform_id === ea.platform_id)));
             existingAssignments.push(...newAssignment);
           } else if (role === 'app_super_admin') {
-            const { data: roleData, error: roleError } = await tenantSupabase.from('roles').select('id').eq('name', 'app_super_admin').single();
+            const { data: roleData, error: roleError } = await coreSupabase.from('roles').select('id').eq('name', 'app_super_admin').single();
             if (roleError) throw new Error('Could not find app_super_admin role.');
             const roleId = roleData.id;
             const platformAssignments = assignments.map((a: any) => ({
               user_id: userId, platform_id: a.platformId, role_id: roleId,
             }));
-            const { error } = await tenantSupabase.from('platform_assignments').upsert(platformAssignments);
+            const { error } = await coreSupabase.from('platform_assignments').upsert(platformAssignments);
             if (error) throw error;
             const newAssignment = assignments.map((a: any) => ({
               assignment_id: crypto.randomUUID(), tenant_id: null, tenant_name: null, role_id: roleId, role: 'app_super_admin', platform_id: a.platformId, platform_name: a.platform_name, branch_id: null, branch_name: null, status: 'active',
@@ -809,10 +824,10 @@ Deno.serve(async (req) => {
             const { userId, role, platformId } = payload;
             if (!userId || !role || !platformId) throw new Error('userId, role, and platformId are required.');
             if (role === 'investor') {
-                const { error } = await tenantSupabase.from('investor_platform_shares').delete().match({ user_id: userId, platform_id: platformId });
+                const { error } = await coreSupabase.from('investor_platform_shares').delete().match({ user_id: userId, platform_id: platformId });
                 if (error) throw error;
             } else if (role === 'app_super_admin') {
-                const { error } = await tenantSupabase.from('platform_assignments').delete().match({ user_id: userId, platform_id: platformId });
+                const { error } = await coreSupabase.from('platform_assignments').delete().match({ user_id: userId, platform_id: platformId });
                 if (error) throw error;
             }
             const { data: user, error: fetchError } = await tenantSupabase.auth.admin.getUserById(userId);
@@ -832,7 +847,7 @@ Deno.serve(async (req) => {
         case 'update_investor_stake': {
           const { userId, platformId, stake } = payload;
           if (!userId || !platformId || stake === undefined) throw new Error('userId, platformId, and stake are required.');
-          const { error } = await tenantSupabase.from('investor_platform_shares').update({ investment_share: stake / 100 }).match({ user_id: userId, platform_id: platformId });
+          const { error } = await coreSupabase.from('investor_platform_shares').update({ investment_share: stake / 100 }).match({ user_id: userId, platform_id: platformId });
           if (error) throw error;
           responseData = { success: true };
           break;
@@ -852,7 +867,7 @@ Deno.serve(async (req) => {
         case 'assign_vendor_role': {
           const { userId, tenantId } = payload;
           if (!userId || !tenantId) throw new Error('userId and tenantId are required.');
-          const { error } = await tenantSupabase.from('vendor_tenants').insert({ user_id: userId, tenant_id: tenantId });
+          const { error } = await coreSupabase.from('vendor_tenants').insert({ user_id: userId, tenant_id: tenantId });
           if (error) throw error;
           responseData = { success: true };
           break;
@@ -864,7 +879,7 @@ Deno.serve(async (req) => {
           const vendorData = commissions.map((c: any) => ({
             user_id: userId, platform_id: c.platformId, first_payment_commission_rate: c.first_payment_commission_rate / 100, recurring_payment_commission_rate: c.recurring_payment_commission_rate / 100,
           }));
-          const { error } = await tenantSupabase.from('vendor_platform_commissions').upsert(vendorData, { onConflict: 'user_id, platform_id' });
+          const { error } = await coreSupabase.from('vendor_platform_commissions').upsert(vendorData, { onConflict: 'user_id, platform_id' });
           if (error) throw error;
           responseData = { success: true };
           break;
@@ -890,24 +905,24 @@ Deno.serve(async (req) => {
           });
           if (createError) throw createError;
           const userId = newUser.user.id;
-          const { data: roleData, error: roleError } = await tenantSupabase.from('roles').select('id').eq('name', role).single();
+          const { data: roleData, error: roleError } = await coreSupabase.from('roles').select('id').eq('name', role).single();
           if (roleError) throw new Error('Could not find role.'); // Changed
           const roleId = roleData.id;
           if (role === 'app_super_admin' && assignments) {
             const platformAssignments = assignments.map((platformId: string) => ({ user_id: userId, platform_id: platformId, role_id: roleId }));
-            const { error } = await tenantSupabase.from('platform_assignments').insert(platformAssignments);
+            const { error } = await coreSupabase.from('platform_assignments').insert(platformAssignments);
             if (error) throw error;
           } else if (role === 'investor' && assignments) {
             const investorData = assignments.map((a: any) => ({
               user_id: userId, platform_id: a.platformId, investment_share: a.stake / 100,
             }));
-            const { error } = await tenantSupabase.from('investor_platform_shares').insert(investorData);
+            const { error } = await coreSupabase.from('investor_platform_shares').insert(investorData);
             if (error) throw error;
           } else if (role === 'vendor' && assignments) {
             const vendorData = assignments.map((platformId: string) => ({
               user_id: userId, platform_id: platformId,
             }));
-            const { error } = await tenantSupabase.from('vendor_platform_commissions').insert(vendorData);
+            const { error } = await coreSupabase.from('vendor_platform_commissions').insert(vendorData);
             if (error) throw error;
           }
           responseData = { success: true, user: newUser.user };
@@ -928,7 +943,7 @@ Deno.serve(async (req) => {
         case 'get_vendor_platform_commissions': {
           const { userId } = payload;
           if (!userId) throw new Error('userId is required.');
-          const { data, error } = await tenantSupabase
+          const { data, error } = await coreSupabase
             .from('vendor_platform_commissions')
             .select(`*, platform:platforms (name)`)
             .eq('user_id', userId);
@@ -941,7 +956,7 @@ Deno.serve(async (req) => {
         case 'update_vendor_platform_commission': {
           const { commissionId, updates } = payload;
           if (!commissionId || !updates) throw new Error('commissionId and updates are required.');
-          const { data, error } = await tenantSupabase.from('vendor_platform_commissions').update(updates).eq('id', commissionId).select().single();
+          const { data, error } = await coreSupabase.from('vendor_platform_commissions').update(updates).eq('id', commissionId).select().single();
           if (error) throw error;
           responseData = data;
           break;
@@ -950,14 +965,14 @@ Deno.serve(async (req) => {
         case 'remove_vendor_platform_commission': {
           const { commissionId } = payload;
           if (!commissionId) throw new Error('commissionId is required.');
-          const { error } = await tenantSupabase.from('vendor_platform_commissions').delete().eq('id', commissionId);
+          const { error } = await coreSupabase.from('vendor_platform_commissions').delete().eq('id', commissionId);
           if (error) throw error;
           responseData = { success: true };
           break;
         }
 
         case 'get_api_health_stats': {
-          const { data, error } = await tenantSupabase.rpc('get_api_health_stats');
+          const { data, error } = await coreSupabase.rpc('get_api_health_stats');
           if (error) throw error;
           responseData = data;
           break;
@@ -1056,7 +1071,7 @@ Deno.serve(async (req) => {
       const endTime = performance.now();
       const responseTimeMs = endTime - startTime;
       console.log(`superadmin-actions: Action '${action}' took ${responseTimeMs.toFixed(2)}ms, status: ${statusCode}`);
-      await tenantSupabase.from('api_request_metrics').insert({
+      await coreSupabase.from('api_request_metrics').insert({
         path: metricsPath, method: 'POST', status_code: statusCode, response_time_ms: responseTimeMs
       });
     }

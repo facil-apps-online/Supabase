@@ -3571,6 +3571,27 @@ serve(async (req) => {
       }
 
 
+      // La tabla tenant_integrations vive en Core: se guarda vía su RPC con el rol real tomado del JWT.
+      case 'save_tenant_integration': {
+        const { providerSlug, encrypted_credentials, nonce, environment } = payload;
+        if (!providerSlug || !encrypted_credentials || !nonce || !environment) {
+          throw new Error('providerSlug, encrypted_credentials, nonce y environment son obligatorios.');
+        }
+        const callerRole = decodedToken?.app_metadata?.assignments?.[0]?.role_name;
+        const { error } = await coreSupabase.rpc('upsert_tenant_integration', {
+          p_tenant_id: tenantId,
+          p_platform_id: platformId,
+          p_provider_slug: providerSlug,
+          p_encrypted_credentials: encrypted_credentials,
+          p_nonce: nonce,
+          p_environment: environment,
+          p_user_role: callerRole,
+        });
+        if (error) throw error;
+        responseData = { success: true };
+        break;
+      }
+
       case 'update_notification_settings': {
         const { settings } = payload;
         if (!settings || !Array.isArray(settings)) {
@@ -5500,7 +5521,28 @@ serve(async (req) => {
                 break;
               }
 
-              case 'get_sale_by_attention_id': {
+              // Al volver de la pasarela el cliente solo conoce el id de la atención. El estado de los pagos NO se
+      // modifica desde aquí (no se puede confiar en el retorno del navegador): esta acción solo consulta
+      // el estado actual de los pagos de la atención para mostrar el resultado.
+      case 'update-attention-payment-status': {
+        const { attention_id } = payload;
+        if (!attention_id) throw new Error('attention_id is required.');
+        const { data: payments, error } = await supabaseAdmin
+          .from('attention_payments')
+          .select('id, status, amount')
+          .eq('attention_id', attention_id)
+          .eq('tenant_id', tenantId)
+          .eq('platform_id', platformId);
+        if (error) throw error;
+        responseData = {
+          attention_id,
+          payments: payments || [],
+          all_completed: (payments || []).length > 0 && (payments || []).every((p: any) => p.status === 'completed'),
+        };
+        break;
+      }
+
+      case 'get_sale_by_attention_id': {
                 const { attentionId } = payload;
                 if (!attentionId) {
                   throw new Error('Attention ID is required.');
@@ -5747,10 +5789,12 @@ serve(async (req) => {
       }
 
       // --- PROJECT IMAGE ACTIONS ---
+      // En TattooSuite los "proyectos" comparten tabla con los tratamientos de Glamtica (treatments / treatment_images),
+      // así que estas acciones son alias de las RPC *_treatment_image(s).
       case 'get_project_images': {
         const { projectId } = payload;
         if (!projectId) throw new Error('Project ID is required.');
-        responseData = await callRpc(supabaseAdmin, 'get_project_images', { p_tenant_id: tenantId, p_platform_id: platformId, p_project_id: projectId });
+        responseData = await callRpc(supabaseAdmin, 'get_treatment_images', { p_tenant_id: tenantId, p_platform_id: platformId, p_treatment_id: projectId });
         break;
       }
 
@@ -5759,11 +5803,11 @@ serve(async (req) => {
         if (!projectId || !google_drive_file_id) {
           throw new Error('projectId and google_drive_file_id are required.');
         }
-        responseData = await callRpc(supabaseAdmin, 'associate_project_image', { p_platform_id: platformId, 
+        responseData = await callRpc(supabaseAdmin, 'associate_treatment_image', {
           p_tenant_id: tenantId,
           p_platform_id: platformId,
-          p_project_id: projectId, 
-          p_google_drive_file_id: google_drive_file_id 
+          p_treatment_id: projectId,
+          p_google_drive_file_id: google_drive_file_id
         });
         break;
       }
@@ -5771,17 +5815,17 @@ serve(async (req) => {
       case 'delete_project_image': {
         const { imageId } = payload;
         if (!imageId) throw new Error('Image ID is required.');
-        responseData = await callRpc(supabaseAdmin, 'delete_project_image', { p_tenant_id: tenantId, p_platform_id: platformId, p_image_id: imageId });
+        responseData = await callRpc(supabaseAdmin, 'delete_treatment_image', { p_tenant_id: tenantId, p_platform_id: platformId, p_image_id: imageId });
         break;
       }
 
       case 'set_primary_project_image': {
         const { projectId, imageId } = payload;
         if (!projectId || !imageId) throw new Error('Project ID and Image ID are required.');
-        responseData = await callRpc(supabaseAdmin, 'set_primary_project_image', { p_platform_id: platformId,
+        responseData = await callRpc(supabaseAdmin, 'set_primary_treatment_image', {
           p_tenant_id: tenantId,
           p_platform_id: platformId,
-          p_project_id: projectId,
+          p_treatment_id: projectId,
           p_image_id: imageId,
         });
         break;
@@ -7770,6 +7814,69 @@ serve(async (req) => {
         }
         
         responseData = data;
+        break;
+      }
+
+      // Edición masiva del precio de combos en una sucursal. El precio vive a nivel de ítem
+      // (branch_combo_item_prices) porque de ahí se reparten las comisiones de productos/servicios,
+      // así que el nuevo total de cada combo se distribuye proporcionalmente entre sus ítems.
+      case 'bulk_update_branch_combo_prices': {
+        const { branchId, updates } = payload;
+        if (!branchId || !Array.isArray(updates) || updates.length === 0) {
+          throw new Error('branchId and a non-empty updates array are required.');
+        }
+
+        const results: any[] = [];
+        for (const u of updates) {
+          const comboId = u.combo_id;
+          const target = Number(u.selling_price);
+          if (!comboId || !Number.isFinite(target) || target < 0) {
+            throw new Error(`Invalid update for combo "${comboId}": combo_id and a non-negative selling_price are required.`);
+          }
+
+          const details = await callRpc(supabaseAdmin, 'get_combo_branch_details', {
+            p_tenant_id: tenantId,
+            p_platform_id: platformId,
+            p_branch_id: branchId,
+            p_combo_id: comboId,
+          });
+          const items: any[] = details?.items ?? [];
+          if (items.length === 0) throw new Error(`El combo ${comboId} no tiene ítems.`);
+
+          const currentTotal = items.reduce((sum, it) => sum + Number(it.final_price) * Number(it.quantity || 1), 0);
+          // Si el total actual es 0 se reparte en partes iguales por unidad.
+          const totalUnits = items.reduce((sum, it) => sum + Number(it.quantity || 1), 0);
+          const factor = currentTotal > 0 ? target / currentTotal : null;
+
+          const overrides = items.map((it) => {
+            const price = factor !== null ? Number(it.final_price) * factor : target / totalUnits;
+            return { product_id: it.product_id, service_id: it.service_id, price: Math.round(price * 100) / 100 };
+          });
+
+          // Ajuste de redondeo en el último ítem de cantidad 1 para que el total coincida con el objetivo.
+          const roundedTotal = overrides.reduce((sum, o, i) => sum + o.price * Number(items[i].quantity || 1), 0);
+          const diff = Math.round((target - roundedTotal) * 100) / 100;
+          if (diff !== 0) {
+            for (let i = overrides.length - 1; i >= 0; i--) {
+              if (Number(items[i].quantity || 1) === 1 && overrides[i].price + diff >= 0) {
+                overrides[i].price = Math.round((overrides[i].price + diff) * 100) / 100;
+                break;
+              }
+            }
+          }
+
+          const { error } = await supabaseAdmin.rpc('update_combo_branch_prices', {
+            p_tenant_id: tenantId,
+            p_platform_id: platformId,
+            p_branch_id: branchId,
+            p_combo_id: comboId,
+            p_price_overrides: overrides,
+          });
+          if (error) throw error;
+          results.push({ combo_id: comboId, selling_price: target });
+        }
+
+        responseData = { success: true, updated: results };
         break;
       }
 

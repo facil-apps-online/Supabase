@@ -1,5 +1,6 @@
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { getCoreSupabaseClient } from '../_shared/supabaseClients.ts';
 
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
@@ -99,8 +100,20 @@ serve(async (req) => {
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     );
 
+    // platform_id del tenant (columna obligatoria en tenant_integrations de Core)
+    const { data: tenantRow, error: tenantRowError } = await supabaseAdmin
+      .from('tenants')
+      .select('platform_id')
+      .eq('id', tenantId)
+      .single();
+    if (tenantRowError || !tenantRow) {
+      throw new Error(`Could not fetch tenant to determine platform: ${tenantRowError?.message ?? 'not found'}`);
+    }
+
     const upsertData = {
       tenant_id: tenantId,
+      platform_id: tenantRow.platform_id,
+      is_active: true,
       provider: provider,
       access_token: access_token,
       encrypted_credentials: encryptedData,
@@ -110,7 +123,8 @@ serve(async (req) => {
       environment: 'production', // Añadir explícitamente el entorno
     };
 
-    const { error: dbError } = await supabaseAdmin
+    // tenant_integrations vive en Core, no en Services
+    const { error: dbError } = await getCoreSupabaseClient()
       .from('tenant_integrations')
       .upsert(upsertData, { onConflict: 'tenant_id, provider, environment' }); // Corregir onConflict
 
